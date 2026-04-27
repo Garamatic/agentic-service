@@ -1,0 +1,37 @@
+# Agentic Service Stack
+# Includes the MCP server and connects to existing infrastructure
+
+version: '3.8'
+
+services:
+  agentic-service:
+    build: .
+    ports:
+      - "3001:3001"  # SSE transport
+    environment:
+      # Connect to existing services
+      TICKET_API_URL: http://ticket-masala:80
+      ODOO_BRIDGE_URL: http://odoo-bridge:80
+      
+      # RabbitMQ (same as your existing)
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      
+      # Logging
+      LOG_LEVEL: INFO
+      
+      # MCP transport mode
+      TRANSPORT: sse  # or 'stdio' for CLI mode
+      PORT: 3001
+    networks:
+      - garamatic-network
+    restart: unless-stopped
+
+  # Optional: Add to your existing docker-compose
+  # This shows how to integrate with your stack
+
+networks:
+  garamatic-network:
+    external: true  # Connect to your existing network
