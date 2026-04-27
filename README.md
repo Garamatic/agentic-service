@@ -2,6 +2,8 @@
 
 **MCP Server** exposing your Garamatic platform to AI agents (Claude, GPT, etc.)
 
+Now includes: REST API, Event Consumer, and AI Agent for complete automation.
+
 ## 🎯 What is this?
 
 This service provides a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that exposes your existing Garamatic services as AI-callable tools:
@@ -14,13 +16,23 @@ This service provides a [Model Context Protocol (MCP)](https://modelcontextproto
 ## 🏗️ Architecture
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   Claude/GPT    │────▶│  MCP Protocol    │────▶│  agentic-service│
-│   (AI Agent)    │     │  (stdio/sse)     │     │  (Python/FastMCP)
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-                                                          │
-          ┌─────────────────┬─────────────────┬──────────┘
-          ▼                 ▼                 ▼
+                    ┌─────────────────┐
+                    │   AI Agents     │
+                    │  (Claude/GPT)   │
+                    └────────┬────────┘
+                             │ MCP
+                    ┌────────▼────────┐
+   ┌──────────┐     │  Agentic       │     ┌──────────┐
+   │ REST API │────▶│   Service      │◀────│  Web UI  │
+   │ Clients  │     │                │     │  Scripts │
+   └──────────┘     │ ┌────────────┐ │     └──────────┘
+   ┌──────────┐     │ │LangGraph   │ │     ┌──────────┐
+   │ Consumer │────▶│ │Agent       │ │     │  CLI     │
+   │ (Events) │     │ └────────────┘ │     └──────────┘
+   └──────────┘     └────────┬───────┘
+                             │
+          ┌──────────────────┼──────────────────┐
+          ▼                  ▼                  ▼
    ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
    │ticket-masala │ │odoo-bridge   │ │mailing-      │
    │(REST API)    │ │(RabbitMQ)    │ │service       │
@@ -62,13 +74,29 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 
 Restart Claude Desktop. You'll now see Garamatic tools available!
 
-### 4. Test manually
-```bash
-# Run the server
-uv run garamatic-mcp
+### 4. Run the services
 
-# Or in development mode with SSE transport
-uv run python -m agentic_service.server --transport sse --port 3001
+**MCP Server (for Claude Desktop):**
+```bash
+uv run garamatic-mcp
+```
+
+**REST API (for web/mobile integrations):**
+```bash
+uv run garamatic-api
+# API available at http://localhost:3001
+# Docs at http://localhost:3001/docs
+```
+
+**Event Consumer (for automated workflows):**
+```bash
+uv run garamatic-consumer
+```
+
+**AI Agent (interactive LangGraph agent):**
+```bash
+export OPENAI_API_KEY='your-key-here'
+uv run garamatic-agent
 ```
 
 ## 🛠️ Available Tools
@@ -79,20 +107,20 @@ uv run python -m agentic_service.server --transport sse --port 3001
 | `get_ticket_status` | Get current status of a ticket |
 | `list_customer_tickets` | List all tickets for a customer |
 | `create_ticket` | Create a new support ticket |
-| `update_ticket` | Update ticket status/notes |
+| `resolve_ticket` | Resolve ticket with optional invoice |
 
 ### Invoicing
 | Tool | Description |
 |------|-------------|
 | `create_invoice` | Create invoice for a ticket |
 | `get_invoice_status` | Check if invoice is paid |
-| `list_outstanding_invoices` | Get unpaid invoices |
+
 
 ### Email
 | Tool | Description |
 |------|-------------|
 | `send_email` | Send email to customer |
-| `send_invoice_email` | Send invoice PDF to customer |
+
 
 ### Resources (Context)
 | Resource | Description |
@@ -160,6 +188,66 @@ RABBITMQ_PASS=guest
 LOG_LEVEL=INFO
 ```
 
+## 🔌 Extensions
+
+### REST API Gateway
+Full REST API for non-AI integrations:
+
+```bash
+uv run garamatic-api
+```
+
+**Available endpoints:**
+- `GET /health` - Service health check
+- `GET /tickets/{id}` - Get ticket
+- `GET /tickets` - List tickets (with filters)
+- `POST /tickets` - Create ticket
+- `POST /tickets/{id}/resolve` - Resolve ticket
+- `GET /invoices/by-ticket/{id}` - Get invoice
+- `POST /invoices` - Create invoice
+- `POST /emails` - Send email
+- `GET /customers/{email}/context` - Customer context
+
+All endpoints include input validation, request tracing, and proper error handling.
+
+### Event Consumer
+Automated workflow engine consuming RabbitMQ events:
+
+```bash
+uv run garamatic-consumer
+```
+
+**Automated workflows:**
+- `invoice.paid` → Send thank you email to customer
+- `invoice.sent` → Notify customer of new invoice
+- `ticket.escalated` → Alert manager via email
+- `ticket.created` → Send confirmation to customer
+
+### AI Agent (LangGraph)
+Intelligent agent with planning and memory:
+
+```bash
+export OPENAI_API_KEY='your-key'
+uv run garamatic-agent
+```
+
+**Capabilities:**
+- Multi-step reasoning (find ticket → check status → resolve + invoice)
+- Customer context analysis across all services
+- Human approval for large invoices (€500+)
+- Conversation memory
+- Tool orchestration with fallback
+
+Example interaction:
+```
+You: Customer john@example.com needs help with ticket T-123
+Agent: I'll look up the customer context and ticket details...
+[Agent retrieves context, checks ticket, provides solution]
+
+You: Create an invoice for €200 and resolve the ticket
+Agent: ✅ Ticket T-123 resolved with €200 invoice queued.
+```
+
 ## 🧪 Testing
 
 ```bash
@@ -168,6 +256,9 @@ uv run pytest
 
 # With coverage
 uv run pytest --cov=agentic_service --cov-report=html
+
+# Test API endpoints
+curl http://localhost:3001/health
 ```
 
 ## 🐳 Docker

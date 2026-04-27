@@ -5,23 +5,42 @@ Exposes tickets, invoices, and emails as AI-callable tools
 
 import asyncio
 import json
-from typing import Any, AsyncIterator
+import uuid
+from datetime import datetime
+from typing import Any, Literal
 
 import httpx
 import structlog
 from fastmcp import FastMCP, Context
-from tenacity import retry, stop_after_attempt, wait_exponential
 
-from .config import Settings, get_settings
 from .clients import TicketClient, OdooBridgeClient, RabbitMQPublisher
+from .config import get_settings
 
 logger = structlog.get_logger()
 
 # Create MCP server
 mcp = FastMCP("garamatic")
 
-# Global settings (initialized on startup)
-settings: Settings | None = None
+
+def _format_date(d: str | None) -> str:
+    """Format an ISO date string to YYYY-MM-DD or return placeholder."""
+    return d[:10] if d and len(d) >= 10 else (d or "N/A")
+
+
+def _validate_email(email: str) -> None:
+    """Validate email format, raise ValueError if invalid."""
+    if not email or "@" not in email:
+        raise ValueError(f"Invalid email format: {email}")
+    local, _, domain = email.rpartition("@")
+    if not local or not domain or "." not in domain or domain.endswith("."):
+        raise ValueError(f"Invalid email format: {email}")
+
+
+def _generate_request_id() -> str:
+    """Generate unique request ID for tracing."""
+    return uuid.uuid4().hex
+
+# Global clients (initialized on startup)
 ticket_client: TicketClient | None = None
 odoo_client: OdooBridgeClient | None = None
 mq_publisher: RabbitMQPublisher | None = None
@@ -30,6 +49,7 @@ mq_publisher: RabbitMQPublisher | None = None
 @mcp.tool()
 async def get_ticket_status(
     ticket_id: str,
+    *,
     ctx: Context
 ) -> dict[str, Any]:
     """
@@ -41,39 +61,38 @@ async def get_ticket_status(
     Returns:
         Ticket details including status, customer info, and resolution notes
     """
-    logger.info("Getting ticket status", ticket_id=ticket_id)
+    if ticket_client is None:
+        return {"error": "Ticket service unavailable", "ticket_id": ticket_id}
     
-    try:
-        result = await ticket_client.get_ticket(ticket_id)
-        
-        ctx.info(f"Found ticket {ticket_id} with status: {result.get('status')}")
-        
-        return {
-            "ticket_id": ticket_id,
-            "status": result.get("status", "unknown"),
-            "customer_email": result.get("customerEmail"),
-            "customer_name": result.get("customerName"),
-            "title": result.get("title"),
-            "description": result.get("description"),
-            "created_at": result.get("createdAt"),
-            "resolved_at": result.get("resolvedAt"),
-            "resolution_notes": result.get("resolutionNotes"),
-            "billable_amount": result.get("billableAmount")
-        }
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            ctx.error(f"Ticket {ticket_id} not found")
-            return {"error": f"Ticket {ticket_id} not found"}
-        raise
+    rid = _generate_request_id()
+    logger.info("Getting ticket status", ticket_id=ticket_id, request_id=rid)
+    
+    result = await ticket_client.get_ticket(ticket_id)
+    
+    ctx.info(f"Found ticket {ticket_id} with status: {result.get('status')}")
+    
+    return {
+        "ticket_id": ticket_id,
+        "status": result.get("status", "unknown"),
+        "customer_email": result.get("customerEmail"),
+        "customer_name": result.get("customerName"),
+        "title": result.get("title"),
+        "description": result.get("description"),
+        "created_at": result.get("createdAt"),
+        "resolved_at": result.get("resolvedAt"),
+        "resolution_notes": result.get("resolutionNotes"),
+        "billable_amount": result.get("billableAmount")
+    }
 
 
 @mcp.tool()
 async def list_customer_tickets(
     customer_email: str,
-    status: str | None = None,
+    status: Literal["open", "resolved", "closed"] | None = None,
     limit: int = 10,
-    ctx: Context = None
-) -> list[dict[str, Any]]:
+    *,
+    ctx: Context
+) -> dict[str, Any]:
     """
     List all tickets for a specific customer.
     
@@ -83,9 +102,14 @@ async def list_customer_tickets(
         limit: Maximum number of tickets to return (default 10)
     
     Returns:
-        List of tickets with status and brief details
+        Dict containing "tickets" list with status and brief details
     """
-    logger.info("Listing customer tickets", email=customer_email, status=status)
+    if ticket_client is None:
+        return {"error": "Ticket service unavailable", "tickets": []}
+    
+    _validate_email(customer_email)
+    rid = _generate_request_id()
+    logger.info("Listing customer tickets", email=customer_email, status=status, request_id=rid)
     
     result = await ticket_client.list_tickets(
         customer_email=customer_email,
@@ -95,16 +119,18 @@ async def list_customer_tickets(
     
     ctx.info(f"Found {len(result)} tickets for {customer_email}")
     
-    return [
-        {
-            "ticket_id": t.get("id"),
-            "title": t.get("title"),
-            "status": t.get("status"),
-            "created_at": t.get("createdAt"),
-            "resolved_at": t.get("resolvedAt")
-        }
-        for t in result
-    ]
+    return {
+        "tickets": [
+            {
+                "ticket_id": t.get("id"),
+                "title": t.get("title"),
+                "status": t.get("status"),
+                "created_at": t.get("createdAt"),
+                "resolved_at": t.get("resolvedAt")
+            }
+            for t in result
+        ]
+    }
 
 
 @mcp.tool()
@@ -113,8 +139,9 @@ async def create_ticket(
     description: str,
     customer_email: str,
     customer_name: str,
-    priority: str = "medium",
-    ctx: Context = None
+    priority: Literal["low", "medium", "high", "urgent"] = "medium",
+    *,
+    ctx: Context
 ) -> dict[str, Any]:
     """
     Create a new support ticket.
@@ -129,7 +156,14 @@ async def create_ticket(
     Returns:
         Created ticket details including the new ticket ID
     """
-    logger.info("Creating ticket", title=title, customer=customer_email)
+    if ticket_client is None:
+        return {"error": "Ticket service unavailable"}
+    
+    _validate_email(customer_email)
+    if not title or not title.strip():
+        raise ValueError("Title is required")
+    rid = _generate_request_id()
+    logger.info("Creating ticket", title=title, customer=customer_email, request_id=rid)
     
     result = await ticket_client.create_ticket(
         title=title,
@@ -156,7 +190,8 @@ async def resolve_ticket(
     ticket_id: str,
     resolution_notes: str,
     billable_amount: float | None = None,
-    ctx: Context = None
+    *,
+    ctx: Context
 ) -> dict[str, Any]:
     """
     Resolve a ticket and optionally create a billable invoice.
@@ -169,7 +204,15 @@ async def resolve_ticket(
     Returns:
         Resolution confirmation and invoice info if billable
     """
-    logger.info("Resolving ticket", ticket_id=ticket_id, billable=billable_amount)
+    if ticket_client is None:
+        return {"error": "Ticket service unavailable", "ticket_id": ticket_id}
+    
+    if not resolution_notes or not resolution_notes.strip():
+        raise ValueError("Resolution notes are required")
+    if billable_amount is not None and billable_amount < 0:
+        raise ValueError("Billable amount cannot be negative")
+    rid = _generate_request_id()
+    logger.info("Resolving ticket", ticket_id=ticket_id, billable=billable_amount, request_id=rid)
     
     # Resolve in ticket-masala
     result = await ticket_client.resolve_ticket(
@@ -186,7 +229,7 @@ async def resolve_ticket(
         "resolution_notes": resolution_notes
     }
     
-    if billable_amount:
+    if billable_amount is not None:
         response["invoice"] = {
             "status": "queued",
             "estimated_amount": billable_amount,
@@ -201,7 +244,8 @@ async def create_invoice(
     ticket_id: str,
     amount: float,
     description: str | None = None,
-    ctx: Context = None
+    *,
+    ctx: Context
 ) -> dict[str, Any]:
     """
     Create an invoice for a ticket via the Odoo integration.
@@ -214,10 +258,29 @@ async def create_invoice(
     Returns:
         Invoice creation confirmation with estimated processing time
     """
-    logger.info("Creating invoice", ticket_id=ticket_id, amount=amount)
+    if ticket_client is None:
+        return {"error": "Ticket service unavailable", "status": "failed", "ticket_id": ticket_id}
+    if amount <= 0:
+        raise ValueError("Invoice amount must be positive")
+    if mq_publisher is None:
+        return {
+            "error": "Invoice service unavailable",
+            "status": "failed",
+            "ticket_id": ticket_id
+        }
+    rid = _generate_request_id()
+    logger.info("Creating invoice", ticket_id=ticket_id, amount=amount, request_id=rid)
     
     # Get ticket details first
-    ticket = await ticket_client.get_ticket(ticket_id)
+    try:
+        ticket = await ticket_client.get_ticket(ticket_id)
+    except Exception as e:
+        logger.error("create_invoice.ticket_lookup_failed", ticket_id=ticket_id, error=str(e))
+        return {
+            "error": f"Failed to get ticket: {e}",
+            "status": "failed",
+            "ticket_id": ticket_id
+        }
     
     # Emit event to RabbitMQ for odoo-bridge to process
     event = {
@@ -246,7 +309,8 @@ async def create_invoice(
 @mcp.tool()
 async def get_invoice_status(
     ticket_id: str,
-    ctx: Context = None
+    *,
+    ctx: Context
 ) -> dict[str, Any]:
     """
     Check invoice status for a ticket.
@@ -257,10 +321,16 @@ async def get_invoice_status(
     Returns:
         Invoice status: draft, sent, paid, or not_found
     """
-    logger.info("Checking invoice status", ticket_id=ticket_id)
+    if odoo_client is None:
+        return {
+            "ticket_id": ticket_id,
+            "status": "error",
+            "message": "Invoice service unavailable"
+        }
     
-    # Query odoo-bridge for invoice status
-    # This is a simplified version - real implementation would query DB
+    rid = _generate_request_id()
+    logger.info("Checking invoice status", ticket_id=ticket_id, request_id=rid)
+    
     result = await odoo_client.get_invoice_status(ticket_id)
     
     if not result:
@@ -286,7 +356,8 @@ async def send_email(
     subject: str,
     body: str,
     from_name: str = "Garamatic Support",
-    ctx: Context = None
+    *,
+    ctx: Context
 ) -> dict[str, Any]:
     """
     Send an email to a customer via the mailing service.
@@ -300,7 +371,17 @@ async def send_email(
     Returns:
         Send confirmation
     """
-    logger.info("Sending email", to=to_email, subject=subject)
+    _validate_email(to_email)
+    if not subject or not subject.strip():
+        raise ValueError("Email subject is required")
+    if mq_publisher is None:
+        return {
+            "error": "Email service unavailable",
+            "status": "failed",
+            "to_email": to_email
+        }
+    rid = _generate_request_id()
+    logger.info("Sending email", to=to_email, subject=subject, request_id=rid)
     
     # Emit event for mailing-service
     event = {
@@ -324,21 +405,15 @@ async def send_email(
     }
 
 
-@mcp.tool()
-async def get_customer_context(
-    customer_email: str,
-    ctx: Context = None
-) -> dict[str, Any]:
-    """
-    Get full customer context across all services.
+async def _get_customer_context_internal(customer_email: str) -> dict[str, Any]:
+    """Internal helper to fetch customer context without MCP context."""
+    _validate_email(customer_email)
     
-    Args:
-        customer_email: Customer email to look up
+    if ticket_client is None or odoo_client is None:
+        raise RuntimeError("Required services unavailable")
     
-    Returns:
-        Comprehensive profile: tickets, invoices, and activity
-    """
-    logger.info("Getting customer context", email=customer_email)
+    rid = _generate_request_id()
+    logger.info("Getting customer context", email=customer_email, request_id=rid)
     
     # Parallel queries
     tickets_task = ticket_client.list_tickets(customer_email, limit=5)
@@ -384,13 +459,136 @@ async def get_customer_context(
     }
 
 
+@mcp.tool()
+async def get_customer_context(
+    customer_email: str,
+    *,
+    ctx: Context
+) -> dict[str, Any]:
+    """
+    Get full customer context across all services.
+    
+    Args:
+        customer_email: Customer email to look up
+    
+    Returns:
+        Comprehensive profile: tickets, invoices, and activity
+    """
+    context = await _get_customer_context_internal(customer_email)
+    ctx.info(f"Retrieved context for {customer_email}")
+    return context
+
+
+@mcp.resource("ticket://{ticket_id}")
+async def get_ticket_resource(ticket_id: str) -> str:
+    """
+    MCP Resource: Single ticket details as formatted text.
+    AI can read this for ticket-specific context.
+    """
+    if ticket_client is None:
+        return f"Error: Ticket service unavailable"
+    
+    ticket = await ticket_client.get_ticket(ticket_id)
+    invoice = await odoo_client.get_invoice_status(ticket_id) if odoo_client else None
+    
+    invoice_info = ""
+    if invoice:
+        invoice_info = f"""
+
+## Invoice
+- ID: {invoice.get('invoice_id', 'N/A')}
+- Status: {invoice.get('status', 'unknown').upper()}
+- Amount: €{invoice.get('amount', 0):.2f}
+- Paid At: {_format_date(invoice.get('paid_at'))}
+"""
+    
+    return f"""
+# Ticket {ticket_id}
+
+## Details
+- Status: {ticket.get('status', 'unknown').upper()}
+- Title: {ticket.get('title', 'Untitled')}
+- Customer: {ticket.get('customerName', 'Unknown')} ({ticket.get('customerEmail', 'no email')})
+- Priority: {ticket.get('priority', 'medium').upper()}
+- Created: {_format_date(ticket.get('createdAt'))}
+- Resolved: {_format_date(ticket.get('resolvedAt'))}
+
+## Description
+{ticket.get('description', 'No description')}
+
+## Resolution Notes
+{ticket.get('resolutionNotes', 'Not resolved')}{invoice_info}
+"""
+
+
+@mcp.resource("system://health")
+async def get_health() -> str:
+    """
+    MCP Resource: System health status.
+    Check connectivity to all backend services.
+    """
+    health = {
+        "status": "healthy",
+        "services": {
+            "ticket_api": "unknown",
+            "odoo_bridge": "unknown",
+            "rabbitmq": mq_publisher is not None and getattr(mq_publisher, 'connection', None) is not None
+        }
+    }
+    
+    # Check ticket API
+    if ticket_client is None:
+        health["services"]["ticket_api"] = "not_initialized"
+        health["status"] = "degraded"
+    else:
+        try:
+            await ticket_client.list_tickets(limit=1)
+            health["services"]["ticket_api"] = "connected"
+        except Exception as e:
+            health["services"]["ticket_api"] = f"error: {str(e)[:50]}"
+            health["status"] = "degraded"
+    
+    # Check odoo bridge
+    if odoo_client is None:
+        health["services"]["odoo_bridge"] = "not_initialized"
+        health["status"] = "degraded"
+    else:
+        try:
+            await odoo_client.list_customer_invoices("test@example.com")
+            health["services"]["odoo_bridge"] = "connected"
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                health["services"]["odoo_bridge"] = "connected"
+            else:
+                health["services"]["odoo_bridge"] = f"error: {str(e)[:50]}"
+                health["status"] = "degraded"
+        except Exception as e:
+            health["services"]["odoo_bridge"] = f"error: {str(e)[:50]}"
+            health["status"] = "degraded"
+    
+    return json.dumps(health, indent=2)
+
+
 @mcp.resource("customer://{email}")
 async def get_customer_resource(email: str) -> str:
     """
     MCP Resource: Full customer profile as formatted text.
     AI can read this for rich context about a customer.
     """
-    context = await get_customer_context(email)
+    _validate_email(email)
+    context = await _get_customer_context_internal(email)
+    
+    tickets_section = chr(10).join(
+        f"- [{t['status'].upper() if t.get('status') else 'UNKNOWN'}] "
+        f"{t.get('title', 'Untitled')} ({_format_date(t.get('created_at'))})"
+        for t in context['recent_tickets']
+    ) if context['recent_tickets'] else "No recent tickets"
+    
+    invoices_section = chr(10).join(
+        f"- [{inv['status'].upper() if inv.get('status') else 'UNKNOWN'}] "
+        f"€{inv.get('amount', 0):.2f}"
+        for inv in context['recent_invoices']
+    ) if context['recent_invoices'] else "No recent invoices"
     
     return f"""
 # Customer Profile: {email}
@@ -402,10 +600,10 @@ async def get_customer_resource(email: str) -> str:
 - Lifetime Value: €{context['summary']['lifetime_value']:.2f}
 
 ## Recent Tickets
-{chr(10).join(f"- [{t['status'].upper()}] {t['title']} ({t['created_at'][:10]})" for t in context['recent_tickets'])}
+{tickets_section}
 
 ## Recent Invoices
-{chr(10).join(f"- [{inv['status'].upper()}] €{inv['amount']:.2f}" for inv in context['recent_invoices'])}
+{invoices_section}
 """
 
 
@@ -413,19 +611,25 @@ async def get_customer_resource(email: str) -> str:
 @mcp.on_startup
 async def on_startup():
     """Initialize clients on server startup."""
-    global settings, ticket_client, odoo_client, mq_publisher
+    global ticket_client, odoo_client, mq_publisher
     
-    settings = get_settings()
+    config = get_settings()
     
-    ticket_client = TicketClient(settings.ticket_api_url)
-    odoo_client = OdooBridgeClient(settings.odoo_bridge_url)
-    mq_publisher = RabbitMQPublisher(settings.rabbitmq_url)
+    ticket_client = TicketClient(config.ticket_api_url)
+    odoo_client = OdooBridgeClient(config.odoo_bridge_url)
     
-    await mq_publisher.connect()
+    # Initialize RabbitMQ but don't fail if unavailable (graceful degradation)
+    try:
+        mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
+        await mq_publisher.connect()
+        logger.info("rabbitmq.connected")
+    except Exception as e:
+        logger.warning("rabbitmq.unavailable", error=str(e))
+        mq_publisher = None  # Flag as unavailable - write operations will fail gracefully
     
-    logger.info("Agentic service started", 
-                ticket_api=settings.ticket_api_url,
-                odoo_bridge=settings.odoo_bridge_url)
+    logger.info("service.started",
+                ticket_api=config.ticket_api_url,
+                odoo_bridge=config.odoo_bridge_url)
 
 
 @mcp.on_shutdown
@@ -438,7 +642,7 @@ async def on_shutdown():
     if mq_publisher:
         await mq_publisher.close()
     
-    logger.info("Agentic service stopped")
+    logger.info("service.stopped")
 
 
 def main():
@@ -448,5 +652,4 @@ def main():
 
 
 if __name__ == "__main__":
-    from datetime import datetime
     main()

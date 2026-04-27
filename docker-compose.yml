@@ -18,13 +18,10 @@ services:
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: guest
       RABBITMQ_PASS: guest
+      RABBITMQ_VHOST: /
       
       # Logging
       LOG_LEVEL: INFO
-      
-      # MCP transport mode
-      TRANSPORT: sse  # or 'stdio' for CLI mode
-      PORT: 3001
     networks:
       - garamatic-network
     restart: unless-stopped

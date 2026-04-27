@@ -1,7 +1,8 @@
 """Configuration management for agentic service."""
 
-from functools import lru_cache
-from pydantic_settings import BaseSettings
+from functools import cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -25,12 +26,13 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
 
-@lru_cache
+@cache
 def get_settings() -> Settings:
     """Get cached settings instance."""
     return Settings()

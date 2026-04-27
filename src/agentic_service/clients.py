@@ -1,36 +1,53 @@
 """HTTP and RabbitMQ clients for service integration."""
 
+import asyncio
 import json
 from typing import Any
 
 import httpx
 import structlog
-from tenacity import retry, stop_after_attempt, wait_exponential
-import pika
-from pika.adapters.asyncio_connection import AsyncioConnection
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 logger = structlog.get_logger()
+
+
+def _is_retryable_error(e: Exception) -> bool:
+    """Check if an exception should trigger a retry."""
+    # Retry on connection/timeout errors
+    if isinstance(e, (httpx.ConnectError, httpx.TimeoutException)):
+        return True
+    # Retry on 5xx HTTP errors
+    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code >= 500:
+        return True
+    return False
 
 
 class TicketClient:
     """HTTP client for ticket-masala API."""
     
     def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip("/")
         self.client = httpx.AsyncClient(
-            base_url=self.base_url,
+            base_url=base_url.rstrip("/"),
             timeout=30.0,
             headers={"Accept": "application/json"}
         )
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error)
+    )
     async def get_ticket(self, ticket_id: str) -> dict[str, Any]:
         """Get single ticket details."""
         response = await self.client.get(f"/api/tickets/{ticket_id}")
         response.raise_for_status()
         return response.json()
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error)
+    )
     async def list_tickets(
         self,
         customer_email: str | None = None,
@@ -48,7 +65,11 @@ class TicketClient:
         response.raise_for_status()
         return response.json()
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error)
+    )
     async def create_ticket(
         self,
         title: str,
@@ -69,7 +90,11 @@ class TicketClient:
         response.raise_for_status()
         return response.json()
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error)
+    )
     async def resolve_ticket(
         self,
         ticket_id: str,
@@ -98,14 +123,17 @@ class OdooBridgeClient:
     """HTTP client for odoo-bridge API."""
     
     def __init__(self, base_url: str):
-        self.base_url = base_url.rstrip("/")
         self.client = httpx.AsyncClient(
-            base_url=self.base_url,
+            base_url=base_url.rstrip("/"),
             timeout=30.0,
             headers={"Accept": "application/json"}
         )
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error)
+    )
     async def get_invoice_status(self, ticket_id: str) -> dict[str, Any] | None:
         """Get invoice status for a ticket."""
         response = await self.client.get(f"/api/invoices/by-ticket/{ticket_id}")
@@ -114,7 +142,11 @@ class OdooBridgeClient:
         response.raise_for_status()
         return response.json()
     
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error)
+    )
     async def list_customer_invoices(self, customer_email: str) -> list[dict[str, Any]]:
         """List invoices for a customer."""
         response = await self.client.get(
@@ -139,13 +171,12 @@ class RabbitMQPublisher:
     
     async def connect(self):
         """Establish connection."""
-        import asyncio
-        from pika import URLParameters
+        import pika
         
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         
         def _connect():
-            params = URLParameters(self.amqp_url)
+            params = pika.URLParameters(self.amqp_url)
             return pika.BlockingConnection(params)
         
         self.connection = await loop.run_in_executor(None, _connect)
@@ -158,16 +189,16 @@ class RabbitMQPublisher:
             durable=True
         )
         
-        logger.info("Connected to RabbitMQ", exchange=self.exchange)
+        logger.info("rabbitmq.connected", exchange=self.exchange)
     
     async def publish(self, routing_key: str, message: dict[str, Any]):
         """Publish message to exchange."""
         if not self.channel:
             raise RuntimeError("Not connected to RabbitMQ")
         
-        import asyncio
-        
         body = json.dumps(message, default=str).encode()
+        
+        import pika
         
         def _publish():
             self.channel.basic_publish(
@@ -180,14 +211,13 @@ class RabbitMQPublisher:
                 )
             )
         
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _publish)
         
-        logger.debug("Published message", routing_key=routing_key)
+        logger.debug("rabbitmq.message_published", routing_key=routing_key)
     
     async def close(self):
         """Close connection."""
         if self.connection and not self.connection.is_closed:
-            import asyncio
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, self.connection.close)
