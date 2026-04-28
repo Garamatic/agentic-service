@@ -9,7 +9,6 @@ Consumes events from RabbitMQ and triggers automated workflows:
 import asyncio
 import json
 import signal
-from datetime import datetime
 from typing import Any
 
 import aio_pika
@@ -81,8 +80,6 @@ class EventConsumer:
         )
         customer_email = event.get("customer_email") or event.get("CustomerEmail")
         amount = event.get("amount") or event.get("Amount") or 0
-        paid_at = event.get("paid_at") or event.get("PaidAt")
-
         logger.info("workflow.payment_received", ticket_id=ticket_id, invoice_id=invoice_id)
 
         if not self.mq_publisher.exchange:
@@ -92,8 +89,6 @@ class EventConsumer:
         # Send thank you email (flat structure per email.send schema)
         payload = {
             "event_type": "email.send",
-            "timestamp": datetime.now().isoformat(),
-            "source": "agentic-service",
             "to_email": customer_email,
             "from_email": "billing@garamatic.com",
             "from_name": "Garamatic Billing",
@@ -122,8 +117,6 @@ class EventConsumer:
         )
         customer_email = event.get("customer_email") or event.get("CustomerEmail")
         amount = event.get("amount") or event.get("Amount") or 0
-        sent_at = event.get("sent_at") or event.get("SentAt")
-
         logger.info("workflow.invoice_created", ticket_id=ticket_id, invoice_id=invoice_id)
 
         if not self.mq_publisher.exchange:
@@ -132,8 +125,6 @@ class EventConsumer:
 
         payload = {
             "event_type": "email.send",
-            "timestamp": datetime.now().isoformat(),
-            "source": "agentic-service",
             "to_email": customer_email,
             "from_email": "billing@garamatic.com",
             "from_name": "Garamatic Billing",
@@ -157,8 +148,6 @@ class EventConsumer:
         """Handle ticket.escalated event: notify manager."""
         ticket_id = event.get("ticket_id") or event.get("TicketId")
         reason = event.get("reason") or event.get("Reason") or "Unknown"
-        escalated_at = event.get("escalated_at") or event.get("EscalatedAt")
-
         logger.warning("workflow.ticket_escalated", ticket_id=ticket_id, reason=reason)
 
         if not self.mq_publisher.exchange:
@@ -176,8 +165,6 @@ class EventConsumer:
 
         payload = {
             "event_type": "email.send",
-            "timestamp": datetime.now().isoformat(),
-            "source": "agentic-service",
             "to_email": manager_email,
             "from_email": "system@garamatic.com",
             "from_name": "Garamatic System",
@@ -186,7 +173,7 @@ class EventConsumer:
             <h2>Ticket Escalation Alert</h2>
             <p>Ticket #{ticket_id} has been escalated.</p>
             <p><strong>Reason:</strong> {reason}</p>
-            <p><strong>Customer:</strong> {ticket.get('customerName', 'Unknown')} ({ticket.get('customerEmail', 'N/A')})</p>
+            <p><strong>Customer ID:</strong> {ticket.get('customerId', 'N/A')}</p>
             <p><strong>Title:</strong> {ticket.get('title', 'Untitled')}</p>
             <p>Please review immediately.</p>
             """,
@@ -204,8 +191,6 @@ class EventConsumer:
         customer_email = event.get("customer_email") or event.get("CustomerEmail")
         customer_name = event.get("customer_name") or event.get("CustomerName")
         title = event.get("title") or event.get("Title")
-        created_at = event.get("created_at") or event.get("CreatedAt")
-
         logger.info("workflow.ticket_created", ticket_id=ticket_id, customer=customer_email)
 
         if not self.mq_publisher.exchange:
@@ -214,8 +199,6 @@ class EventConsumer:
 
         payload = {
             "event_type": "email.send",
-            "timestamp": datetime.now().isoformat(),
-            "source": "agentic-service",
             "to_email": customer_email,
             "from_email": "support@garamatic.com",
             "from_name": "Garamatic Support",
@@ -261,8 +244,6 @@ class EventConsumer:
 
         payload = {
             "event_type": "email.send",
-            "timestamp": datetime.now().isoformat(),
-            "source": "agentic-service",
             "to_email": customer_email,
             "from_email": "billing@garamatic.com",
             "from_name": "Garamatic Billing",
@@ -290,8 +271,6 @@ class EventConsumer:
             or event.get("ResolutionNotes")
             or "Your issue has been resolved."
         )
-        resolved_at = event.get("resolved_at") or event.get("ResolvedAt")
-
         logger.info(
             "workflow.ticket_resolved", ticket_id=ticket_id, customer=customer_email
         )
@@ -306,8 +285,6 @@ class EventConsumer:
 
         payload = {
             "event_type": "email.send",
-            "timestamp": datetime.now().isoformat(),
-            "source": "agentic-service",
             "to_email": customer_email,
             "from_email": "support@garamatic.com",
             "from_name": "Garamatic Support",

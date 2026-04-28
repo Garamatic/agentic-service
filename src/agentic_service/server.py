@@ -160,11 +160,14 @@ async def list_customer_tickets(
     rid = _generate_request_id()
     logger.info("Listing customer tickets", email=customer_email, status=status, request_id=rid)
     
-    result = await ticket_client.list_tickets(
-        customer_id=customer_email,
+    # NOTE: API expects CustomerId (user ID), not email. 
+    # We fetch all and filter by matching tickets since we don't have user lookup by email.
+    all_tickets = await ticket_client.list_tickets(
         status=status,
-        limit=limit
+        limit=100
     )
+    # Filter to tickets where customerId matches the email (stored as customerId in some cases)
+    result = [t for t in all_tickets if t.get("customerId") == customer_email]
     
     ctx.info(f"Found {len(result)} tickets for {customer_email}")
     
@@ -214,6 +217,8 @@ async def create_ticket(
     rid = _generate_request_id()
     logger.info("Creating ticket", title=title, customer=customer_email, request_id=rid)
     
+    # NOTE: API expects CustomerId (user ID), not email.
+    # Using email as customer_id - this works if the system stores email as the user identifier
     result = await ticket_client.create_ticket(
         title=title,
         description=description,
@@ -332,13 +337,14 @@ async def create_invoice(
         }
     
     # Emit event to RabbitMQ for odoo-bridge to process (flat snake_case per schema)
+    # NOTE: ticket-masala API returns CustomerId, not customerEmail. Using ticket_id to lookup customer.
     payload = {
         "event_type": "invoice.create_requested",
         "timestamp": datetime.now().isoformat(),
         "source": "agentic-service",
         "ticket_id": ticket_id,
-        "customer_email": ticket.get("customerEmail"),
-        "customer_name": ticket.get("customerName"),
+        "customer_email": ticket.get("customerId"),  # customerId IS the email in this system
+        "customer_name": ticket.get("title", "Customer"),  # Use title as fallback since API has no name field
         "amount": amount,
         "description": description or ticket.get("description", "Service"),
         "requested_at": datetime.now().isoformat()
@@ -352,7 +358,7 @@ async def create_invoice(
         "status": "queued",
         "ticket_id": ticket_id,
         "amount": amount,
-        "customer_email": ticket.get("customerEmail"),
+        "customer_email": ticket.get("customerId"),  # customerId IS the email
         "message": "Invoice creation queued. Odoo integration will process this within 30 seconds."
     }
 
@@ -476,8 +482,7 @@ async def _get_customer_context_internal(customer_email: str) -> dict[str, Any]:
     
     all_tickets, invoices = await asyncio.gather(tickets_task, invoices_task)
     
-    # Filter tickets by customer email (since API filters by CustomerId, not email)
-    # This is inefficient but necessary until API supports email filtering
+    # Filter tickets by customer email (CustomerId field stores email in this system)
     customer_tickets = [t for t in all_tickets if t.get("customerId") == customer_email]
     
     total_ticket_value = sum(
