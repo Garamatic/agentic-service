@@ -59,7 +59,6 @@ class TicketClient:
             api_key: Optional API key for authentication
             timeout: Request timeout in seconds
         """
-        # FIXED: Use versioned API path /api/v1 instead of /api
         self.client = httpx.AsyncClient(
             base_url=f"{base_url.rstrip('/')}/api/v1",
             headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
@@ -82,7 +81,6 @@ class TicketClient:
         Returns:
             The ticket data as a dictionary
         """
-        # FIXED: Use /work-items/{id} instead of /tickets/{id}
         response = await self.client.get(f"/work-items/{ticket_id}")
         response.raise_for_status()
         return response.json()
@@ -112,8 +110,6 @@ class TicketClient:
         Returns:
             List of ticket data dictionaries
         """
-        # FIXED: Use /work-items instead of /tickets
-        # FIXED: Use customer_id instead of customerEmail
         params: dict[str, Any] = {
             "limit": limit,
             "offset": offset,
@@ -152,7 +148,6 @@ class TicketClient:
         Returns:
             The created ticket data
         """
-        # FIXED: Use /work-items instead of /tickets
         payload = {
             "title": title,
             "description": description,
@@ -187,7 +182,6 @@ class TicketClient:
         Returns:
             The resolved ticket data
         """
-        # FIXED: Use /work-items/{id}/resolve instead of /tickets/{id}/resolve
         payload: dict[str, Any] = {}
         if resolution_notes:
             payload["resolutionNotes"] = resolution_notes
@@ -196,7 +190,7 @@ class TicketClient:
 
         response = await self.client.post(
             f"/work-items/{ticket_id}/resolve",
-            json=payload if payload else None,
+            json=payload,
         )
         response.raise_for_status()
         return response.json()
@@ -255,6 +249,14 @@ class OdooBridgeClient:
 
     async def close(self) -> None:
         await self.client.aclose()
+
+    async def __aenter__(self) -> "OdooBridgeClient":
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        """Async context manager exit."""
+        await self.close()
 
 
 class RabbitMQPublisher:
