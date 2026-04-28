@@ -1,8 +1,7 @@
 """Tests for MCP server tools."""
 
 import pytest
-import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 from fastmcp import Context
 
 from agentic_service.server import (

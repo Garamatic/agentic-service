@@ -3,7 +3,6 @@
 import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock
-from httpx import AsyncClient as HTTPXAsyncClient
 import respx
 
 

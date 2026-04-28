@@ -5,7 +5,7 @@ from datetime import datetime
 
 import httpx
 import structlog
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 import pybreaker
