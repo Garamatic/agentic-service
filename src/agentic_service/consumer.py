@@ -1,8 +1,8 @@
 """Event Consumer for Garamatic Agentic Service.
 
 Consumes events from RabbitMQ and triggers automated workflows:
-- invoice.paid -> resolve ticket, email customer
-- ticket.escalated -> notify manager
+- payment.received -> email customer, resolve ticket
+- invoice.created -> notify customer
 - etc.
 """
 
@@ -57,12 +57,11 @@ class EventConsumer:
             durable=True
         )
 
-        # Bind to relevant events
+        # Bind to relevant events (FIXED: match odoo-integration emissions)
         bindings = [
-            "invoice.paid",
-            "invoice.sent",
-            "ticket.created",
-            "ticket.escalated",
+            "payment.received",  # Was: invoice.paid
+            "invoice.created",   # Was: invoice.sent
+            # NOTE: ticket.created and ticket.escalated have no producers yet
         ]
 
         for routing_key in bindings:
@@ -71,18 +70,18 @@ class EventConsumer:
         logger.info("consumer.connected", queue=self.queue.name)
         return self.queue
 
-    async def process_invoice_paid(self, event: dict[str, Any]):
-        """Handle invoice.paid event: email customer, resolve ticket."""
+    async def process_payment_received(self, event: dict[str, Any]):
+        """Handle payment.received event: email customer, resolve ticket."""
         ticket_id = event.get("ticket_id")
         invoice_id = event.get("invoice_id")
         customer_email = event.get("customer_email")
         amount = event.get("amount")
         paid_at = event.get("paid_at")
 
-        logger.info("workflow.invoice_paid", ticket_id=ticket_id, invoice_id=invoice_id)
+        logger.info("workflow.payment_received", ticket_id=ticket_id, invoice_id=invoice_id)
 
         if not self.mq_publisher.exchange:
-            logger.error("workflow.mq_not_connected", event="invoice.paid")
+            logger.error("workflow.mq_not_connected", event="payment.received")
             return
 
         # Send thank you email
@@ -112,18 +111,18 @@ class EventConsumer:
         except Exception as e:
             logger.error("workflow.email_failed", error=str(e))
 
-    async def process_invoice_sent(self, event: dict[str, Any]):
-        """Handle invoice.sent event: notify customer."""
+    async def process_invoice_created(self, event: dict[str, Any]):
+        """Handle invoice.created event: notify customer."""
         ticket_id = event.get("ticket_id")
         invoice_id = event.get("invoice_id")
         customer_email = event.get("customer_email")
         amount = event.get("amount")
         sent_at = event.get("sent_at")
 
-        logger.info("workflow.invoice_sent", ticket_id=ticket_id, invoice_id=invoice_id)
+        logger.info("workflow.invoice_created", ticket_id=ticket_id, invoice_id=invoice_id)
 
         if not self.mq_publisher.exchange:
-            logger.error("workflow.mq_not_connected", event="invoice.sent")
+            logger.error("workflow.mq_not_connected", event="invoice.created")
             return
 
         email_data = {
@@ -264,8 +263,9 @@ class EventConsumer:
 
                 # Dispatch to appropriate handler
                 handlers = {
-                    "invoice.paid": self.process_invoice_paid,
-                    "invoice.sent": self.process_invoice_sent,
+                    "payment.received": self.process_payment_received,
+                    "invoice.created": self.process_invoice_created,
+                    # NOTE: handlers for ticket.escalated and ticket.created defined but no producers
                     "ticket.escalated": self.process_ticket_escalated,
                     "ticket.created": self.process_ticket_created,
                 }
