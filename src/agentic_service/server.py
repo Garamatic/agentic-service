@@ -124,12 +124,11 @@ async def get_ticket_status(
     return {
         "ticket_id": ticket_id,
         "status": result.get("status", "unknown"),
-        "customer_email": result.get("customerEmail"),
-        "customer_name": result.get("customerName"),
+        "customer_id": result.get("customerId"),  # NOTE: API returns CustomerId, not customerEmail
         "title": result.get("title"),
         "description": result.get("description"),
         "created_at": result.get("createdAt"),
-        "resolved_at": result.get("resolvedAt"),
+        "resolved_at": result.get("resolvedAt") or result.get("completedAt"),
         "resolution_notes": result.get("resolutionNotes"),
         "billable_amount": result.get("billableAmount")
     }
@@ -176,7 +175,7 @@ async def list_customer_tickets(
                 "title": t.get("title"),
                 "status": t.get("status"),
                 "created_at": t.get("createdAt"),
-                "resolved_at": t.get("resolvedAt")
+                "resolved_at": t.get("resolvedAt") or t.get("completedAt")
             }
             for t in result
         ]
@@ -470,13 +469,19 @@ async def _get_customer_context_internal(customer_email: str) -> dict[str, Any]:
     logger.info("Getting customer context", email=customer_email, request_id=rid)
     
     # Parallel queries
-    tickets_task = ticket_client.list_tickets(customer_id=customer_email, limit=5)
+    # NOTE: Ticket API filters by CustomerId (user ID), not email
+    # This requires mapping email -> user ID first, or the API needs email filter support
+    tickets_task = ticket_client.list_tickets(limit=50)  # Fetch all, filter locally
     invoices_task = odoo_client.list_customer_invoices(customer_email)
     
-    tickets, invoices = await asyncio.gather(tickets_task, invoices_task)
+    all_tickets, invoices = await asyncio.gather(tickets_task, invoices_task)
+    
+    # Filter tickets by customer email (since API filters by CustomerId, not email)
+    # This is inefficient but necessary until API supports email filtering
+    customer_tickets = [t for t in all_tickets if t.get("customerId") == customer_email]
     
     total_ticket_value = sum(
-        t.get("billableAmount", 0) for t in tickets if t.get("status") == "resolved"
+        t.get("billableAmount", 0) for t in customer_tickets if t.get("status") == "resolved"
     )
     
     outstanding = sum(
@@ -486,8 +491,8 @@ async def _get_customer_context_internal(customer_email: str) -> dict[str, Any]:
     return {
         "customer_email": customer_email,
         "summary": {
-            "total_tickets": len(tickets),
-            "open_tickets": sum(1 for t in tickets if t.get("status") != "resolved"),
+            "total_tickets": len(customer_tickets),
+            "open_tickets": sum(1 for t in customer_tickets if t.get("status") != "resolved"),
             "total_invoiced": sum(inv.get("amount", 0) for inv in invoices),
             "outstanding_balance": outstanding,
             "lifetime_value": total_ticket_value
@@ -499,7 +504,7 @@ async def _get_customer_context_internal(customer_email: str) -> dict[str, Any]:
                 "status": t.get("status"),
                 "created_at": t.get("createdAt")
             }
-            for t in tickets[:3]
+            for t in customer_tickets[:3]
         ],
         "recent_invoices": [
             {
@@ -632,13 +637,13 @@ async def get_customer_resource(email: str) -> str:
     _validate_email(email)
     context = await _get_customer_context_internal(email)
     
-    tickets_section = chr(10).join(
+    tickets_section = "\n".join(
         f"- [{t['status'].upper() if t.get('status') else 'UNKNOWN'}] "
         f"{t.get('title', 'Untitled')} ({_format_date(t.get('created_at'))})"
         for t in context['recent_tickets']
     ) if context['recent_tickets'] else "No recent tickets"
     
-    invoices_section = chr(10).join(
+    invoices_section = "\n".join(
         f"- [{inv['status'].upper() if inv.get('status') else 'UNKNOWN'}] "
         f"€{inv.get('amount', 0):.2f}"
         for inv in context['recent_invoices']
