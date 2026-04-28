@@ -352,22 +352,27 @@ async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
         logger.error("api.create_invoice.ticket_lookup_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
         raise HTTPException(status_code=500, detail=create_error_response(rid, "Failed to retrieve ticket"))
     
+    # Use envelope format matching server.py and agent.py
     event = {
-        "event_type": "invoice.create_requested",
-        "ticket_id": ticket_id,
-        "customer_email": ticket.get("customerEmail"),
-        "customer_name": ticket.get("customerName"),
-        "amount": request.amount,
-        "description": request.description or ticket.get("description", "Service"),
-        "requested_at": datetime.now().isoformat()
+        "eventType": "invoice.create_requested",
+        "timestamp": datetime.now().isoformat(),
+        "source": "agentic-service",
+        "data": {
+            "ticket_id": ticket_id,
+            "customer_email": ticket.get("customerEmail"),
+            "customer_name": ticket.get("customerName"),
+            "amount": request.amount,
+            "description": request.description or ticket.get("description", "Service"),
+            "requested_at": datetime.now().isoformat()
+        }
     }
-    
+
     try:
         await mq_publisher.publish("invoice.create_requested", event)
     except Exception as e:
         logger.error("api.create_invoice.publish_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
         raise HTTPException(status_code=503, detail=create_error_response(rid, "Failed to queue invoice creation"))
-    
+
     return {
         "status": "queued",
         "ticket_id": ticket_id,
@@ -387,21 +392,26 @@ async def api_send_email(request: SendEmailRequest):
     rid = _generate_request_id()
     logger.info("api.send_email", to=request.to_email, subject=request.subject, request_id=rid)
     
+    # Use envelope format matching server.py
     event = {
-        "event_type": "email.send",
-        "to_email": request.to_email,
-        "from_name": request.from_name,
-        "subject": request.subject,
-        "body_html": request.body,
-        "sent_at": datetime.now().isoformat()
+        "eventType": "email.send",
+        "timestamp": datetime.now().isoformat(),
+        "source": "agentic-service",
+        "data": {
+            "to_email": request.to_email,
+            "from_name": request.from_name,
+            "subject": request.subject,
+            "body_html": request.body,
+            "sent_at": datetime.now().isoformat()
+        }
     }
-    
+
     try:
         await mq_publisher.publish("email.send", event)
     except Exception as e:
         logger.error("api.send_email.publish_failed", to=request.to_email, error=str(e), request_id=rid)
         raise HTTPException(status_code=503, detail=create_error_response(rid, "Failed to queue email"))
-    
+
     return {
         "status": "queued",
         "to_email": request.to_email,

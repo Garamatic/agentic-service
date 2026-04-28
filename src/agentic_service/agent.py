@@ -120,7 +120,7 @@ async def resolve_ticket_with_invoice(ticket_id: str, resolution_notes: str, bil
     """
     if ticket_client is None or mq_publisher is None:
         return "Error: Services not available"
-    
+
     try:
         # Resolve ticket
         ticket = await ticket_client.resolve_ticket(
@@ -128,19 +128,23 @@ async def resolve_ticket_with_invoice(ticket_id: str, resolution_notes: str, bil
             resolution_notes=resolution_notes,
             billable_amount=billable_amount
         )
-        
-        # Create invoice
-        event = {
-            "event_type": "invoice.create_requested",
-            "ticket_id": ticket_id,
-            "customer_email": ticket.get("customerEmail"),
-            "customer_name": ticket.get("customerName"),
-            "amount": billable_amount,
-            "description": resolution_notes[:100],
-            "requested_at": datetime.now().isoformat()
+
+        # Create invoice with envelope format matching server.py
+        payload = {
+            "eventType": "invoice.create_requested",
+            "timestamp": datetime.now().isoformat(),
+            "source": "agentic-service",
+            "data": {
+                "ticket_id": ticket_id,
+                "customer_email": ticket.get("customerEmail"),
+                "customer_name": ticket.get("customerName"),
+                "amount": billable_amount,
+                "description": resolution_notes[:100],
+                "requested_at": datetime.now().isoformat()
+            }
         }
-        await mq_publisher.publish("invoice.create_requested", event)
-        
+        await mq_publisher.publish("invoice.create_requested", payload)
+
         return f"✅ Ticket {ticket_id} resolved and invoice (€{billable_amount:.2f}) queued."
     except Exception as e:
         return f"❌ Error: {str(e)}"
@@ -273,48 +277,48 @@ async def _get_checkpointer() -> BaseCheckpointSaver:
         return MemorySaver()
 
 
-async def create_agent(checkpointer: BaseCheckpointSaver | None = None):
+async def create_agent(checkpointer: BaseCheckpointSaver):
     """Create and configure the LangGraph agent.
-    
+
     Args:
-        checkpointer: Optional custom checkpoint saver. If not provided,
-                     uses environment configuration (AGENT_DB_PATH).
-                     
+        checkpointer: Checkpoint saver for persisting conversation state.
+                     Must be provided (use _get_checkpointer() to create one).
+
     Note: This is async because checkpoint initialization may require async context.
     """
-    
+
     def should_continue(state: AgentState) -> Literal["tools", END]:
         """Determine if we should continue to tools or end."""
         messages = state["messages"]
         last_message = messages[-1]
-        
+
         # If last message has tool calls, go to tools
         if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
             return "tools"
-        
+
         # Otherwise end
         return END
-    
+
     def call_model(state: AgentState):
         """Call the LLM with current state."""
         from langchain_openai import ChatOpenAI
-        
+
         # Initialize model (requires OPENAI_API_KEY env var)
         model = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
         model_with_tools = model.bind_tools(tools)
-        
+
         messages = state["messages"]
         response = model_with_tools.invoke(messages)
-        
+
         return {"messages": [response]}
-    
+
     # Build graph
     workflow = StateGraph(AgentState)
-    
+
     # Add nodes
     workflow.add_node("agent", call_model)
     workflow.add_node("tools", tool_node)
-    
+
     # Add edges
     workflow.add_edge(START, "agent")
     workflow.add_conditional_edges(
@@ -326,11 +330,8 @@ async def create_agent(checkpointer: BaseCheckpointSaver | None = None):
         }
     )
     workflow.add_edge("tools", "agent")
-    
-    # Use provided checkpointer or auto-configure
-    memory = checkpointer or await _get_checkpointer()
-    
-    return workflow.compile(checkpointer=memory)
+
+    return workflow.compile(checkpointer=checkpointer)
 
 
 class GaramaticAgent:
@@ -357,6 +358,9 @@ class GaramaticAgent:
     async def _get_agent(self):
         """Lazy initialization of the agent (async)."""
         if self._agent is None:
+            # If no checkpointer provided, create one and store it for cleanup
+            if self._checkpointer is None:
+                self._checkpointer = await _get_checkpointer()
             self._agent = await create_agent(checkpointer=self._checkpointer)
         return self._agent
     
@@ -397,11 +401,17 @@ class GaramaticAgent:
     async def close(self):
         """Cleanup resources including checkpointer connections."""
         if self._agent is not None:
-            # Note: LangGraph doesn't have explicit close() on compiled graphs,
-            # but if we used AsyncSqliteSaver, we should close the connection
-            if hasattr(self._checkpointer, 'conn') and self._checkpointer.conn:
-                await self._checkpointer.conn.close()
             self._agent = None
+
+        # Close checkpointer connection if we manage it
+        if self._checkpointer is not None:
+            # AsyncSqliteSaver stores connection in .conn attribute
+            if hasattr(self._checkpointer, 'conn') and self._checkpointer.conn:
+                try:
+                    await self._checkpointer.conn.close()
+                except Exception:
+                    pass  # Best effort cleanup
+            self._checkpointer = None
     
     async def run_conversation(self):
         """Run interactive conversation loop."""

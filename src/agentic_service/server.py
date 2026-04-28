@@ -19,8 +19,47 @@ from .config import get_settings
 
 logger = structlog.get_logger()
 
+# Setup and teardown using lifespan context manager
+@asynccontextmanager
+async def app_lifespan():
+    """Initialize and cleanup clients on server startup/shutdown."""
+    global ticket_client, odoo_client, mq_publisher
+    
+    # Startup
+    config = get_settings()
+    
+    ticket_client = TicketClient(config.ticket_api_url)
+    odoo_client = OdooBridgeClient(config.odoo_bridge_url)
+    
+    # Initialize RabbitMQ but don't fail if unavailable (graceful degradation)
+    try:
+        mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
+        await mq_publisher.connect()
+        logger.info("rabbitmq.connected")
+    except Exception as e:
+        logger.warning("rabbitmq.unavailable", error=str(e))
+        mq_publisher = None  # Flag as unavailable - write operations will fail gracefully
+    
+    logger.info("service.started",
+                ticket_api=config.ticket_api_url,
+                odoo_bridge=config.odoo_bridge_url)
+    
+    try:
+        yield
+    finally:
+        # Shutdown
+        if ticket_client:
+            await ticket_client.close()
+        if odoo_client:
+            await odoo_client.close()
+        if mq_publisher:
+            await mq_publisher.close()
+        
+        logger.info("service.stopped")
+
+
 # Create MCP server
-mcp = FastMCP("garamatic")
+mcp = FastMCP("garamatic", lifespan=app_lifespan)
 
 
 def _format_date(d: str | None) -> str:
@@ -30,10 +69,20 @@ def _format_date(d: str | None) -> str:
 
 def _validate_email(email: str) -> None:
     """Validate email format, raise ValueError if invalid."""
-    if not email or "@" not in email:
+    if not email or not isinstance(email, str):
+        raise ValueError(f"Invalid email format: {email}")
+    if "@" not in email:
         raise ValueError(f"Invalid email format: {email}")
     local, _, domain = email.rpartition("@")
-    if not local or not domain or "." not in domain or domain.endswith("."):
+    if not local or not domain:
+        raise ValueError(f"Invalid email format: {email}")
+    # Domain must contain at least one dot, not start/end with dot
+    if "." not in domain:
+        raise ValueError(f"Invalid email format: {email}")
+    if domain.startswith(".") or domain.endswith("."):
+        raise ValueError(f"Invalid email format: {email}")
+    # Local part cannot contain consecutive dots
+    if ".." in local:
         raise ValueError(f"Invalid email format: {email}")
 
 
@@ -284,17 +333,21 @@ async def create_invoice(
         }
     
     # Emit event to RabbitMQ for odoo-bridge to process
-    event = {
-        "event_type": "invoice.create_requested",
-        "ticket_id": ticket_id,
-        "customer_email": ticket.get("customerEmail"),
-        "customer_name": ticket.get("customerName"),
-        "amount": amount,
-        "description": description or ticket.get("description", "Service"),
-        "requested_at": datetime.now().isoformat()
+    payload = {
+        "eventType": "invoice.create_requested",
+        "timestamp": datetime.now().isoformat(),
+        "source": "agentic-service",
+        "data": {
+            "ticket_id": ticket_id,
+            "customer_email": ticket.get("customerEmail"),
+            "customer_name": ticket.get("customerName"),
+            "amount": amount,
+            "description": description or ticket.get("description", "Service"),
+            "requested_at": datetime.now().isoformat()
+        }
     }
     
-    await mq_publisher.publish("invoice.create_requested", event)
+    await mq_publisher.publish("invoice.create_requested", payload)
     
     ctx.info(f"Invoice creation requested for ticket {ticket_id}")
     
@@ -385,16 +438,20 @@ async def send_email(
     logger.info("Sending email", to=to_email, subject=subject, request_id=rid)
     
     # Emit event for mailing-service
-    event = {
-        "event_type": "email.send",
-        "to_email": to_email,
-        "from_name": from_name,
-        "subject": subject,
-        "body_html": body,
-        "sent_at": datetime.now().isoformat()
+    payload = {
+        "eventType": "email.send",
+        "timestamp": datetime.now().isoformat(),
+        "source": "agentic-service",
+        "data": {
+            "to_email": to_email,
+            "from_name": from_name,
+            "subject": subject,
+            "body_html": body,
+            "sent_at": datetime.now().isoformat()
+        }
     }
     
-    await mq_publisher.publish("email.send", event)
+    await mq_publisher.publish("email.send", payload)
     
     ctx.info(f"Email queued for {to_email}")
     
@@ -608,47 +665,6 @@ async def get_customer_resource(email: str) -> str:
 """
 
 
-# Setup and teardown using lifespan context manager
-@asynccontextmanager
-async def app_lifespan():
-    """Initialize and cleanup clients on server startup/shutdown."""
-    global ticket_client, odoo_client, mq_publisher
-    
-    # Startup
-    config = get_settings()
-    
-    ticket_client = TicketClient(config.ticket_api_url)
-    odoo_client = OdooBridgeClient(config.odoo_bridge_url)
-    
-    # Initialize RabbitMQ but don't fail if unavailable (graceful degradation)
-    try:
-        mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
-        await mq_publisher.connect()
-        logger.info("rabbitmq.connected")
-    except Exception as e:
-        logger.warning("rabbitmq.unavailable", error=str(e))
-        mq_publisher = None  # Flag as unavailable - write operations will fail gracefully
-    
-    logger.info("service.started",
-                ticket_api=config.ticket_api_url,
-                odoo_bridge=config.odoo_bridge_url)
-    
-    try:
-        yield
-    finally:
-        # Shutdown
-        if ticket_client:
-            await ticket_client.close()
-        if odoo_client:
-            await odoo_client.close()
-        if mq_publisher:
-            await mq_publisher.close()
-        
-        logger.info("service.stopped")
-
-
-# Attach lifespan to MCP server
-mcp.lifespan = app_lifespan
 
 
 def main():

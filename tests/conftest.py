@@ -88,8 +88,8 @@ def mock_mq_publisher():
     return publisher
 
 
-@pytest.fixture
-def mock_mcp_context():
+@pytest_asyncio.fixture
+async def mock_mcp_context():
     """Mock MCP Context with properly configured async info method."""
     ctx = MagicMock()
     ctx.info = AsyncMock()

@@ -58,25 +58,65 @@ class TicketClient:
             timeout=30.0,
             headers={"Accept": "application/json"}
         )
+
+    async def _try_request_json(self, method: str, paths: list[str], **kwargs):
+        """Try multiple paths in order and return the first successful JSON response.
+
+        Raises the last HTTP error if none succeed.
+        """
+        last_exc: Exception | None = None
+        for path in paths:
+            try:
+                resp = await self.client.request(method, path, **kwargs)
+            except Exception as e:
+                last_exc = e
+                continue
+
+            # success
+            if 200 <= resp.status_code < 300:
+                try:
+                    return resp.json()
+                except Exception as e:
+                    # JSON decode error - treat as failure
+                    last_exc = e
+                    continue
+
+            # Not found -> try next
+            if resp.status_code == 404:
+                last_exc = httpx.HTTPStatusError("404 Not Found", request=resp.request, response=resp)
+                continue
+
+            # other client/server error -> raise to caller
+            resp.raise_for_status()
+
+        # If we reach here, re-raise last exception
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("No paths provided to _try_request_json")
     
-    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception(_is_retryable_error)
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True
     )
+    @ticket_api_breaker
     async def get_ticket(self, ticket_id: str) -> dict[str, Any]:
         """Get single ticket details."""
-        response = await self.client.get(f"/api/tickets/{ticket_id}")
-        response.raise_for_status()
-        return response.json()
+        paths = [
+            f"/api/tickets/{ticket_id}",
+            f"/api/v1/tickets/{ticket_id}",
+            f"/api/v1/work-items/{ticket_id}"
+        ]
+        return await self._try_request_json("GET", paths)
     
-    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception(_is_retryable_error)
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True
     )
+    @ticket_api_breaker
     async def list_tickets(
         self,
         customer_email: str | None = None,
@@ -89,17 +129,18 @@ class TicketClient:
             params["customerEmail"] = customer_email
         if status:
             params["status"] = status
-            
-        response = await self.client.get("/api/tickets", params=params)
-        response.raise_for_status()
-        return response.json()
+
+        # try legacy unversioned list first, then v1 work-items (which may not support filters)
+        paths = ["/api/tickets", "/api/v1/work-items"]
+        return await self._try_request_json("GET", paths, params=params)
     
-    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception(_is_retryable_error)
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True
     )
+    @ticket_api_breaker
     async def create_ticket(
         self,
         title: str,
@@ -109,23 +150,52 @@ class TicketClient:
         priority: str = "medium"
     ) -> dict[str, Any]:
         """Create a new ticket."""
-        payload = {
-            "title": title,
-            "description": description,
-            "customerEmail": customer_email,
-            "customerName": customer_name,
-            "priority": priority
-        }
-        response = await self.client.post("/api/tickets", json=payload)
-        response.raise_for_status()
-        return response.json()
+        # Candidate payloads for different TicketMasala endpoints
+        payloads = [
+            # legacy unversioned tickets endpoint (best-effort)
+            ("/api/tickets", {
+                "title": title,
+                "description": description,
+                "customerEmail": customer_email,
+                "customerName": customer_name,
+                "priority": priority
+            }),
+            # external submission endpoint exposed by TicketMasala for anonymous partners
+            ("/api/v1/tickets/external", {
+                "Subject": title,
+                "Description": description,
+                "CustomerEmail": customer_email,
+                "CustomerName": customer_name,
+                "SourceSite": "agentic-service"
+            }),
+            # fallback: create work-item (requires CustomerId usually, may fail)
+            ("/api/v1/work-items", {
+                "Title": title,
+                "Description": description,
+                "CustomerId": customer_email,  # best-effort (may not be accepted)
+                "Priority": priority
+            })
+        ]
+
+        last_exc: Exception | None = None
+        for path, payload in payloads:
+            try:
+                return await self._try_request_json("POST", [path], json=payload)
+            except Exception as e:
+                last_exc = e
+                continue
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Failed to create ticket: no payloads attempted")
     
-    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception(_is_retryable_error)
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True
     )
+    @ticket_api_breaker
     async def resolve_ticket(
         self,
         ticket_id: str,
@@ -133,18 +203,17 @@ class TicketClient:
         billable_amount: float | None = None
     ) -> dict[str, Any]:
         """Resolve a ticket."""
-        payload = {
-            "resolutionNotes": resolution_notes
-        }
+        payload = {"resolutionNotes": resolution_notes}
         if billable_amount is not None:
             payload["billableAmount"] = billable_amount
-            
-        response = await self.client.post(
+
+        paths = [
             f"/api/tickets/{ticket_id}/resolve",
-            json=payload
-        )
-        response.raise_for_status()
-        return response.json()
+            f"/api/v1/tickets/{ticket_id}/resolve",
+            f"/api/v1/work-items/{ticket_id}/resolve"
+        ]
+
+        return await self._try_request_json("POST", paths, json=payload)
     
     async def close(self):
         await self.client.aclose()
@@ -160,12 +229,13 @@ class OdooBridgeClient:
             headers={"Accept": "application/json"}
         )
     
-    @odoo_bridge_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception(_is_retryable_error)
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True
     )
+    @odoo_bridge_breaker
     async def get_invoice_status(self, ticket_id: str) -> dict[str, Any] | None:
         """Get invoice status for a ticket."""
         response = await self.client.get(f"/api/invoices/by-ticket/{ticket_id}")
@@ -174,12 +244,13 @@ class OdooBridgeClient:
         response.raise_for_status()
         return response.json()
     
-    @odoo_bridge_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception(_is_retryable_error)
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True
     )
+    @odoo_bridge_breaker
     async def list_customer_invoices(self, customer_email: str) -> list[dict[str, Any]]:
         """List invoices for a customer."""
         response = await self.client.get(
