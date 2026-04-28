@@ -1,13 +1,45 @@
 """HTTP clients for external service communication."""
 
+import json
 import httpx
 from typing import Optional, Any
+import aio_pika
 import pybreaker
+import structlog
 from tenacity import (
     retry,
     stop_after_attempt,
     wait_exponential,
     retry_if_exception,
+)
+
+logger = structlog.get_logger()
+
+
+def _is_retryable_error(exception: BaseException) -> bool:
+    """Module-level retryable error helper."""
+    if isinstance(exception, httpx.HTTPStatusError):
+        return exception.response.status_code >= 500
+    return isinstance(exception, (httpx.ConnectError, httpx.TimeoutException))
+
+
+ticket_api_breaker = pybreaker.CircuitBreaker(
+    fail_max=5,
+    reset_timeout=60,
+    exclude=[
+        lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500
+    ],
+    name="ticket_api",
+)
+
+
+odoo_bridge_breaker = pybreaker.CircuitBreaker(
+    fail_max=5,
+    reset_timeout=60,
+    exclude=[
+        lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500
+    ],
+    name="odoo_bridge",
 )
 
 
@@ -33,19 +65,8 @@ class TicketClient:
             headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
             timeout=timeout,
         )
-        # Circuit breaker for ticket API
-        self._breaker = pybreaker.CircuitBreaker(
-            fail_max=5,
-            reset_timeout=60,
-            expected_exception=httpx.HTTPStatusError,
-        )
 
-    def _is_retryable_error(self, exception: Exception) -> bool:
-        """Check if an exception is retryable."""
-        if isinstance(exception, httpx.HTTPStatusError):
-            return exception.response.status_code >= 500
-        return isinstance(exception, (httpx.ConnectError, httpx.TimeoutException))
-
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -62,11 +83,11 @@ class TicketClient:
             The ticket data as a dictionary
         """
         # FIXED: Use /work-items/{id} instead of /tickets/{id}
-        async with self._breaker:
-            response = await self.client.get(f"/work-items/{ticket_id}")
-            response.raise_for_status()
-            return response.json()
+        response = await self.client.get(f"/work-items/{ticket_id}")
+        response.raise_for_status()
+        return response.json()
 
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -102,11 +123,11 @@ class TicketClient:
         if status:
             params["status"] = status
 
-        async with self._breaker:
-            response = await self.client.get("/work-items", params=params)
-            response.raise_for_status()
-            return response.json()
+        response = await self.client.get("/work-items", params=params)
+        response.raise_for_status()
+        return response.json()
 
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -139,11 +160,11 @@ class TicketClient:
             **kwargs,
         }
 
-        async with self._breaker:
-            response = await self.client.post("/work-items", json=payload)
-            response.raise_for_status()
-            return response.json()
+        response = await self.client.post("/work-items", json=payload)
+        response.raise_for_status()
+        return response.json()
 
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -173,13 +194,12 @@ class TicketClient:
         if billable_amount is not None:
             payload["billableAmount"] = billable_amount
 
-        async with self._breaker:
-            response = await self.client.post(
-                f"/work-items/{ticket_id}/resolve",
-                json=payload if payload else None,
-            )
-            response.raise_for_status()
-            return response.json()
+        response = await self.client.post(
+            f"/work-items/{ticket_id}/resolve",
+            json=payload if payload else None,
+        )
+        response.raise_for_status()
+        return response.json()
 
     async def close(self) -> None:
         """Close the HTTP client."""
@@ -192,3 +212,88 @@ class TicketClient:
     async def __aexit__(self, *args: Any) -> None:
         """Async context manager exit."""
         await self.close()
+
+
+class OdooBridgeClient:
+    """HTTP client for odoo-bridge API."""
+
+    def __init__(self, base_url: str):
+        self.client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            timeout=30.0,
+            headers={"Accept": "application/json"},
+        )
+
+    @odoo_bridge_breaker
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True,
+    )
+    async def get_invoice_status(self, ticket_id: str) -> dict[str, Any] | None:
+        response = await self.client.get(f"/api/invoices/by-ticket/{ticket_id}")
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    @odoo_bridge_breaker
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True,
+    )
+    async def list_customer_invoices(self, customer_email: str) -> list[dict[str, Any]]:
+        response = await self.client.get(
+            "/api/invoices",
+            params={"customerEmail": customer_email},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+
+class RabbitMQPublisher:
+    """Async RabbitMQ publisher (aio-pika native)."""
+
+    def __init__(self, amqp_url: str):
+        self.amqp_url = amqp_url
+        self.connection: aio_pika.RobustConnection | None = None
+        self.channel: aio_pika.Channel | None = None
+        self.exchange: aio_pika.Exchange | None = None
+        self._exchange_name = "event_exchange"
+
+    async def connect(self) -> None:
+        self.connection = await aio_pika.connect_robust(self.amqp_url)
+        self.channel = await self.connection.channel()
+        self.exchange = await self.channel.declare_exchange(
+            self._exchange_name,
+            aio_pika.ExchangeType.TOPIC,
+            durable=True,
+        )
+        logger.info("rabbitmq.connected", exchange=self._exchange_name)
+
+    async def publish(self, routing_key: str, message: dict[str, Any]) -> None:
+        if not self.exchange:
+            raise RuntimeError("Not connected to RabbitMQ")
+        body = json.dumps(message, default=str).encode()
+        await self.exchange.publish(
+            aio_pika.Message(
+                body=body,
+                content_type="application/json",
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            ),
+            routing_key=routing_key,
+        )
+        logger.debug("rabbitmq.message_published", routing_key=routing_key)
+
+    async def close(self) -> None:
+        if self.connection:
+            await self.connection.close()
+            self.connection = None
+            self.channel = None
+            self.exchange = None

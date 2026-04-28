@@ -59,9 +59,10 @@ class EventConsumer:
 
         # Bind to relevant events (FIXED: match odoo-integration emissions)
         bindings = [
-            "payment.received",  # Was: invoice.paid
-            "invoice.created",   # Was: invoice.sent
-            # NOTE: ticket.created and ticket.escalated have no producers yet
+            "payment.received",   # from odoo-integration InvoiceStatusPoller
+            "invoice.created",    # from odoo-integration TicketResolvedConsumer
+            "invoice.overdue",    # from odoo-integration InvoiceStatusPoller
+            "ticket.resolved",    # from ticket-masala TicketWorkflowService
         ]
 
         for routing_key in bindings:
@@ -72,11 +73,15 @@ class EventConsumer:
 
     async def process_payment_received(self, event: dict[str, Any]):
         """Handle payment.received event: email customer, resolve ticket."""
-        ticket_id = event.get("ticket_id")
-        invoice_id = event.get("invoice_id")
-        customer_email = event.get("customer_email")
-        amount = event.get("amount")
-        paid_at = event.get("paid_at")
+        ticket_id = event.get("ticket_id") or event.get("TicketId")
+        invoice_id = (
+            event.get("invoice_id")
+            or event.get("InvoiceId")
+            or event.get("OdooInvoiceId")
+        )
+        customer_email = event.get("customer_email") or event.get("CustomerEmail")
+        amount = event.get("amount") or event.get("Amount") or 0
+        paid_at = event.get("paid_at") or event.get("PaidAt")
 
         logger.info("workflow.payment_received", ticket_id=ticket_id, invoice_id=invoice_id)
 
@@ -84,9 +89,13 @@ class EventConsumer:
             logger.error("workflow.mq_not_connected", event="payment.received")
             return
 
-        # Send thank you email
-        email_data = {
+        # Send thank you email (flat structure per email.send schema)
+        payload = {
+            "event_type": "email.send",
+            "timestamp": datetime.now().isoformat(),
+            "source": "agentic-service",
             "to_email": customer_email,
+            "from_email": "billing@garamatic.com",
             "from_name": "Garamatic Billing",
             "subject": f"Payment Received - Invoice #{invoice_id}",
             "body_html": f"""
@@ -95,14 +104,6 @@ class EventConsumer:
             <p>Your ticket #{ticket_id} has been closed.</p>
             <p>Best regards,<br>Garamatic Team</p>
             """,
-            "sent_at": paid_at or datetime.now().isoformat()
-        }
-
-        payload = {
-            "eventType": "email.send",
-            "timestamp": datetime.now().isoformat(),
-            "source": "agentic-service",
-            "data": email_data
         }
 
         try:
@@ -113,11 +114,15 @@ class EventConsumer:
 
     async def process_invoice_created(self, event: dict[str, Any]):
         """Handle invoice.created event: notify customer."""
-        ticket_id = event.get("ticket_id")
-        invoice_id = event.get("invoice_id")
-        customer_email = event.get("customer_email")
-        amount = event.get("amount")
-        sent_at = event.get("sent_at")
+        ticket_id = event.get("ticket_id") or event.get("TicketId")
+        invoice_id = (
+            event.get("invoice_id")
+            or event.get("InvoiceId")
+            or event.get("OdooInvoiceId")
+        )
+        customer_email = event.get("customer_email") or event.get("CustomerEmail")
+        amount = event.get("amount") or event.get("Amount") or 0
+        sent_at = event.get("sent_at") or event.get("SentAt")
 
         logger.info("workflow.invoice_created", ticket_id=ticket_id, invoice_id=invoice_id)
 
@@ -125,8 +130,12 @@ class EventConsumer:
             logger.error("workflow.mq_not_connected", event="invoice.created")
             return
 
-        email_data = {
+        payload = {
+            "event_type": "email.send",
+            "timestamp": datetime.now().isoformat(),
+            "source": "agentic-service",
             "to_email": customer_email,
+            "from_email": "billing@garamatic.com",
             "from_name": "Garamatic Billing",
             "subject": f"New Invoice #{invoice_id} - €{amount:.2f}",
             "body_html": f"""
@@ -136,14 +145,6 @@ class EventConsumer:
             <p>Please review and process payment at your earliest convenience.</p>
             <p>Best regards,<br>Garamatic Team</p>
             """,
-            "sent_at": sent_at or datetime.now().isoformat()
-        }
-
-        payload = {
-            "eventType": "email.send",
-            "timestamp": datetime.now().isoformat(),
-            "source": "agentic-service",
-            "data": email_data
         }
 
         try:
@@ -154,9 +155,9 @@ class EventConsumer:
 
     async def process_ticket_escalated(self, event: dict[str, Any]):
         """Handle ticket.escalated event: notify manager."""
-        ticket_id = event.get("ticket_id")
-        reason = event.get("reason", "Unknown")
-        escalated_at = event.get("escalated_at")
+        ticket_id = event.get("ticket_id") or event.get("TicketId")
+        reason = event.get("reason") or event.get("Reason") or "Unknown"
+        escalated_at = event.get("escalated_at") or event.get("EscalatedAt")
 
         logger.warning("workflow.ticket_escalated", ticket_id=ticket_id, reason=reason)
 
@@ -171,11 +172,14 @@ class EventConsumer:
             logger.error("workflow.ticket_lookup_failed", ticket_id=ticket_id, error=str(e))
             ticket = {}
 
-        # TODO: Configure manager email via environment variable
-        manager_email = "manager@garamatic.com"
+        manager_email = "manager@garamatic.com"  # TODO: Make configurable via env var
 
-        alert_data = {
+        payload = {
+            "event_type": "email.send",
+            "timestamp": datetime.now().isoformat(),
+            "source": "agentic-service",
             "to_email": manager_email,
+            "from_email": "system@garamatic.com",
             "from_name": "Garamatic System",
             "subject": f"URGENT: Ticket #{ticket_id} Escalated",
             "body_html": f"""
@@ -186,14 +190,6 @@ class EventConsumer:
             <p><strong>Title:</strong> {ticket.get('title', 'Untitled')}</p>
             <p>Please review immediately.</p>
             """,
-            "sent_at": escalated_at or datetime.now().isoformat()
-        }
-
-        payload = {
-            "eventType": "email.send",
-            "timestamp": datetime.now().isoformat(),
-            "source": "agentic-service",
-            "data": alert_data
         }
 
         try:
@@ -204,11 +200,11 @@ class EventConsumer:
 
     async def process_ticket_created(self, event: dict[str, Any]):
         """Handle ticket.created event: send confirmation."""
-        ticket_id = event.get("ticket_id")
-        customer_email = event.get("customer_email")
-        customer_name = event.get("customer_name")
-        title = event.get("title")
-        created_at = event.get("created_at")
+        ticket_id = event.get("ticket_id") or event.get("TicketId")
+        customer_email = event.get("customer_email") or event.get("CustomerEmail")
+        customer_name = event.get("customer_name") or event.get("CustomerName")
+        title = event.get("title") or event.get("Title")
+        created_at = event.get("created_at") or event.get("CreatedAt")
 
         logger.info("workflow.ticket_created", ticket_id=ticket_id, customer=customer_email)
 
@@ -216,8 +212,12 @@ class EventConsumer:
             logger.error("workflow.mq_not_connected", event="ticket.created")
             return
 
-        email_data = {
+        payload = {
+            "event_type": "email.send",
+            "timestamp": datetime.now().isoformat(),
+            "source": "agentic-service",
             "to_email": customer_email,
+            "from_email": "support@garamatic.com",
             "from_name": "Garamatic Support",
             "subject": f"Ticket #{ticket_id} Created - {title}",
             "body_html": f"""
@@ -228,14 +228,6 @@ class EventConsumer:
             <p>Our team will review and respond within 24 hours.</p>
             <p>Best regards,<br>Garamatic Support Team</p>
             """,
-            "sent_at": created_at or datetime.now().isoformat()
-        }
-
-        payload = {
-            "eventType": "email.send",
-            "timestamp": datetime.now().isoformat(),
-            "source": "agentic-service",
-            "data": email_data
         }
 
         try:
@@ -243,6 +235,101 @@ class EventConsumer:
             logger.info("workflow.confirmation_sent", to=customer_email, ticket_id=ticket_id)
         except Exception as e:
             logger.error("workflow.confirmation_failed", error=str(e))
+
+    async def process_invoice_overdue(self, event: dict[str, Any]):
+        """Handle invoice.overdue event: notify customer + manager."""
+        invoice_id = (
+            event.get("invoice_id")
+            or event.get("InvoiceId")
+            or event.get("OdooInvoiceId")
+        )
+        customer_email = event.get("customer_email") or event.get("CustomerEmail")
+        amount = event.get("amount") or event.get("Amount") or 0
+        days_overdue = event.get("days_overdue") or event.get("DaysOverdue") or 0
+
+        logger.warning(
+            "workflow.invoice_overdue", invoice_id=invoice_id, days=days_overdue
+        )
+
+        if not self.mq_publisher.exchange:
+            logger.error("workflow.mq_not_connected", event="invoice.overdue")
+            return
+
+        if not customer_email:
+            logger.warning("workflow.invoice_overdue.no_email", invoice_id=invoice_id)
+            return
+
+        payload = {
+            "event_type": "email.send",
+            "timestamp": datetime.now().isoformat(),
+            "source": "agentic-service",
+            "to_email": customer_email,
+            "from_email": "billing@garamatic.com",
+            "from_name": "Garamatic Billing",
+            "subject": f"Overdue Invoice #{invoice_id}",
+            "body_html": f"""
+            <h2>Invoice Overdue</h2>
+            <p>Invoice #{invoice_id} for €{amount:.2f} is now {days_overdue} days overdue.</p>
+            <p>Please process payment at your earliest convenience.</p>
+            """,
+        }
+
+        try:
+            await self.mq_publisher.publish("email.send", payload)
+            logger.info("workflow.overdue_notification_sent", to=customer_email)
+        except Exception as e:
+            logger.error("workflow.overdue_notification_failed", error=str(e))
+
+    async def process_ticket_resolved(self, event: dict[str, Any]):
+        """Handle ticket.resolved event: send confirmation to customer."""
+        ticket_id = event.get("ticket_id") or event.get("TicketId")
+        customer_email = event.get("customer_email") or event.get("CustomerEmail")
+        customer_name = event.get("customer_name") or event.get("CustomerName")
+        resolution_notes = (
+            event.get("resolution_notes")
+            or event.get("ResolutionNotes")
+            or "Your issue has been resolved."
+        )
+        resolved_at = event.get("resolved_at") or event.get("ResolvedAt")
+
+        logger.info(
+            "workflow.ticket_resolved", ticket_id=ticket_id, customer=customer_email
+        )
+
+        if not self.mq_publisher.exchange:
+            logger.error("workflow.mq_not_connected", event="ticket.resolved")
+            return
+
+        if not customer_email:
+            logger.warning("workflow.ticket_resolved.no_email", ticket_id=ticket_id)
+            return
+
+        payload = {
+            "event_type": "email.send",
+            "timestamp": datetime.now().isoformat(),
+            "source": "agentic-service",
+            "to_email": customer_email,
+            "from_email": "support@garamatic.com",
+            "from_name": "Garamatic Support",
+            "subject": f"Ticket #{ticket_id} Resolved",
+            "body_html": f"""
+            <h2>Your ticket has been resolved</h2>
+            <p>Hi {customer_name or 'there'},</p>
+            <p>Ticket #{ticket_id} has been resolved.</p>
+            <p><strong>Resolution:</strong> {resolution_notes}</p>
+            <p>If you have any further questions, please reply to this email.</p>
+            """,
+        }
+
+        try:
+            await self.mq_publisher.publish("email.send", payload)
+            logger.info(
+                "workflow.resolution_email_sent",
+                to=customer_email,
+                ticket_id=ticket_id,
+            )
+        except Exception as e:
+            logger.error("workflow.resolution_email_failed", error=str(e))
 
     async def handle_message(self, message: aio_pika.IncomingMessage):
         """Process a single message (async-native, no threads)."""
@@ -265,7 +352,9 @@ class EventConsumer:
                 handlers = {
                     "payment.received": self.process_payment_received,
                     "invoice.created": self.process_invoice_created,
-                    # NOTE: handlers for ticket.escalated and ticket.created defined but no producers
+                    "invoice.overdue": self.process_invoice_overdue,
+                    "ticket.resolved": self.process_ticket_resolved,
+                    # Kept for potential future producers; currently no emitters:
                     "ticket.escalated": self.process_ticket_escalated,
                     "ticket.created": self.process_ticket_created,
                 }
