@@ -21,7 +21,7 @@ logger = structlog.get_logger()
 
 # Setup and teardown using lifespan context manager
 @asynccontextmanager
-async def app_lifespan():
+async def app_lifespan(server: "FastMCP"):
     """Initialize and cleanup clients on server startup/shutdown."""
     global ticket_client, odoo_client, mq_publisher
     
@@ -162,7 +162,7 @@ async def list_customer_tickets(
     logger.info("Listing customer tickets", email=customer_email, status=status, request_id=rid)
     
     result = await ticket_client.list_tickets(
-        customer_email=customer_email,
+        customer_id=customer_email,
         status=status,
         limit=limit
     )
@@ -218,7 +218,7 @@ async def create_ticket(
     result = await ticket_client.create_ticket(
         title=title,
         description=description,
-        customer_email=customer_email,
+        customer_id=customer_email,
         customer_name=customer_name,
         priority=priority
     )
@@ -332,19 +332,17 @@ async def create_invoice(
             "ticket_id": ticket_id
         }
     
-    # Emit event to RabbitMQ for odoo-bridge to process
+    # Emit event to RabbitMQ for odoo-bridge to process (flat snake_case per schema)
     payload = {
-        "eventType": "invoice.create_requested",
+        "event_type": "invoice.create_requested",
         "timestamp": datetime.now().isoformat(),
         "source": "agentic-service",
-        "data": {
-            "ticket_id": ticket_id,
-            "customer_email": ticket.get("customerEmail"),
-            "customer_name": ticket.get("customerName"),
-            "amount": amount,
-            "description": description or ticket.get("description", "Service"),
-            "requested_at": datetime.now().isoformat()
-        }
+        "ticket_id": ticket_id,
+        "customer_email": ticket.get("customerEmail"),
+        "customer_name": ticket.get("customerName"),
+        "amount": amount,
+        "description": description or ticket.get("description", "Service"),
+        "requested_at": datetime.now().isoformat()
     }
     
     await mq_publisher.publish("invoice.create_requested", payload)
@@ -437,18 +435,16 @@ async def send_email(
     rid = _generate_request_id()
     logger.info("Sending email", to=to_email, subject=subject, request_id=rid)
     
-    # Emit event for mailing-service
+    # Emit event for mailing-service (flat snake_case per email.send schema)
     payload = {
-        "eventType": "email.send",
+        "event_type": "email.send",
         "timestamp": datetime.now().isoformat(),
         "source": "agentic-service",
-        "data": {
-            "to_email": to_email,
-            "from_name": from_name,
-            "subject": subject,
-            "body_html": body,
-            "sent_at": datetime.now().isoformat()
-        }
+        "to_email": to_email,
+        "from_email": "support@garamatic.com",
+        "from_name": from_name,
+        "subject": subject,
+        "body_html": body,
     }
     
     await mq_publisher.publish("email.send", payload)
@@ -474,7 +470,7 @@ async def _get_customer_context_internal(customer_email: str) -> dict[str, Any]:
     logger.info("Getting customer context", email=customer_email, request_id=rid)
     
     # Parallel queries
-    tickets_task = ticket_client.list_tickets(customer_email, limit=5)
+    tickets_task = ticket_client.list_tickets(customer_id=customer_email, limit=5)
     invoices_task = odoo_client.list_customer_invoices(customer_email)
     
     tickets, invoices = await asyncio.gather(tickets_task, invoices_task)
