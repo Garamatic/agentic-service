@@ -14,7 +14,7 @@ def mock_ticket_data():
         "title": "Network Issue",
         "description": "Customer cannot connect to VPN",
         "status": "open",
-        "customerEmail": "john@example.com",
+        "customerId": "john@example.com",
         "customerName": "John Doe",
         "priority": "high",
         "createdAt": "2024-01-15T10:30:00Z",

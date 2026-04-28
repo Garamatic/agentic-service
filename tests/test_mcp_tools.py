@@ -72,7 +72,7 @@ class TestGetTicketStatus:
         
         assert result["ticket_id"] == "T-123"
         assert result["status"] == "open"
-        assert result["customer_email"] == "john@example.com"
+        assert result["customer_id"] == "john@example.com"
         assert result["title"] == "Network Issue"
     
     async def test_handles_unavailable_service(self):
@@ -113,11 +113,10 @@ class TestListCustomerTickets:
         assert len(result["tickets"]) == 1
         assert result["tickets"][0]["ticket_id"] == "T-123"
         
-        # Verify client called with correct params
+        # Verify client called with correct params (fetches all, filters locally)
         mock_ticket_client.list_tickets.assert_called_once_with(
-            customer_email="john@example.com",
             status="open",
-            limit=5
+            limit=100
         )
     
     async def test_validates_email(self, mock_ticket_client, mock_mcp_context):

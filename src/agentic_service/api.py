@@ -4,13 +4,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 import httpx
+import pybreaker
 import structlog
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
-import pybreaker
 
-from .clients import TicketClient, OdooBridgeClient, RabbitMQPublisher
+from .clients import OdooBridgeClient, RabbitMQPublisher, TicketClient
 from .config import get_settings
 from .server import _generate_request_id, _get_customer_context_internal, _validate_email
 
@@ -71,12 +71,12 @@ class SendEmailRequest(BaseModel):
 async def lifespan(app: FastAPI):
     """Initialize and cleanup clients."""
     global ticket_client, odoo_client, mq_publisher
-    
+
     config = get_settings()
-    
+
     ticket_client = TicketClient(config.ticket_api_url)
     odoo_client = OdooBridgeClient(config.odoo_bridge_url)
-    
+
     try:
         mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
         await mq_publisher.connect()
@@ -84,10 +84,10 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("api.rabbitmq.unavailable", error=str(e))
         mq_publisher = None
-    
+
     logger.info("api.started")
     yield
-    
+
     if ticket_client:
         await ticket_client.close()
     if odoo_client:
@@ -110,7 +110,7 @@ async def circuit_breaker_handler(request: Request, exc: pybreaker.CircuitBreake
     """Handle circuit breaker open state."""
     rid = _generate_request_id()
     logger.warning("api.circuit_breaker_open", request_id=rid, path=request.url.path)
-    
+
     return JSONResponse(
         status_code=503,
         content=create_error_response(rid, "Service temporarily unavailable. Please try again later.")
@@ -122,11 +122,11 @@ async def global_exception_handler(request: Request, exc: Exception):
     """Handle all unhandled exceptions with sanitized responses."""
     rid = _generate_request_id()
     logger.error("api.unhandled_exception", request_id=rid, error=str(exc), path=request.url.path)
-    
+
     # Check for development mode from environment
     config = get_settings()
     is_dev = config.log_level == "DEBUG"
-    
+
     return JSONResponse(
         status_code=500,
         content=create_error_response(rid, "Internal server error", str(exc), is_dev)
@@ -144,7 +144,7 @@ async def health_check():
             "rabbitmq": mq_publisher is not None
         }
     }
-    
+
     if ticket_client is None:
         health["services"]["ticket_api"] = "not_initialized"
         health["status"] = "degraded"
@@ -155,7 +155,7 @@ async def health_check():
         except Exception as e:
             health["services"]["ticket_api"] = f"error: {str(e)[:50]}"
             health["status"] = "degraded"
-    
+
     if odoo_client is None:
         health["services"]["odoo_bridge"] = "not_initialized"
         health["status"] = "degraded"
@@ -170,7 +170,7 @@ async def health_check():
             else:
                 health["services"]["odoo_bridge"] = f"error: {str(e)[:50]}"
                 health["status"] = "degraded"
-    
+
     return health
 
 
@@ -179,12 +179,12 @@ def _check_clients():
     rid = _generate_request_id()
     if ticket_client is None:
         raise HTTPException(
-            status_code=503, 
+            status_code=503,
             detail=create_error_response(rid, "Ticket service unavailable")
         )
     if odoo_client is None:
         raise HTTPException(
-            status_code=503, 
+            status_code=503,
             detail=create_error_response(rid, "Invoice service unavailable")
         )
 
@@ -200,7 +200,7 @@ async def api_get_ticket(ticket_id: str):
         return {
             "ticket_id": ticket_id,
             "status": result.get("status", "unknown"),
-            "customer_email": result.get("customerEmail"),
+            "customer_email": result.get("customerId"),
             "customer_name": result.get("customerName"),
             "title": result.get("title"),
             "description": result.get("description"),
@@ -337,10 +337,10 @@ async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
     if mq_publisher is None:
         rid = _generate_request_id()
         raise HTTPException(status_code=503, detail=create_error_response(rid, "Invoice service unavailable"))
-    
+
     rid = _generate_request_id()
     logger.info("api.create_invoice", ticket_id=ticket_id, amount=request.amount, request_id=rid)
-    
+
     try:
         ticket = await ticket_client.get_ticket(ticket_id)
     except httpx.HTTPStatusError as e:
@@ -351,20 +351,16 @@ async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
     except Exception as e:
         logger.error("api.create_invoice.ticket_lookup_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
         raise HTTPException(status_code=500, detail=create_error_response(rid, "Failed to retrieve ticket"))
-    
-    # Use envelope format matching server.py and agent.py
+
+    # Flat format per integration-contracts schema
     event = {
-        "eventType": "invoice.create_requested",
-        "timestamp": datetime.now().isoformat(),
-        "source": "agentic-service",
-        "data": {
-            "ticket_id": ticket_id,
-            "customer_email": ticket.get("customerEmail"),
-            "customer_name": ticket.get("customerName"),
-            "amount": request.amount,
-            "description": request.description or ticket.get("description", "Service"),
-            "requested_at": datetime.now().isoformat()
-        }
+        "event_type": "invoice.create_requested",
+        "ticket_id": ticket_id,
+        "customer_email": ticket.get("customerId"),
+        "customer_name": ticket.get("customerName"),
+        "amount": request.amount,
+        "description": request.description or ticket.get("description", "Service"),
+        "requested_at": datetime.now().isoformat()
     }
 
     try:
@@ -377,7 +373,7 @@ async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
         "status": "queued",
         "ticket_id": ticket_id,
         "amount": request.amount,
-        "customer_email": ticket.get("customerEmail"),
+        "customer_email": ticket.get("customerId"),
         "message": "Invoice creation queued"
     }
 
@@ -388,22 +384,18 @@ async def api_send_email(request: SendEmailRequest):
     if mq_publisher is None:
         rid = _generate_request_id()
         raise HTTPException(status_code=503, detail=create_error_response(rid, "Email service unavailable"))
-    
+
     rid = _generate_request_id()
     logger.info("api.send_email", to=request.to_email, subject=request.subject, request_id=rid)
-    
-    # Use envelope format matching server.py
+
+    # Flat format per integration-contracts email.send schema
     event = {
-        "eventType": "email.send",
-        "timestamp": datetime.now().isoformat(),
-        "source": "agentic-service",
-        "data": {
-            "to_email": request.to_email,
-            "from_name": request.from_name,
-            "subject": request.subject,
-            "body_html": request.body,
-            "sent_at": datetime.now().isoformat()
-        }
+        "event_type": "email.send",
+        "to_email": request.to_email,
+        "from_email": "system@garamatic.com",
+        "from_name": request.from_name,
+        "subject": request.subject,
+        "body_html": request.body
     }
 
     try:

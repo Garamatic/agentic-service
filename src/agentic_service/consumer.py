@@ -14,7 +14,7 @@ from typing import Any
 import aio_pika
 import structlog
 
-from .clients import TicketClient, OdooBridgeClient, RabbitMQPublisher
+from .clients import OdooBridgeClient, RabbitMQPublisher, TicketClient
 from .config import get_settings
 
 logger = structlog.get_logger()
@@ -56,7 +56,7 @@ class EventConsumer:
             durable=True
         )
 
-        # Bind to relevant events (FIXED: match odoo-integration emissions)
+        # Bind to relevant events from upstream services
         bindings = [
             "payment.received",   # from odoo-integration InvoiceStatusPoller
             "invoice.created",    # from odoo-integration TicketResolvedConsumer

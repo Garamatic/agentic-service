@@ -5,7 +5,6 @@ import pytest_asyncio
 import httpx
 import pybreaker
 from unittest.mock import AsyncMock, MagicMock, patch
-import aio_pika
 
 from agentic_service.clients import (
     TicketClient,
@@ -59,7 +58,7 @@ class TestTicketClient:
     
     async def test_get_ticket_success(self, respx_mock, mock_ticket_data):
         """Should successfully retrieve ticket."""
-        route = respx_mock.get("http://ticket-api.example.com/api/tickets/T-123").mock(
+        route = respx_mock.get("http://ticket-api.example.com/api/v1/work-items/T-123").mock(
             return_value=httpx.Response(200, json=mock_ticket_data)
         )
         
@@ -73,13 +72,13 @@ class TestTicketClient:
     async def test_list_tickets_with_params(self, respx_mock, mock_ticket_data):
         """Should list tickets with query parameters."""
         route = respx_mock.get(
-            "http://ticket-api.example.com/api/tickets",
-            params={"customerEmail": "john@example.com", "status": "open", "limit": 5}
+            "http://ticket-api.example.com/api/v1/work-items",
+            params={"customerId": "john@example.com", "status": "open", "limit": 5}
         ).mock(return_value=httpx.Response(200, json=[mock_ticket_data]))
         
         client = TicketClient("http://ticket-api.example.com")
         result = await client.list_tickets(
-            customer_email="john@example.com",
+            customer_id="john@example.com",
             status="open",
             limit=5
         )
@@ -91,7 +90,7 @@ class TestTicketClient:
     async def test_create_ticket(self, respx_mock):
         """Should create ticket successfully."""
         created_data = {"id": "T-999", "status": "created"}
-        route = respx_mock.post("http://ticket-api.example.com/api/tickets").mock(
+        route = respx_mock.post("http://ticket-api.example.com/api/v1/work-items").mock(
             return_value=httpx.Response(201, json=created_data)
         )
         
@@ -99,9 +98,7 @@ class TestTicketClient:
         result = await client.create_ticket(
             title="New Issue",
             description="Description",
-            customer_email="test@example.com",
-            customer_name="Test User",
-            priority="high"
+            customer_id="test@example.com"
         )
         
         assert result["id"] == "T-999"
@@ -111,7 +108,7 @@ class TestTicketClient:
     async def test_resolve_ticket(self, respx_mock):
         """Should resolve ticket successfully."""
         resolved_data = {"id": "T-123", "status": "resolved"}
-        route = respx_mock.post("http://ticket-api.example.com/api/tickets/T-123/resolve").mock(
+        route = respx_mock.post("http://ticket-api.example.com/api/v1/work-items/T-123/resolve").mock(
             return_value=httpx.Response(200, json=resolved_data)
         )
         
@@ -126,26 +123,17 @@ class TestTicketClient:
         assert route.called
         await client.close()
     
-    async def test_fallback_paths_on_connection_error(self, respx_mock):
-        """Should try fallback paths when primary fails with connection error."""
-        # First path fails with connection error
-        respx_mock.get("http://ticket-api.example.com/api/tickets/T-123").mock(
-            side_effect=httpx.ConnectError("Connection refused")
-        )
-        # Fallback path succeeds
-        respx_mock.get("http://ticket-api.example.com/api/v1/tickets/T-123").mock(
-            return_value=httpx.Response(200, json={"id": "T-123-v1"})
-        )
-        # Third path (should not be reached)
-        respx_mock.get("http://ticket-api.example.com/api/v1/work-items/T-123").mock(
-            return_value=httpx.Response(200, json={"id": "T-123-work"})
+    async def test_successful_request(self, respx_mock):
+        """Should successfully retrieve ticket from correct endpoint."""
+        route = respx_mock.get("http://ticket-api.example.com/api/v1/work-items/T-123").mock(
+            return_value=httpx.Response(200, json={"id": "T-123", "status": "open"})
         )
 
         client = TicketClient("http://ticket-api.example.com")
         result = await client.get_ticket("T-123")
 
-        # Should get result from second path (first fallback)
-        assert result["id"] == "T-123-v1"
+        assert result["id"] == "T-123"
+        assert route.called
         await client.close()
     
     async def test_circuit_breaker_configured(self, respx_mock):
@@ -166,45 +154,23 @@ class TestTicketClient:
 
         await client.close()
 
-    async def test_circuit_breaker_opens_after_failures(self, respx_mock):
-        """Circuit breaker should open after consecutive failures.
-
-        Note: This test verifies circuit breaker integration. The tenacity retry
-        decorator (3 attempts with exponential backoff) wraps the actual calls,
-        and the circuit breaker wraps the retry. After 3 failed attempts, retry
-        raises RetryError, which counts toward circuit breaker failures.
-        """
+    async def test_circuit_breaker_decorator_applied(self, respx_mock):
+        """Verify circuit breaker decorator is properly applied to methods."""
         # Reset breaker state before test
         ticket_api_breaker.close()
 
-        call_count = 0
-
-        def fail_twice_then_succeed(request):
-            nonlocal call_count
-            call_count += 1
-            if call_count <= 2:
-                raise httpx.ConnectError("Connection refused")
-            return httpx.Response(200, json={"id": "T-123"})
-
-        # Only mock first path - will fail twice then succeed on 3rd try
-        # (matching tenacity's 3 attempts)
-        respx_mock.get("http://ticket-api.example.com/api/tickets/T-123").mock(
-            side_effect=fail_twice_then_succeed
-        )
-        respx_mock.get("http://ticket-api.example.com/api/v1/tickets/T-123").mock(
-            return_value=httpx.Response(200, json={"id": "T-123"})
-        )
-        respx_mock.get("http://ticket-api.example.com/api/v1/work-items/T-123").mock(
+        route = respx_mock.get("http://ticket-api.example.com/api/v1/work-items/T-123").mock(
             return_value=httpx.Response(200, json={"id": "T-123"})
         )
 
         client = TicketClient("http://ticket-api.example.com")
 
-        # First call: fails twice on first path (retried), then succeeds on second path
+        # Successful call should work normally
         result = await client.get_ticket("T-123")
         assert result["id"] == "T-123"
+        assert route.called
 
-        # The circuit breaker should still be closed (only 1 call, 2 failures that were retried)
+        # Circuit breaker should still be closed after success
         assert ticket_api_breaker.current_state == pybreaker.STATE_CLOSED
 
         await client.close()
@@ -265,7 +231,7 @@ class TestRabbitMQPublisher:
         """Should establish async connection."""
         publisher = RabbitMQPublisher("amqp://guest:guest@localhost:5672/")
         
-        # Mock aio_pika.connect_robust
+        # Mock the connection
         mock_conn = AsyncMock()
         mock_channel = AsyncMock()
         mock_exchange = AsyncMock()

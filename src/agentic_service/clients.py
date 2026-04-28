@@ -1,16 +1,17 @@
 """HTTP clients for external service communication."""
 
 import json
-import httpx
-from typing import Optional, Any
+from typing import Any
+
 import aio_pika
+import httpx
 import pybreaker
 import structlog
 from tenacity import (
     retry,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception,
 )
 
 logger = structlog.get_logger()
@@ -49,7 +50,7 @@ class TicketClient:
     def __init__(
         self,
         base_url: str,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         timeout: float = 30.0,
     ):
         """Initialize the ticket client.
@@ -94,8 +95,8 @@ class TicketClient:
     @ticket_api_breaker
     async def list_tickets(
         self,
-        customer_id: Optional[str] = None,
-        status: Optional[str] = None,
+        customer_id: str | None = None,
+        status: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
@@ -169,8 +170,8 @@ class TicketClient:
     async def resolve_ticket(
         self,
         ticket_id: str,
-        resolution_notes: Optional[str] = None,
-        billable_amount: Optional[float] = None,
+        resolution_notes: str | None = None,
+        billable_amount: float | None = None,
     ) -> dict[str, Any]:
         """Resolve a ticket.
         
