@@ -573,7 +573,7 @@ async def get_ticket_resource(ticket_id: str) -> str:
 - Status: {ticket.get('status', 'unknown').upper()}
 - Title: {ticket.get('title', 'Untitled')}
 - Customer ID: {ticket.get('customerId', 'Unknown')}
-- Priority: {ticket.get('priority', 'medium').upper()}
+- Priority Score: {ticket.get('priorityScore', 'N/A')}
 - Created: {_format_date(ticket.get('createdAt'))}
 - Resolved: {_format_date(ticket.get('resolvedAt'))}
 
