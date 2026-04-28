@@ -6,6 +6,7 @@ Exposes tickets, invoices, and emails as AI-callable tools
 import asyncio
 import json
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Literal
 
@@ -40,7 +41,7 @@ def _generate_request_id() -> str:
     """Generate unique request ID for tracing."""
     return uuid.uuid4().hex
 
-# Global clients (initialized on startup)
+# Global clients (initialized by lifespan context manager)
 ticket_client: TicketClient | None = None
 odoo_client: OdooBridgeClient | None = None
 mq_publisher: RabbitMQPublisher | None = None
@@ -215,7 +216,7 @@ async def resolve_ticket(
     logger.info("Resolving ticket", ticket_id=ticket_id, billable=billable_amount, request_id=rid)
     
     # Resolve in ticket-masala
-    result = await ticket_client.resolve_ticket(
+    await ticket_client.resolve_ticket(
         ticket_id=ticket_id,
         resolution_notes=resolution_notes,
         billable_amount=billable_amount
@@ -486,7 +487,7 @@ async def get_ticket_resource(ticket_id: str) -> str:
     AI can read this for ticket-specific context.
     """
     if ticket_client is None:
-        return f"Error: Ticket service unavailable"
+        return "Error: Ticket service unavailable"
     
     ticket = await ticket_client.get_ticket(ticket_id)
     invoice = await odoo_client.get_invoice_status(ticket_id) if odoo_client else None
@@ -607,12 +608,13 @@ async def get_customer_resource(email: str) -> str:
 """
 
 
-# Setup and teardown
-@mcp.on_startup
-async def on_startup():
-    """Initialize clients on server startup."""
+# Setup and teardown using lifespan context manager
+@asynccontextmanager
+async def app_lifespan():
+    """Initialize and cleanup clients on server startup/shutdown."""
     global ticket_client, odoo_client, mq_publisher
     
+    # Startup
     config = get_settings()
     
     ticket_client = TicketClient(config.ticket_api_url)
@@ -630,19 +632,23 @@ async def on_startup():
     logger.info("service.started",
                 ticket_api=config.ticket_api_url,
                 odoo_bridge=config.odoo_bridge_url)
-
-
-@mcp.on_shutdown
-async def on_shutdown():
-    """Cleanup on shutdown."""
-    if ticket_client:
-        await ticket_client.close()
-    if odoo_client:
-        await odoo_client.close()
-    if mq_publisher:
-        await mq_publisher.close()
     
-    logger.info("service.stopped")
+    try:
+        yield
+    finally:
+        # Shutdown
+        if ticket_client:
+            await ticket_client.close()
+        if odoo_client:
+            await odoo_client.close()
+        if mq_publisher:
+            await mq_publisher.close()
+        
+        logger.info("service.stopped")
+
+
+# Attach lifespan to MCP server
+mcp.lifespan = app_lifespan
 
 
 def main():

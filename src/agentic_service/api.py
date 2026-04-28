@@ -5,8 +5,10 @@ from datetime import datetime
 
 import httpx
 import structlog
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
+import pybreaker
 
 from .clients import TicketClient, OdooBridgeClient, RabbitMQPublisher
 from .config import get_settings
@@ -14,10 +16,26 @@ from .server import _generate_request_id, _get_customer_context_internal, _valid
 
 logger = structlog.get_logger()
 
+
 # Global clients
 ticket_client: TicketClient | None = None
 odoo_client: OdooBridgeClient | None = None
 mq_publisher: RabbitMQPublisher | None = None
+
+
+def create_error_response(request_id: str, message: str, internal_error: str | None = None, is_development: bool = False) -> dict:
+    """Create sanitized error response.
+    
+    In production: Only show generic message + request_id for tracing
+    In development: Include internal details
+    """
+    response = {
+        "error": message,
+        "request_id": request_id
+    }
+    if is_development and internal_error:
+        response["detail"] = internal_error
+    return response
 
 
 class CreateTicketRequest(BaseModel):
@@ -87,6 +105,34 @@ app = FastAPI(
 )
 
 
+@app.exception_handler(pybreaker.CircuitBreakerError)
+async def circuit_breaker_handler(request: Request, exc: pybreaker.CircuitBreakerError):
+    """Handle circuit breaker open state."""
+    rid = _generate_request_id()
+    logger.warning("api.circuit_breaker_open", request_id=rid, path=request.url.path)
+    
+    return JSONResponse(
+        status_code=503,
+        content=create_error_response(rid, "Service temporarily unavailable. Please try again later.")
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Handle all unhandled exceptions with sanitized responses."""
+    rid = _generate_request_id()
+    logger.error("api.unhandled_exception", request_id=rid, error=str(exc), path=request.url.path)
+    
+    # Check for development mode from environment
+    config = get_settings()
+    is_dev = config.log_level == "DEBUG"
+    
+    return JSONResponse(
+        status_code=500,
+        content=create_error_response(rid, "Internal server error", str(exc), is_dev)
+    )
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
@@ -130,10 +176,17 @@ async def health_check():
 
 def _check_clients():
     """Validate that required clients are initialized."""
+    rid = _generate_request_id()
     if ticket_client is None:
-        raise HTTPException(status_code=503, detail="Ticket service unavailable")
+        raise HTTPException(
+            status_code=503, 
+            detail=create_error_response(rid, "Ticket service unavailable")
+        )
     if odoo_client is None:
-        raise HTTPException(status_code=503, detail="Invoice service unavailable")
+        raise HTTPException(
+            status_code=503, 
+            detail=create_error_response(rid, "Invoice service unavailable")
+        )
 
 
 @app.get("/tickets/{ticket_id}")
@@ -156,9 +209,17 @@ async def api_get_ticket(ticket_id: str):
             "resolution_notes": result.get("resolutionNotes"),
             "billable_amount": result.get("billableAmount")
         }
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail=create_error_response(rid, "Ticket not found"))
+        logger.error("api.get_ticket_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
+        raise HTTPException(status_code=502, detail=create_error_response(rid, "Ticket service error"))
+    except pybreaker.CircuitBreakerError:
+        # Let global exception handler handle this
+        raise
     except Exception as e:
-        logger.error("api.get_ticket_failed", ticket_id=ticket_id, error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("api.get_ticket_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
+        raise HTTPException(status_code=500, detail=create_error_response(rid, "Failed to retrieve ticket"))
 
 
 @app.get("/tickets")
@@ -188,8 +249,8 @@ async def api_list_tickets(
             for t in result
         ]
     except Exception as e:
-        logger.error("api.list_tickets_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("api.list_tickets_failed", error=str(e), request_id=rid)
+        raise HTTPException(status_code=500, detail=create_error_response(rid, "Failed to list tickets"))
 
 
 @app.post("/tickets")
@@ -214,8 +275,8 @@ async def api_create_ticket(request: CreateTicketRequest):
             "message": f"Ticket {result.get('id')} created successfully"
         }
     except Exception as e:
-        logger.error("api.create_ticket_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("api.create_ticket_failed", error=str(e), request_id=rid)
+        raise HTTPException(status_code=500, detail=create_error_response(rid, "Failed to create ticket"))
 
 
 @app.post("/tickets/{ticket_id}/resolve")
@@ -225,7 +286,7 @@ async def api_resolve_ticket(ticket_id: str, request: ResolveTicketRequest):
     rid = _generate_request_id()
     logger.info("api.resolve_ticket", ticket_id=ticket_id, billable=request.billable_amount, request_id=rid)
     try:
-        result = await ticket_client.resolve_ticket(
+        await ticket_client.resolve_ticket(
             ticket_id=ticket_id,
             resolution_notes=request.resolution_notes,
             billable_amount=request.billable_amount
@@ -242,8 +303,8 @@ async def api_resolve_ticket(ticket_id: str, request: ResolveTicketRequest):
             }
         return response
     except Exception as e:
-        logger.error("api.resolve_ticket_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("api.resolve_ticket_failed", error=str(e), request_id=rid)
+        raise HTTPException(status_code=500, detail=create_error_response(rid, "Failed to resolve ticket"))
 
 
 @app.get("/invoices/by-ticket/{ticket_id}")
@@ -265,8 +326,8 @@ async def api_get_invoice(ticket_id: str):
             "paid_at": result.get("paid_at")
         }
     except Exception as e:
-        logger.error("api.get_invoice_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("api.get_invoice_failed", error=str(e), request_id=rid)
+        raise HTTPException(status_code=500, detail=create_error_response(rid, "Failed to retrieve invoice"))
 
 
 @app.post("/invoices/{ticket_id}")
@@ -274,15 +335,22 @@ async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
     """Create an invoice for a ticket."""
     _check_clients()
     if mq_publisher is None:
-        raise HTTPException(status_code=503, detail="Invoice service unavailable")
+        rid = _generate_request_id()
+        raise HTTPException(status_code=503, detail=create_error_response(rid, "Invoice service unavailable"))
     
     rid = _generate_request_id()
     logger.info("api.create_invoice", ticket_id=ticket_id, amount=request.amount, request_id=rid)
     
     try:
         ticket = await ticket_client.get_ticket(ticket_id)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            raise HTTPException(status_code=404, detail=create_error_response(rid, "Ticket not found"))
+        logger.error("api.create_invoice.ticket_lookup_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
+        raise HTTPException(status_code=502, detail=create_error_response(rid, "Failed to retrieve ticket"))
     except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Ticket not found: {e}")
+        logger.error("api.create_invoice.ticket_lookup_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
+        raise HTTPException(status_code=500, detail=create_error_response(rid, "Failed to retrieve ticket"))
     
     event = {
         "event_type": "invoice.create_requested",
@@ -294,7 +362,11 @@ async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
         "requested_at": datetime.now().isoformat()
     }
     
-    await mq_publisher.publish("invoice.create_requested", event)
+    try:
+        await mq_publisher.publish("invoice.create_requested", event)
+    except Exception as e:
+        logger.error("api.create_invoice.publish_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
+        raise HTTPException(status_code=503, detail=create_error_response(rid, "Failed to queue invoice creation"))
     
     return {
         "status": "queued",
@@ -309,7 +381,8 @@ async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
 async def api_send_email(request: SendEmailRequest):
     """Send an email."""
     if mq_publisher is None:
-        raise HTTPException(status_code=503, detail="Email service unavailable")
+        rid = _generate_request_id()
+        raise HTTPException(status_code=503, detail=create_error_response(rid, "Email service unavailable"))
     
     rid = _generate_request_id()
     logger.info("api.send_email", to=request.to_email, subject=request.subject, request_id=rid)
@@ -323,7 +396,11 @@ async def api_send_email(request: SendEmailRequest):
         "sent_at": datetime.now().isoformat()
     }
     
-    await mq_publisher.publish("email.send", event)
+    try:
+        await mq_publisher.publish("email.send", event)
+    except Exception as e:
+        logger.error("api.send_email.publish_failed", to=request.to_email, error=str(e), request_id=rid)
+        raise HTTPException(status_code=503, detail=create_error_response(rid, "Failed to queue email"))
     
     return {
         "status": "queued",
@@ -342,11 +419,11 @@ async def api_get_customer_context(email: str):
     try:
         _validate_email(email)
         return await _get_customer_context_internal(email)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=create_error_response(rid, "Invalid email format"))
     except Exception as e:
-        logger.error("api.get_customer_context_failed", error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("api.get_customer_context_failed", error=str(e), request_id=rid)
+        raise HTTPException(status_code=500, detail=create_error_response(rid, "Failed to retrieve customer context"))
 
 
 def main():

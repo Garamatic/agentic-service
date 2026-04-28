@@ -11,6 +11,7 @@ import json
 import signal
 from typing import Any
 
+import aio_pika
 import structlog
 
 from .clients import TicketClient, OdooBridgeClient, RabbitMQPublisher
@@ -21,44 +22,39 @@ logger = structlog.get_logger()
 # Global flag for graceful shutdown
 running = True
 
-# Track in-flight message processing
-_in_flight_messages = 0
-
 
 class EventConsumer:
-    """RabbitMQ event consumer with workflow automation."""
+    """RabbitMQ event consumer with workflow automation (async-native)."""
     
     def __init__(self, amqp_url: str, ticket_api_url: str, odoo_api_url: str):
         self.amqp_url = amqp_url
         self.ticket_client = TicketClient(ticket_api_url)
         self.odoo_client = OdooBridgeClient(odoo_api_url)
         self.mq_publisher = RabbitMQPublisher(amqp_url)
-        self.connection = None
-        self.channel = None
+        self.connection: aio_pika.RobustConnection | None = None
+        self.channel: aio_pika.Channel | None = None
+        self.queue: aio_pika.Queue | None = None
     
-    async def connect(self):
-        """Establish RabbitMQ connection."""
-        import pika
+    async def connect(self) -> aio_pika.Queue:
+        """Establish RabbitMQ connection (async-native)."""
+        self.connection = await aio_pika.connect_robust(self.amqp_url)
+        self.channel = await self.connection.channel()
         
-        loop = asyncio.get_running_loop()
+        # Set QoS to process one message at a time per consumer
+        await self.channel.set_qos(prefetch_count=1)
         
-        def _connect():
-            params = pika.URLParameters(self.amqp_url)
-            return pika.BlockingConnection(params)
-        
-        self.connection = await loop.run_in_executor(None, _connect)
-        self.channel = self.connection.channel()
-        
-        # Declare exchange and queue
-        self.channel.exchange_declare(
-            exchange="event_exchange",
-            exchange_type="topic",
+        # Declare exchange
+        exchange = await self.channel.declare_exchange(
+            "event_exchange",
+            aio_pika.ExchangeType.TOPIC,
             durable=True
         )
         
-        # Create queue for this consumer
-        result = self.channel.queue_declare(queue="agentic_consumer", durable=True)
-        queue_name = result.method.queue
+        # Declare queue
+        self.queue = await self.channel.declare_queue(
+            "agentic_consumer",
+            durable=True
+        )
         
         # Bind to relevant events
         bindings = [
@@ -69,14 +65,10 @@ class EventConsumer:
         ]
         
         for routing_key in bindings:
-            self.channel.queue_bind(
-                exchange="event_exchange",
-                queue=queue_name,
-                routing_key=routing_key
-            )
+            await self.queue.bind(exchange, routing_key=routing_key)
         
-        logger.info("consumer.connected", queue=queue_name)
-        return queue_name
+        logger.info("consumer.connected", queue=self.queue.name)
+        return self.queue
     
     async def process_invoice_paid(self, event: dict[str, Any]):
         """Handle invoice.paid event: email customer, resolve ticket."""
@@ -219,100 +211,73 @@ class EventConsumer:
         except Exception as e:
             logger.error("workflow.confirmation_failed", error=str(e))
     
-    def handle_message(self, ch, method, properties, body):
-        """Callback for RabbitMQ messages."""
-        global _in_flight_messages
-        
-        # Ensure loop is available (set in run() before consuming starts)
-        if not hasattr(self, '_loop') or self._loop is None:
-            logger.error("consumer.no_loop_reference", routing_key=method.routing_key if method else None)
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-            return
-        
-        _in_flight_messages += 1
-        try:
-            event = json.loads(body)
-            routing_key = method.routing_key
-            
-            logger.info("consumer.received", routing_key=routing_key, event_type=event.get("event_type"))
-            
-            # Dispatch to appropriate handler
-            handlers = {
-                "invoice.paid": self.process_invoice_paid,
-                "invoice.sent": self.process_invoice_sent,
-                "ticket.escalated": self.process_ticket_escalated,
-                "ticket.created": self.process_ticket_created,
-            }
-            
-            handler = handlers.get(routing_key)
-            if handler:
-                # Schedule async handler in the main event loop
-                # self._loop is set in run() method
-                asyncio.run_coroutine_threadsafe(handler(event), self._loop)
-            else:
-                logger.warning("consumer.unhandled_routing_key", key=routing_key)
-            
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            
-        except Exception as e:
-            logger.error("consumer.message_failed", error=str(e))
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-        finally:
-            _in_flight_messages -= 1
+    async def handle_message(self, message: aio_pika.IncomingMessage):
+        """Process a single message (async-native, no threads)."""
+        async with message.process():
+            try:
+                body = json.loads(message.body)
+                routing_key = message.routing_key
+                
+                logger.info(
+                    "consumer.received",
+                    routing_key=routing_key,
+                    event_type=body.get("event_type")
+                )
+                
+                # Dispatch to appropriate handler
+                handlers = {
+                    "invoice.paid": self.process_invoice_paid,
+                    "invoice.sent": self.process_invoice_sent,
+                    "ticket.escalated": self.process_ticket_escalated,
+                    "ticket.created": self.process_ticket_created,
+                }
+                
+                handler = handlers.get(routing_key)
+                if handler:
+                    await handler(body)
+                else:
+                    logger.warning("consumer.unhandled_routing_key", key=routing_key)
+                    
+            except json.JSONDecodeError as e:
+                logger.error("consumer.invalid_json", error=str(e))
+                # Message is auto-acked by context manager even on error
+            except Exception as e:
+                logger.error("consumer.message_failed", error=str(e))
+                # Requeue on unexpected errors
+                raise
     
     async def run(self):
-        """Main consumer loop."""
+        """Main consumer loop (async-native)."""
         global running
         
-        # Store reference to event loop for thread-safe callback scheduling
-        self._loop = asyncio.get_running_loop()
-        
-        # Verify the loop is set before any message can arrive
-        if self._loop is None:
-            raise RuntimeError("Failed to get event loop")
-        
-        queue_name = await self.connect()
+        queue = await self.connect()
         await self.mq_publisher.connect()
         
-        # Set up message consumption
-        def _start_consuming():
-            self.channel.basic_consume(
-                queue=queue_name,
-                on_message_callback=self.handle_message
-            )
-            self.channel.start_consuming()
+        logger.info("consumer.started", queue=queue.name)
         
-        # Run consumer in executor thread
-        consumer_task = self._loop.run_in_executor(None, _start_consuming)
-        
-        logger.info("consumer.started", queue=queue_name)
-        
-        # Wait for shutdown signal
-        while running:
-            await asyncio.sleep(0.1)
-        
-        # Stop consuming
-        def _stop():
-            self.channel.stop_consuming()
-        
-        await self._loop.run_in_executor(None, _stop)
-        
-        try:
-            await consumer_task
-        except Exception:
-            pass
+        # Start consuming messages
+        async with queue.iterator() as queue_iter:
+            async for message in queue_iter:
+                if not running:
+                    break
+                
+                # Process message (auto-acks on success, requeues on failure)
+                try:
+                    await self.handle_message(message)
+                except Exception:
+                    # Message will be requeued by aio-pika
+                    pass
     
     async def close(self):
-        """Cleanup resources."""
+        """Cleanup resources (async-native)."""
         if self.ticket_client:
             await self.ticket_client.close()
         if self.odoo_client:
             await self.odoo_client.close()
         if self.mq_publisher:
             await self.mq_publisher.close()
-        if self.connection and not self.connection.is_closed:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self.connection.close)
+        if self.connection:
+            await self.connection.close()
 
 
 def signal_handler(signum, _frame):
@@ -324,11 +289,7 @@ def signal_handler(signum, _frame):
 
 async def main_async():
     """Async main entry point."""
-    global running, _in_flight_messages
-    
-    # Set up signal handlers
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
+    global running
     
     config = get_settings()
     consumer = EventConsumer(
@@ -337,18 +298,17 @@ async def main_async():
         odoo_api_url=config.odoo_bridge_url
     )
     
+    # Set up signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, signal_handler, sig, None)
+    
     try:
         await consumer.run()
     finally:
-        # Wait for in-flight messages to complete before closing
-        if _in_flight_messages > 0:
-            logger.info("consumer.waiting_for_inflight", count=_in_flight_messages)
-            # Brief grace period for in-flight processing
-            for _ in range(50):  # 5 seconds max
-                if _in_flight_messages == 0:
-                    break
-                await asyncio.sleep(0.1)
-        
+        # Remove signal handlers
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(sig)
         await consumer.close()
         logger.info("consumer.stopped")
 

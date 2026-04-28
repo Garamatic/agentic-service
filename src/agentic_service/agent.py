@@ -8,13 +8,16 @@ Provides an autonomous agent that can:
 """
 
 import asyncio
+import os
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Literal
 from typing_extensions import TypedDict
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -243,8 +246,42 @@ When resolving tickets:
 """
 
 
-def create_agent():
-    """Create and configure the LangGraph agent."""
+async def _get_checkpointer() -> BaseCheckpointSaver:
+    """Get appropriate checkpoint saver based on configuration.
+    
+    Uses SQLite persistence if AGENT_DB_PATH is set (production),
+    otherwise falls back to in-memory storage (development).
+    
+    Note: This is async because AsyncSqliteSaver requires async context to initialize.
+    The caller is responsible for closing the checkpointer when done.
+    """
+    import aiosqlite
+    
+    db_path = os.getenv("AGENT_DB_PATH", "").strip()
+    
+    if db_path:
+        # Ensure directory exists
+        from pathlib import Path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        logger.info("agent.using_persistent_storage", db_path=db_path)
+        # Create connection and pass to AsyncSqliteSaver
+        # Note: AsyncSqliteSaver manages the connection lifecycle
+        conn = await aiosqlite.connect(db_path)
+        return AsyncSqliteSaver(conn)
+    else:
+        logger.info("agent.using_in_memory_storage")
+        return MemorySaver()
+
+
+async def create_agent(checkpointer: BaseCheckpointSaver | None = None):
+    """Create and configure the LangGraph agent.
+    
+    Args:
+        checkpointer: Optional custom checkpoint saver. If not provided,
+                     uses environment configuration (AGENT_DB_PATH).
+                     
+    Note: This is async because checkpoint initialization may require async context.
+    """
     
     def should_continue(state: AgentState) -> Literal["tools", END]:
         """Determine if we should continue to tools or end."""
@@ -290,27 +327,52 @@ def create_agent():
     )
     workflow.add_edge("tools", "agent")
     
-    # Add memory
-    memory = MemorySaver()
+    # Use provided checkpointer or auto-configure
+    memory = checkpointer or await _get_checkpointer()
     
     return workflow.compile(checkpointer=memory)
 
 
 class GaramaticAgent:
-    """High-level interface to the Garamatic AI Agent."""
+    """High-level interface to the Garamatic AI Agent.
     
-    def __init__(self):
-        self.agent = create_agent()
-        self.config = {"configurable": {"thread_id": "garamatic-session"}}
+    Supports persistent conversation state via SQLite (production)
+    or in-memory storage (development).
+    """
+    
+    def __init__(self, thread_id: str | None = None, checkpointer: BaseCheckpointSaver | None = None):
+        """Initialize agent with optional thread_id for multi-user support.
+        
+        Args:
+            thread_id: Unique identifier for conversation thread. If not provided,
+                      uses a default thread (single-user mode).
+            checkpointer: Optional custom checkpoint saver. Uses environment
+                         config if not provided.
+        """
+        self.thread_id = thread_id or "garamatic-session"
+        self.config = {"configurable": {"thread_id": self.thread_id}}
+        self._checkpointer = checkpointer
+        self._agent = None
+    
+    async def _get_agent(self):
+        """Lazy initialization of the agent (async)."""
+        if self._agent is None:
+            self._agent = await create_agent(checkpointer=self._checkpointer)
+        return self._agent
     
     async def process(self, message: str) -> str:
-        """Process a user message and return the response."""
+        """Process a user message and return the response.
+        
+        State is automatically persisted based on checkpointer configuration.
+        """
+        agent = await self._get_agent()
+        
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=message)
         ]
         
-        result = await self.agent.ainvoke(
+        result = await agent.ainvoke(
             {"messages": messages},
             config=self.config
         )
@@ -321,6 +383,25 @@ class GaramaticAgent:
                 return msg.content
         
         return "No response generated"
+    
+    async def get_state(self) -> dict:
+        """Get current conversation state."""
+        agent = await self._get_agent()
+        state = await agent.aget_state(self.config)
+        return {
+            "thread_id": self.thread_id,
+            "message_count": len(state.values.get("messages", [])),
+            "last_message": state.values.get("messages", [])[-1].content if state.values.get("messages") else None
+        }
+    
+    async def close(self):
+        """Cleanup resources including checkpointer connections."""
+        if self._agent is not None:
+            # Note: LangGraph doesn't have explicit close() on compiled graphs,
+            # but if we used AsyncSqliteSaver, we should close the connection
+            if hasattr(self._checkpointer, 'conn') and self._checkpointer.conn:
+                await self._checkpointer.conn.close()
+            self._agent = None
     
     async def run_conversation(self):
         """Run interactive conversation loop."""
@@ -384,17 +465,19 @@ async def main_async():
     """Async main entry point."""
     await init_clients()
     
+    agent = None
     try:
         agent = GaramaticAgent()
         await agent.run_conversation()
     finally:
+        if agent:
+            await agent.close()
         await close_clients()
 
 
 def main():
     """Run the AI Agent."""
     # Check for OpenAI API key
-    import os
     if not os.getenv("OPENAI_API_KEY"):
         print("⚠️  Warning: OPENAI_API_KEY not set. Agent will not function.")
         print("Set it with: export OPENAI_API_KEY='your-key-here'")

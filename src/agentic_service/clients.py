@@ -1,10 +1,11 @@
 """HTTP and RabbitMQ clients for service integration."""
 
-import asyncio
 import json
 from typing import Any
 
+import aio_pika
 import httpx
+import pybreaker
 import structlog
 from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
@@ -22,6 +23,32 @@ def _is_retryable_error(e: Exception) -> bool:
     return False
 
 
+# Circuit breakers for external services
+# Prevents cascading failures when downstream services are down
+# "exclude" defines which exceptions should NOT count toward the fail_max
+# (i.e., business logic errors like 404s shouldn't open the circuit)
+# Note: By default, ALL exceptions count toward the circuit breaker except what's in exclude
+# RetryError from tenacity (after retries exhausted) will count toward circuit breaker
+ticket_api_breaker = pybreaker.CircuitBreaker(
+    fail_max=5,  # Open after 5 failures
+    reset_timeout=60,  # Try again after 60 seconds
+    exclude=[
+        # Don't open circuit for client errors (4xx)
+        lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500
+    ],
+    name="ticket_api"
+)
+
+odoo_bridge_breaker = pybreaker.CircuitBreaker(
+    fail_max=5,
+    reset_timeout=60,
+    exclude=[
+        lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500
+    ],
+    name="odoo_bridge"
+)
+
+
 class TicketClient:
     """HTTP client for ticket-masala API."""
     
@@ -32,6 +59,7 @@ class TicketClient:
             headers={"Accept": "application/json"}
         )
     
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -43,6 +71,7 @@ class TicketClient:
         response.raise_for_status()
         return response.json()
     
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -65,6 +94,7 @@ class TicketClient:
         response.raise_for_status()
         return response.json()
     
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -90,6 +120,7 @@ class TicketClient:
         response.raise_for_status()
         return response.json()
     
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -129,6 +160,7 @@ class OdooBridgeClient:
             headers={"Accept": "application/json"}
         )
     
+    @odoo_bridge_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -142,6 +174,7 @@ class OdooBridgeClient:
         response.raise_for_status()
         return response.json()
     
+    @odoo_bridge_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -161,63 +194,51 @@ class OdooBridgeClient:
 
 
 class RabbitMQPublisher:
-    """Async RabbitMQ publisher."""
+    """Async RabbitMQ publisher (aio-pika native)."""
     
     def __init__(self, amqp_url: str):
         self.amqp_url = amqp_url
-        self.connection = None
-        self.channel = None
-        self.exchange = "event_exchange"
+        self.connection: aio_pika.RobustConnection | None = None
+        self.channel: aio_pika.Channel | None = None
+        self.exchange: aio_pika.Exchange | None = None
+        self._exchange_name = "event_exchange"
     
     async def connect(self):
-        """Establish connection."""
-        import pika
-        
-        loop = asyncio.get_running_loop()
-        
-        def _connect():
-            params = pika.URLParameters(self.amqp_url)
-            return pika.BlockingConnection(params)
-        
-        self.connection = await loop.run_in_executor(None, _connect)
-        self.channel = self.connection.channel()
+        """Establish async connection."""
+        self.connection = await aio_pika.connect_robust(self.amqp_url)
+        self.channel = await self.connection.channel()
         
         # Declare exchange
-        self.channel.exchange_declare(
-            exchange=self.exchange,
-            exchange_type="topic",
+        self.exchange = await self.channel.declare_exchange(
+            self._exchange_name,
+            aio_pika.ExchangeType.TOPIC,
             durable=True
         )
         
-        logger.info("rabbitmq.connected", exchange=self.exchange)
+        logger.info("rabbitmq.connected", exchange=self._exchange_name)
     
     async def publish(self, routing_key: str, message: dict[str, Any]):
-        """Publish message to exchange."""
-        if not self.channel:
+        """Publish message to exchange (async-native)."""
+        if not self.exchange:
             raise RuntimeError("Not connected to RabbitMQ")
         
         body = json.dumps(message, default=str).encode()
         
-        import pika
-        
-        def _publish():
-            self.channel.basic_publish(
-                exchange=self.exchange,
-                routing_key=routing_key,
+        await self.exchange.publish(
+            aio_pika.Message(
                 body=body,
-                properties=pika.BasicProperties(
-                    content_type="application/json",
-                    delivery_mode=2  # Persistent
-                )
-            )
-        
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _publish)
+                content_type="application/json",
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+            ),
+            routing_key=routing_key
+        )
         
         logger.debug("rabbitmq.message_published", routing_key=routing_key)
     
     async def close(self):
-        """Close connection."""
-        if self.connection and not self.connection.is_closed:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self.connection.close)
+        """Close async connection."""
+        if self.connection:
+            await self.connection.close()
+            self.connection = None
+            self.channel = None
+            self.exchange = None
