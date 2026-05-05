@@ -1,19 +1,19 @@
 # Garamatic Agentic Service
 
-**MCP Server** exposing your Garamatic platform to AI agents (Claude, GPT, etc.)
+AI-agenten integratieservice die uw Garamatic platform beschikbaar maakt via Model Context Protocol (MCP).
 
-Now includes: REST API, Event Consumer, and AI Agent for complete automation.
+Inclusief: MCP Server, REST API, Event Consumer en LangGraph Agent voor volledige automatisering.
 
-## 🎯 What is this?
+## Inleiding
 
-This service provides a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that exposes your existing Garamatic services as AI-callable tools:
+Deze service biedt een [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server die uw bestaande Garamatic services beschikbaar maakt als AI-aanroepbare tools:
 
-- ✅ Query tickets from `ticket-masala`
-- ✅ Create invoices via `odoo-bridge`
-- ✅ Send emails via `mailing-service`
-- ✅ Get customer context across services
+- Raadpleeg tickets van `ticket-masala`
+- Maak facturen aan via `odoo-bridge`
+- Verstuur e-mails via `mailing-service`
+- Verkrijg klantcontext op services
 
-## 🏗️ Architecture
+## Architectuuroverzicht
 
 ```
                     ┌─────────────────┐
@@ -23,11 +23,11 @@ This service provides a [Model Context Protocol (MCP)](https://modelcontextproto
                              │ MCP
                     ┌────────▼────────┐
    ┌──────────┐     │  Agentic       │     ┌──────────┐
-   │ REST API │────▶│   Service      │◀────│  Web UI  │
+   │ REST API │────>│   Service      │<────│  Web UI  │
    │ Clients  │     │                │     │  Scripts │
    └──────────┘     │ ┌────────────┐ │     └──────────┘
    ┌──────────┐     │ │LangGraph   │ │     ┌──────────┐
-   │ Consumer │────▶│ │Agent       │ │     │  CLI     │
+   │ Consumer │────>│ │Agent       │ │     │  CLI     │
    │ (Events) │     │ └────────────┘ │     └──────────┘
    └──────────┘     └────────┬───────┘
                              │
@@ -39,26 +39,59 @@ This service provides a [Model Context Protocol (MCP)](https://modelcontextproto
    └──────────────┘ └──────────────┘ └──────────────┘
 ```
 
-## 🚀 Quick Start
+## Service Componenten
 
-### 1. Install dependencies
+### MCP Server
+
+Modelcontextprotocol server voor AI-agenten (Claude, GPT):
+- Exposeert Garamatic-tools als MCP resources
+- Draait op stdio voor Claude Desktop integratie
+- Vraagt authenticatie en input van gebruiker
+
+### REST API
+
+HTTP API voor web en mobiele integraties:
+- Volledige CRUD voor tickets, facturen, e-mails
+- Input validatie en request tracing
+- OpenAPI documentatie op `/docs`
+
+### Event Consumer
+
+Geautomatiseerde werkstroom-engine:
+- Luistert naar RabbitMQ events
+- Triggert workflows (factuur betaald → dank e-mail)
+- Loggt alle transities
+
+### LangGraph Agent
+
+Intelligent agentprogramma met planning en geheugen:
+- Multi-stap redenering
+- Klantcontextanalyse
+- Goedkeuring door mens voor grote acties
+- Tool orchestratie met fallback
+
+## Installatie en Setup
+
+### 1. Afhankelijkheden Installeren
+
 ```bash
-# Using uv (recommended)
+# Met uv (aanbevolen)
 uv sync
 
-# Or using pip
+# Of met pip
 pip install -e ".[dev]"
 ```
 
-### 2. Configure environment
+### 2. Omgeving Configureren
+
 ```bash
 cp .env.example .env
-# Edit .env with your service URLs
+# Bewerk .env met uw service URLs
 ```
 
-### 3. Test with Claude Desktop
+### 3. Testen met Claude Desktop
 
-Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+Voeg toe aan uw Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json` op macOS):
 
 ```json
 {
@@ -72,105 +105,103 @@ Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_
 }
 ```
 
-Restart Claude Desktop. You'll now see Garamatic tools available!
+Start Claude Desktop opnieuw. Garamatic tools zijn nu beschikbaar!
 
-### 4. Run the services
+### 4. Services Uitvoeren
 
-**MCP Server (for Claude Desktop):**
+MCP Server (voor Claude Desktop):
 ```bash
 uv run garamatic-mcp
 ```
 
-**REST API (for web/mobile integrations):**
+REST API (voor web/mobiele integraties):
 ```bash
 uv run garamatic-api
-# API available at http://localhost:3001
-# Docs at http://localhost:3001/docs
+# API beschikbaar op http://localhost:3001
+# Documentatie op http://localhost:3001/docs
 ```
 
-**Event Consumer (for automated workflows):**
+Event Consumer (voor geautomatiseerde workflows):
 ```bash
 uv run garamatic-consumer
 ```
 
-**AI Agent (interactive LangGraph agent):**
+AI Agent (interactieve LangGraph agent):
 ```bash
 export OPENAI_API_KEY='your-key-here'
 uv run garamatic-agent
 ```
 
-## 🛠️ Available Tools
+## Beschikbare Tools
 
-### Ticket Management
-| Tool | Description |
+### Ticketbeheer
+| Tool | Beschrijving |
 |------|-------------|
-| `get_ticket_status` | Get current status of a ticket |
-| `list_customer_tickets` | List all tickets for a customer |
-| `create_ticket` | Create a new support ticket |
-| `resolve_ticket` | Resolve ticket with optional invoice |
+| `get_ticket_status` | Huidige status van een ticket opvragen |
+| `list_customer_tickets` | Alle tickets van een klant weergeven |
+| `create_ticket` | Nieuw ondersteuningsticket aanmaken |
+| `resolve_ticket` | Ticket oplossen met optionele factuur |
 
-### Invoicing
-| Tool | Description |
+### Facturering
+| Tool | Beschrijving |
 |------|-------------|
-| `create_invoice` | Create invoice for a ticket |
-| `get_invoice_status` | Check if invoice is paid |
+| `create_invoice` | Factuur voor ticket aanmaken |
+| `get_invoice_status` | Controleer of factuur is betaald |
 
-
-### Email
-| Tool | Description |
+### E-mail
+| Tool | Beschrijving |
 |------|-------------|
-| `send_email` | Send email to customer |
-
+| `send_email` | E-mail naar klant versturen |
 
 ### Resources (Context)
-| Resource | Description |
+| Resource | Beschrijving |
 |----------|-------------|
-| `customer://{email}` | Full customer profile across services |
-| `ticket://{id}` | Ticket details with related invoices |
+| `customer://{email}` | Volledig klantprofiel op services |
+| `ticket://{id}` | Ticketdetails met gerelateerde facturen |
 
-## 📝 Example Agent Conversation
+## Voorbeeld Agent Conversatie
 
-**User**: "What's the status of ticket #123?"
+**Gebruiker**: "Wat is de status van ticket #123?"
 
-**Agent** (calls `get_ticket_status`):
+**Agent** (roept `get_ticket_status` aan):
 ```json
 {
   "ticket_id": "123",
   "status": "resolved",
   "customer_email": "john@example.com",
-  "resolution_notes": "Fixed network issue"
+  "resolution_notes": "Netwerkprobleem opgelost"
 }
 ```
 
-**User**: "Create an invoice for $150"
+**Gebruiker**: "Maak een factuur van 150 euro"
 
-**Agent** (calls `create_invoice`):
+**Agent** (roept `create_invoice` aan):
 ```json
 {
   "ticket_id": "123",
   "amount": 150.00,
-  "description": "Network troubleshooting"
+  "description": "Netwerkprobleemoplossing"
 }
 ```
 
-**Agent**: "✅ Invoice created in Odoo. It will be synced automatically."
+**Agent**: "Factuur aangemaakt in Odoo. Wordt automatisch gesynchroniseerd."
 
-**User**: "Email the customer about this"
+**Gebruiker**: "Stuur de klant een e-mail hierover"
 
-**Agent** (calls `send_email`):
-- Composes professional email
-- Sends via mailing-service
+**Agent** (roept `send_email` aan):
+- Stelt professioneel e-mailbericht op
+- Verzendt via mailing-service
 
-## 🔧 Configuration
+## Configuratie
 
-### Environment Variables
+### Omgevingsvariabelen
 
-| Variable | Default | Description |
-|----------|---------|-------------|
+| Variabele | Standaard | Beschrijving |
+|----------|-----------|-------------|
 | `TICKET_API_URL` | `http://localhost:5000` | ticket-masala API |
 | `ODOO_BRIDGE_URL` | `http://localhost:5001` | odoo-bridge API |
 | `RABBITMQ_URL` | `amqp://guest:guest@localhost:5672` | RabbitMQ |
-| `LOG_LEVEL` | `INFO` | Logging level |
+| `LOG_LEVEL` | `INFO` | Logniveau |
 
 ### .env.example
 ```bash
@@ -188,101 +219,104 @@ RABBITMQ_PASS=guest
 LOG_LEVEL=INFO
 ```
 
-## 🔌 Extensions
+## Uitbreidingen
 
 ### REST API Gateway
-Full REST API for non-AI integrations:
+
+Volledige REST API voor niet-AI integraties:
 
 ```bash
 uv run garamatic-api
 ```
 
-**Available endpoints:**
-- `GET /health` - Service health check
-- `GET /tickets/{id}` - Get ticket
-- `GET /tickets` - List tickets (with filters)
-- `POST /tickets` - Create ticket
-- `POST /tickets/{id}/resolve` - Resolve ticket
-- `GET /invoices/by-ticket/{id}` - Get invoice
-- `POST /invoices` - Create invoice
-- `POST /emails` - Send email
-- `GET /customers/{email}/context` - Customer context
+Beschikbare endpoints:
+- `GET /health` - Service gezondheidsstatus
+- `GET /tickets/{id}` - Ticket ophalen
+- `GET /tickets` - Tickets weergeven (met filters)
+- `POST /tickets` - Ticket aanmaken
+- `POST /tickets/{id}/resolve` - Ticket oplossen
+- `GET /invoices/by-ticket/{id}` - Factuur ophalen
+- `POST /invoices` - Factuur aanmaken
+- `POST /emails` - E-mail versturen
+- `GET /customers/{email}/context` - Klantcontext
 
-All endpoints include input validation, request tracing, and proper error handling.
+Alle endpoints bevatten input validatie, request tracing en foutafhandeling.
 
 ### Event Consumer
-Automated workflow engine consuming RabbitMQ events:
+
+Geautomatiseerde werkstroom-engine die RabbitMQ events verwerkt:
 
 ```bash
 uv run garamatic-consumer
 ```
 
-**Automated workflows:**
-- `invoice.paid` → Send thank you email to customer
-- `invoice.sent` → Notify customer of new invoice
-- `ticket.escalated` → Alert manager via email
-- `ticket.created` → Send confirmation to customer
+Geautomatiseerde workflows:
+- `invoice.paid` - Stuur bedankmail naar klant
+- `invoice.sent` - Notificeer klant van nieuwe factuur
+- `ticket.escalated` - Waarschuw manager via e-mail
+- `ticket.created` - Stuur bevestiging naar klant
 
 ### AI Agent (LangGraph)
-Intelligent agent with planning and memory:
+
+Intelligent agentprogramma met planning en geheugen:
 
 ```bash
 export OPENAI_API_KEY='your-key'
 uv run garamatic-agent
 ```
 
-**Capabilities:**
-- Multi-step reasoning (find ticket → check status → resolve + invoice)
-- Customer context analysis across all services
-- Human approval for large invoices (€500+)
-- Conversation memory
-- Tool orchestration with fallback
+Capaciteiten:
+- Multi-stap redenering (zoek ticket → controleer status → los op + factuur)
+- Klantcontextanalyse op services
+- Menselijke goedkeuring voor grote facturen (€500+)
+- Gespreksgeheugen
+- Tool orchestratie met fallback
 
-Example interaction:
+Voorbeeldinteractie:
 ```
-You: Customer john@example.com needs help with ticket T-123
-Agent: I'll look up the customer context and ticket details...
-[Agent retrieves context, checks ticket, provides solution]
+U: Klant john@example.com heeft hulp nodig bij ticket T-123
+Agent: Ik zoek klantcontext en ticketdetails op...
+[Agent haalt context op, controleert ticket, geeft oplossing]
 
-You: Create an invoice for €200 and resolve the ticket
-Agent: ✅ Ticket T-123 resolved with €200 invoice queued.
+U: Maak een factuur van €200 en los het ticket op
+Agent: Ticket T-123 opgelost met €200 factuur in wachtrij.
 ```
 
-## 🧪 Testing
+## Testen
 
 ```bash
-# Run tests
+# Tests uitvoeren
 uv run pytest
 
-# With coverage
+# Met coverage
 uv run pytest --cov=agentic_service --cov-report=html
 
-# Test API endpoints
+# API endpoints testen
 curl http://localhost:3001/health
 ```
 
-## 🐳 Docker
+## Docker
 
 ```bash
 # Build
 docker build -t garamatic-agentic .
 
-# Run
+# Uitvoeren
 docker run -p 3001:3001 --env-file .env garamatic-agentic
 ```
 
-## 📚 MCP Resources
+## Bronnen
 
-- [MCP Specification](https://modelcontextprotocol.io/)
-- [FastMCP Docs](https://github.com/jlowin/fastmcp)
-- [Example MCP Servers](https://github.com/modelcontextprotocol/servers)
+- [MCP Specificatie](https://modelcontextprotocol.io/)
+- [FastMCP Documentatie](https://github.com/jlowin/fastmcp)
+- [Voorbeeld MCP Servers](https://github.com/modelcontextprotocol/servers)
 
-## 🎓 Learning Outcomes
+## Leeruitkomsten
 
-- How MCP enables AI agents to call your APIs
-- Designing AI-friendly tool interfaces
-- Structured vs unstructured LLM interactions
+- Hoe MCP AI-agenten in staat stelt uw APIs aan te roepen
+- AI-vriendelijke tool interfaces ontwerpen
+- Gestructureerde vs ongestructureerde LLM interacties
 
 ---
 
-**Built with 🤖 AI compatibility in mind**
+Gebouwd met AI-compatibiliteit in het oog
