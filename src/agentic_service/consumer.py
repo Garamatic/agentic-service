@@ -1,22 +1,21 @@
 """Event Consumer for Garamatic Agentic Service.
 
-Consumes events from RabbitMQ and triggers automated workflows:
-- payment.received -> email customer, resolve ticket
-- invoice.created -> notify customer
-- etc.
+Consumes events from RabbitMQ and triggers automated workflows via
+WorkflowEngine + GaramaticService.
 """
 
 import asyncio
 import contextlib
 import json
 import signal
-from typing import Any
 
 import aio_pika
 import structlog
 
-from .clients import RabbitMQPublisher, TicketClient
+from .clients import OdooBridgeClient, RabbitMQPublisher, TicketClient
 from .config import get_settings
+from .service import GaramaticService
+from .workflows import WorkflowEngine
 
 logger = structlog.get_logger()
 
@@ -25,45 +24,41 @@ running = True
 
 
 class EventConsumer:
-    """RabbitMQ event consumer with workflow automation (async-native)."""
+    """RabbitMQ event consumer with workflow automation."""
 
-    def __init__(self, amqp_url: str, ticket_api_url: str):
+    def __init__(self, service: GaramaticService, amqp_url: str):
+        self._service = service
+        self._workflow_engine = WorkflowEngine(service)
         self.amqp_url = amqp_url
-        self.ticket_client = TicketClient(ticket_api_url)
-        self.mq_publisher = RabbitMQPublisher(amqp_url)
+        self._mq_publisher: RabbitMQPublisher | None = None
         self.connection: aio_pika.RobustConnection | None = None
         self.channel: aio_pika.Channel | None = None
         self.queue: aio_pika.Queue | None = None
 
     async def connect(self) -> aio_pika.Queue:
-        """Establish RabbitMQ connection (async-native)."""
+        """Establish RabbitMQ connection and declare topology."""
         self.connection = await aio_pika.connect_robust(self.amqp_url)
         self.channel = await self.connection.channel()
-
-        # Set QoS to process one message at a time per consumer
         await self.channel.set_qos(prefetch_count=1)
 
-        # Declare exchange
         exchange = await self.channel.declare_exchange(
             "event_exchange",
             aio_pika.ExchangeType.TOPIC,
             durable=True
         )
 
-        # Declare queue
         self.queue = await self.channel.declare_queue(
             "agentic_consumer",
             durable=True
         )
 
-        # Bind to relevant events from upstream services
         bindings = [
-            "payment.received",   # from odoo-integration InvoiceStatusPoller
-            "invoice.created",    # from odoo-integration TicketResolvedConsumer
-            "invoice.overdue",    # from odoo-integration InvoiceStatusPoller
-            "ticket.resolved",    # from ticket-masala TicketWorkflowService
-            "ticket.escalated",   # from ticket-masala (future)
-            "ticket.created",     # from ticket-masala (future)
+            "payment.received",
+            "invoice.created",
+            "invoice.overdue",
+            "ticket.resolved",
+            "ticket.escalated",
+            "ticket.created",
         ]
 
         for routing_key in bindings:
@@ -71,261 +66,6 @@ class EventConsumer:
 
         logger.info("consumer.connected", queue=self.queue.name)
         return self.queue
-
-    async def process_payment_received(self, event: dict[str, Any]):
-        """Handle payment.received event: send thank-you email to customer."""
-        ticket_id = event.get("ticket_id") or event.get("TicketId") or "N/A"
-        invoice_id = (
-            event.get("invoice_id")
-            or event.get("InvoiceId")
-            or event.get("OdooInvoiceId")
-            or "N/A"
-        )
-        customer_email = event.get("customer_email") or event.get("CustomerEmail")
-        amount = event.get("amount") or event.get("Amount") or 0
-        logger.info("workflow.payment_received", ticket_id=ticket_id, invoice_id=invoice_id)
-
-        if not self.mq_publisher.exchange:
-            logger.error("workflow.mq_not_connected", event="payment.received")
-            return
-
-        if not customer_email:
-            logger.warning("workflow.payment_received.no_email", ticket_id=ticket_id)
-            return
-
-        # Send thank you email (flat structure per email.send schema)
-        payload = {
-            "event_type": "email.send",
-            "to_email": customer_email,
-            "from_email": "billing@garamatic.com",
-            "from_name": "Garamatic Billing",
-            "subject": f"Payment Received - Invoice #{invoice_id}",
-            "body_html": f"""
-            <h2>Thank you for your payment!</h2>
-            <p>We've received payment of €{amount:.2f} for invoice #{invoice_id}.</p>
-            <p>Your ticket #{ticket_id} has been closed.</p>
-            <p>Best regards,<br>Garamatic Team</p>
-            """,
-        }
-
-        try:
-            await self.mq_publisher.publish("email.send", payload)
-            logger.info("workflow.email_sent", to=customer_email, type="payment_thanks")
-        except Exception as e:
-            logger.error("workflow.email_failed", error=str(e))
-
-    async def process_invoice_created(self, event: dict[str, Any]):
-        """Handle invoice.created event: notify customer."""
-        ticket_id = event.get("ticket_id") or event.get("TicketId") or "N/A"
-        invoice_id = (
-            event.get("invoice_id")
-            or event.get("InvoiceId")
-            or event.get("OdooInvoiceId")
-            or "N/A"
-        )
-        customer_email = event.get("customer_email") or event.get("CustomerEmail")
-        amount = event.get("amount") or event.get("Amount") or 0
-        logger.info("workflow.invoice_created", ticket_id=ticket_id, invoice_id=invoice_id)
-
-        if not self.mq_publisher.exchange:
-            logger.error("workflow.mq_not_connected", event="invoice.created")
-            return
-
-        if not customer_email:
-            logger.warning("workflow.invoice_created.no_email", ticket_id=ticket_id)
-            return
-
-        payload = {
-            "event_type": "email.send",
-            "to_email": customer_email,
-            "from_email": "billing@garamatic.com",
-            "from_name": "Garamatic Billing",
-            "subject": f"New Invoice #{invoice_id} - €{amount:.2f}",
-            "body_html": f"""
-            <h2>New Invoice Available</h2>
-            <p>An invoice for €{amount:.2f} has been generated for ticket #{ticket_id}.</p>
-            <p>Invoice #{invoice_id}</p>
-            <p>Please review and process payment at your earliest convenience.</p>
-            <p>Best regards,<br>Garamatic Team</p>
-            """,
-        }
-
-        try:
-            await self.mq_publisher.publish("email.send", payload)
-            logger.info("workflow.email_sent", to=customer_email, type="invoice_notification")
-        except Exception as e:
-            logger.error("workflow.email_failed", error=str(e))
-
-    async def process_ticket_escalated(self, event: dict[str, Any]):
-        """Handle ticket.escalated event: notify manager."""
-        ticket_id = event.get("ticket_id") or event.get("TicketId") or "N/A"
-        reason = event.get("reason") or event.get("Reason") or "Unknown"
-        logger.warning("workflow.ticket_escalated", ticket_id=ticket_id, reason=reason)
-
-        if not self.mq_publisher.exchange:
-            logger.error("workflow.mq_not_connected", event="ticket.escalated")
-            return
-
-        # Get ticket details for the alert (skip pointless API call when ID is missing)
-        ticket: dict[str, Any] = {}
-        if ticket_id != "N/A":
-            try:
-                ticket = await self.ticket_client.get_ticket(ticket_id)
-            except Exception as e:
-                logger.error("workflow.ticket_lookup_failed", ticket_id=ticket_id, error=str(e))
-
-        manager_email = "manager@garamatic.com"  # TODO: Make configurable via env var
-
-        payload = {
-            "event_type": "email.send",
-            "to_email": manager_email,
-            "from_email": "system@garamatic.com",
-            "from_name": "Garamatic System",
-            "subject": f"URGENT: Ticket #{ticket_id} Escalated",
-            "body_html": f"""
-            <h2>Ticket Escalation Alert</h2>
-            <p>Ticket #{ticket_id} has been escalated.</p>
-            <p><strong>Reason:</strong> {reason}</p>
-            <p><strong>Customer ID:</strong> {ticket.get('customerId', 'N/A')}</p>
-            <p><strong>Title:</strong> {ticket.get('title', 'Untitled')}</p>
-            <p>Please review immediately.</p>
-            """,
-        }
-
-        try:
-            await self.mq_publisher.publish("email.send", payload)
-            logger.info("workflow.manager_notified", ticket_id=ticket_id)
-        except Exception as e:
-            logger.error("workflow.escalation_failed", error=str(e))
-
-    async def process_ticket_created(self, event: dict[str, Any]):
-        """Handle ticket.created event: send confirmation."""
-        ticket_id = event.get("ticket_id") or event.get("TicketId") or "N/A"
-        customer_email = event.get("customer_email") or event.get("CustomerEmail")
-        customer_name = event.get("customer_name") or event.get("CustomerName") or "Customer"
-        title = event.get("title") or event.get("Title") or "Untitled"
-        logger.info("workflow.ticket_created", ticket_id=ticket_id, customer=customer_email)
-
-        if not self.mq_publisher.exchange:
-            logger.error("workflow.mq_not_connected", event="ticket.created")
-            return
-
-        if not customer_email:
-            logger.warning("workflow.ticket_created.no_email", ticket_id=ticket_id)
-            return
-
-        payload = {
-            "event_type": "email.send",
-            "to_email": customer_email,
-            "from_email": "support@garamatic.com",
-            "from_name": "Garamatic Support",
-            "subject": f"Ticket #{ticket_id} Created - {title}",
-            "body_html": f"""
-            <h2>Your Support Ticket</h2>
-            <p>Hi {customer_name},</p>
-            <p>We've received your support request and created ticket #{ticket_id}.</p>
-            <p><strong>Title:</strong> {title}</p>
-            <p>Our team will review and respond within 24 hours.</p>
-            <p>Best regards,<br>Garamatic Support Team</p>
-            """,
-        }
-
-        try:
-            await self.mq_publisher.publish("email.send", payload)
-            logger.info("workflow.confirmation_sent", to=customer_email, ticket_id=ticket_id)
-        except Exception as e:
-            logger.error("workflow.confirmation_failed", error=str(e))
-
-    async def process_invoice_overdue(self, event: dict[str, Any]):
-        """Handle invoice.overdue event: notify customer + manager."""
-        invoice_id = (
-            event.get("invoice_id")
-            or event.get("InvoiceId")
-            or event.get("OdooInvoiceId")
-            or "N/A"
-        )
-        customer_email = event.get("customer_email") or event.get("CustomerEmail")
-        amount = event.get("amount") or event.get("Amount") or 0
-        days_overdue = event.get("days_overdue") or event.get("DaysOverdue") or 0
-
-        logger.warning(
-            "workflow.invoice_overdue", invoice_id=invoice_id, days=days_overdue
-        )
-
-        if not self.mq_publisher.exchange:
-            logger.error("workflow.mq_not_connected", event="invoice.overdue")
-            return
-
-        if not customer_email:
-            logger.warning("workflow.invoice_overdue.no_email", invoice_id=invoice_id)
-            return
-
-        day_word = "day" if days_overdue == 1 else "days"
-        payload = {
-            "event_type": "email.send",
-            "to_email": customer_email,
-            "from_email": "billing@garamatic.com",
-            "from_name": "Garamatic Billing",
-            "subject": f"Overdue Invoice #{invoice_id}",
-            "body_html": f"""
-            <h2>Invoice Overdue</h2>
-            <p>Invoice #{invoice_id} for €{amount:.2f} is now {days_overdue} {day_word} overdue.</p>
-            <p>Please process payment at your earliest convenience.</p>
-            """,
-        }
-
-        try:
-            await self.mq_publisher.publish("email.send", payload)
-            logger.info("workflow.overdue_notification_sent", to=customer_email)
-        except Exception as e:
-            logger.error("workflow.overdue_notification_failed", error=str(e))
-
-    async def process_ticket_resolved(self, event: dict[str, Any]):
-        """Handle ticket.resolved event: send confirmation to customer."""
-        ticket_id = event.get("ticket_id") or event.get("TicketId") or "N/A"
-        customer_email = event.get("customer_email") or event.get("CustomerEmail")
-        customer_name = event.get("customer_name") or event.get("CustomerName") or "there"
-        resolution_notes = (
-            event.get("resolution_notes")
-            or event.get("ResolutionNotes")
-            or "Your issue has been resolved."
-        )
-        logger.info(
-            "workflow.ticket_resolved", ticket_id=ticket_id, customer=customer_email
-        )
-
-        if not self.mq_publisher.exchange:
-            logger.error("workflow.mq_not_connected", event="ticket.resolved")
-            return
-
-        if not customer_email:
-            logger.warning("workflow.ticket_resolved.no_email", ticket_id=ticket_id)
-            return
-
-        payload = {
-            "event_type": "email.send",
-            "to_email": customer_email,
-            "from_email": "support@garamatic.com",
-            "from_name": "Garamatic Support",
-            "subject": f"Ticket #{ticket_id} Resolved",
-            "body_html": f"""
-            <h2>Your ticket has been resolved</h2>
-            <p>Hi {customer_name},</p>
-            <p>Ticket #{ticket_id} has been resolved.</p>
-            <p><strong>Resolution:</strong> {resolution_notes}</p>
-            <p>If you have any further questions, please reply to this email.</p>
-            """,
-        }
-
-        try:
-            await self.mq_publisher.publish("email.send", payload)
-            logger.info(
-                "workflow.resolution_email_sent",
-                to=customer_email,
-                ticket_id=ticket_id,
-            )
-        except Exception as e:
-            logger.error("workflow.resolution_email_failed", error=str(e))
 
     async def handle_message(self, message: aio_pika.IncomingMessage):
         """Process a single message with explicit ack/reject control.
@@ -338,32 +78,11 @@ class EventConsumer:
             routing_key = message.routing_key
 
             # Check for integration-contract envelope, fallback to flat object
-            event_type = body.get("eventType") or body.get("event_type")
             event_data = body.get("data") if "data" in body else body
 
-            logger.info(
-                "consumer.received",
-                routing_key=routing_key,
-                event_type=event_type
-            )
+            logger.info("consumer.received", routing_key=routing_key)
 
-            # Dispatch to appropriate handler
-            handlers = {
-                "payment.received": self.process_payment_received,
-                "invoice.created": self.process_invoice_created,
-                "invoice.overdue": self.process_invoice_overdue,
-                "ticket.resolved": self.process_ticket_resolved,
-                # Kept for potential future producers; currently no emitters:
-                "ticket.escalated": self.process_ticket_escalated,
-                "ticket.created": self.process_ticket_created,
-            }
-
-            handler = handlers.get(routing_key)
-            if handler:
-                await handler(event_data)
-            else:
-                logger.warning("consumer.unhandled_routing_key", key=routing_key)
-
+            await self._workflow_engine.handle(routing_key, event_data)
             await message.ack()
         except json.JSONDecodeError as e:
             logger.error("consumer.invalid_json", error=str(e))
@@ -373,15 +92,12 @@ class EventConsumer:
             await message.reject(requeue=True)
 
     async def run(self):
-        """Main consumer loop (async-native)."""
+        """Main consumer loop."""
         global running
 
         queue = await self.connect()
-        await self.mq_publisher.connect()
-
         logger.info("consumer.started", queue=queue.name)
 
-        # Start consuming messages
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
                 if not running:
@@ -389,11 +105,11 @@ class EventConsumer:
                 await self.handle_message(message)
 
     async def close(self):
-        """Cleanup resources (async-native)."""
-        for client in (self.ticket_client, self.mq_publisher, self.connection):
-            if client:
+        """Cleanup resources."""
+        for resource in (self._service, self.connection):
+            if resource:
                 with contextlib.suppress(Exception):
-                    await client.close()
+                    await resource.close()
 
 
 def signal_handler(signum, frame):
@@ -406,9 +122,27 @@ def signal_handler(signum, frame):
 async def main_async():
     """Async main entry point."""
     config = get_settings()
+
+    ticket_client = TicketClient(config.ticket_api_url)
+    odoo_client = OdooBridgeClient(config.odoo_bridge_url)
+
+    mq_publisher: RabbitMQPublisher | None = None
+    try:
+        mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
+        await mq_publisher.connect()
+        logger.info("consumer.mq.connected")
+    except Exception as e:
+        logger.warning("consumer.mq.unavailable", error=str(e))
+
+    service = GaramaticService(
+        ticket_client=ticket_client,
+        odoo_client=odoo_client,
+        mq_publisher=mq_publisher,
+    )
+
     consumer = EventConsumer(
+        service=service,
         amqp_url=config.rabbitmq_url,
-        ticket_api_url=config.ticket_api_url
     )
 
     # Set up signal handlers for graceful shutdown
@@ -419,7 +153,6 @@ async def main_async():
     try:
         await consumer.run()
     finally:
-        # Remove signal handlers
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.remove_signal_handler(sig)
         await consumer.close()
