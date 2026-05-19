@@ -20,9 +20,9 @@ from agentic_service.server import (
     send_email,
 )
 from agentic_service.service import (
+    ValidationError,
     _generate_request_id,
     _validate_email,
-    ValidationError,
 )
 
 
@@ -358,7 +358,12 @@ class TestGetCustomerContext:
 
     async def test_returns_full_context(self, mock_ticket_data, mock_invoice_data):
         """Should return comprehensive customer context."""
-        from agentic_service.service import CustomerContext, CustomerSummary, InvoiceSummary, TicketSummary
+        from agentic_service.service import (
+            CustomerContext,
+            CustomerSummary,
+            InvoiceSummary,
+            TicketSummary,
+        )
         context = CustomerContext(
             customer_email="john@example.com",
             summary=CustomerSummary(

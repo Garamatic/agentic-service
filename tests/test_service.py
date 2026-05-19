@@ -9,22 +9,18 @@ import pytest
 
 from agentic_service.service import (
     CustomerContext,
-    CustomerSession,
     EmailQueueResult,
     GaramaticService,
     HealthStatus,
     InvoiceQueueResult,
     InvoiceStatus,
-    InvoiceSummary,
     NotFoundError,
     ResolutionResult,
-    ServiceUnavailableError,
     Ticket,
     TicketSummary,
     ValidationError,
     _validate_email,
 )
-
 
 # ------------------------------------------------------------------
 # Fake ports

@@ -27,7 +27,9 @@ async def api_client(mock_ticket_client, mock_odoo_client, mock_mq_publisher):
 class TestHealthEndpoint:
     """Test health check endpoint."""
 
-    async def test_returns_healthy_when_all_services_up(self, api_client, mock_ticket_client, mock_odoo_client):
+    async def test_returns_healthy_when_all_services_up(
+        self, api_client, mock_ticket_client, mock_odoo_client
+    ):
         """Should return healthy status when all services connected."""
         mock_ticket_client.list_tickets.return_value = []
         mock_odoo_client.list_customer_invoices.return_value = []
@@ -71,8 +73,9 @@ class TestTicketsEndpoints:
 
     async def test_get_ticket_not_found(self, api_client, mock_ticket_client):
         """Should return 404 for non-existent ticket."""
-        from httpx import HTTPStatusError
         from unittest.mock import MagicMock
+
+        from httpx import HTTPStatusError
         mock_response = MagicMock()
         mock_response.status_code = 404
         mock_ticket_client.get_ticket.side_effect = HTTPStatusError(
@@ -88,11 +91,15 @@ class TestTicketsEndpoints:
         assert "error" in data["detail"]
         assert "request_id" in data["detail"]
 
-    async def test_list_tickets_with_filters(self, api_client, mock_ticket_client, mock_ticket_data):
+    async def test_list_tickets_with_filters(
+        self, api_client, mock_ticket_client, mock_ticket_data
+    ):
         """Should list tickets with filters applied."""
         mock_ticket_client.list_tickets.return_value = [mock_ticket_data]
 
-        response = await api_client.get("/tickets?customer_email=john@example.com&status=open&limit=5")
+        response = await api_client.get(
+            "/tickets?customer_email=john@example.com&status=open&limit=5"
+        )
 
         assert response.status_code == 200
         data = response.json()
@@ -187,7 +194,9 @@ class TestInvoicesEndpoints:
         data = response.json()
         assert data["status"] == "not_found"
 
-    async def test_create_invoice_success(self, api_client, mock_ticket_client, mock_mq_publisher, mock_ticket_data):
+    async def test_create_invoice_success(
+        self, api_client, mock_ticket_client, mock_mq_publisher, mock_ticket_data
+    ):
         """Should queue invoice creation."""
         mock_ticket_client.get_ticket.return_value = mock_ticket_data
 
@@ -287,7 +296,9 @@ class TestErrorHandling:
 
     async def test_sanitizes_internal_errors(self, api_client, mock_ticket_client):
         """Should not expose internal error details to the client."""
-        mock_ticket_client.get_ticket.side_effect = Exception("Database connection failed: secret_password_here")
+        mock_ticket_client.get_ticket.side_effect = Exception(
+            "Database connection failed: secret_password_here"
+        )
 
         response = await api_client.get("/tickets/T-123")
 

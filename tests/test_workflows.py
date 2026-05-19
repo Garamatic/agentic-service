@@ -7,7 +7,6 @@ import pytest
 from agentic_service.service import EmailQueueResult
 from agentic_service.workflows import (
     DEFAULT_WORKFLOWS,
-    Workflow,
     WorkflowEngine,
     _field,
 )
@@ -107,7 +106,7 @@ class TestWorkflowEngine:
         assert result is not None
         call = mock_service.send_email.await_args
         assert "New Invoice" in call.kwargs["subject"]
-        assert "billing@garamatic.com" == call.kwargs["from_email"]
+        assert call.kwargs["from_email"] == "billing@garamatic.com"
 
     async def test_ticket_resolved_workflow(self):
         """Should send resolution confirmation email."""
@@ -133,7 +132,7 @@ class TestWorkflowEngine:
         call = mock_service.send_email.await_args
         assert "Resolved" in call.kwargs["subject"]
         assert "Fixed the VPN issue" in call.kwargs["body"]
-        assert "support@garamatic.com" == call.kwargs["from_email"]
+        assert call.kwargs["from_email"] == "support@garamatic.com"
 
     async def test_ticket_escalated_sends_to_manager(self):
         """Should send escalation alert to manager email."""
@@ -157,7 +156,7 @@ class TestWorkflowEngine:
         call = mock_service.send_email.await_args
         assert call.kwargs["to_email"] == "manager@garamatic.com"
         assert "URGENT" in call.kwargs["subject"]
-        assert "system@garamatic.com" == call.kwargs["from_email"]
+        assert call.kwargs["from_email"] == "system@garamatic.com"
 
     async def test_ticket_escalated_enriches_with_ticket_data(self):
         """Should look up ticket details before rendering escalation email."""
@@ -196,7 +195,7 @@ class TestWorkflowEngine:
 
     async def test_all_registered_workflows_have_templates(self):
         """Every registered workflow must have a valid template."""
-        for routing_key, workflow in DEFAULT_WORKFLOWS.items():
+        for _routing_key, workflow in DEFAULT_WORKFLOWS.items():
             assert workflow.template is not None
             assert workflow.template.from_email
             assert workflow.template.from_name
@@ -241,7 +240,7 @@ class TestInvoiceOverdueWorkflow:
         engine = WorkflowEngine(mock_service)
 
         # 1 day overdue
-        result = await engine.handle("invoice.overdue", {
+        await engine.handle("invoice.overdue", {
             "customer_email": "customer@example.com",
             "days_overdue": 1,
             "amount": 100.0,
@@ -251,7 +250,7 @@ class TestInvoiceOverdueWorkflow:
 
         # 5 days overdue
         mock_service.send_email.reset_mock()
-        result = await engine.handle("invoice.overdue", {
+        await engine.handle("invoice.overdue", {
             "customer_email": "customer@example.com",
             "days_overdue": 5,
             "amount": 100.0,
