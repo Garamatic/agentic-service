@@ -12,9 +12,8 @@ import signal
 import aio_pika
 import structlog
 
-from .clients import OdooBridgeClient, RabbitMQPublisher, TicketClient
-from .config import get_settings
-from .service import GaramaticService
+from .clients import RabbitMQPublisher
+from .service import GaramaticService, create_service
 from .workflows import WorkflowEngine
 
 logger = structlog.get_logger()
@@ -121,24 +120,10 @@ def signal_handler(signum, frame):
 
 async def main_async():
     """Async main entry point."""
+    from .config import get_settings
+
     config = get_settings()
-
-    ticket_client = TicketClient(config.ticket_api_url)
-    odoo_client = OdooBridgeClient(config.odoo_bridge_url)
-
-    mq_publisher: RabbitMQPublisher | None = None
-    try:
-        mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
-        await mq_publisher.connect()
-        logger.info("consumer.mq.connected")
-    except Exception as e:
-        logger.warning("consumer.mq.unavailable", error=str(e))
-
-    service = GaramaticService(
-        ticket_client=ticket_client,
-        odoo_client=odoo_client,
-        mq_publisher=mq_publisher,
-    )
+    service = await create_service()
 
     consumer = EventConsumer(
         service=service,

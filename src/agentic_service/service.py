@@ -723,3 +723,37 @@ def _map_client_error(e: Exception, rid: str) -> ServiceError:
             return NotFoundError(str(e), rid)
         return UpstreamError(str(e), rid)
     return UpstreamError(str(e), rid)
+
+
+# ------------------------------------------------------------------
+# Factory
+# ------------------------------------------------------------------
+
+async def create_service() -> GaramaticService:
+    """Factory: create a fully wired GaramaticService from config.
+
+    Creates TicketClient, OdooBridgeClient, and RabbitMQPublisher,
+    connects RabbitMQ best-effort, and returns the composed service.
+    This is the single composition root for all entry points.
+    """
+    from .clients import OdooBridgeClient, RabbitMQPublisher, TicketClient
+    from .config import get_settings
+
+    config = get_settings()
+
+    ticket_client = TicketClient(config.ticket_api_url)
+    odoo_client = OdooBridgeClient(config.odoo_bridge_url)
+
+    mq_publisher: RabbitMQPublisher | None = None
+    try:
+        mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
+        await mq_publisher.connect()
+        logger.info("service_factory.mq.connected")
+    except Exception as e:
+        logger.warning("service_factory.mq.unavailable", error=str(e))
+
+    return GaramaticService(
+        ticket_client=ticket_client,
+        odoo_client=odoo_client,
+        mq_publisher=mq_publisher,
+    )

@@ -10,7 +10,7 @@ from typing import Any
 import structlog
 from fastmcp import Context, FastMCP
 
-from .clients import OdooBridgeClient, RabbitMQPublisher, TicketClient
+from .clients import OdooBridgeClient, TicketClient
 from .config import get_settings
 from .service import (
     GaramaticService,
@@ -19,6 +19,7 @@ from .service import (
     ValidationError,
     _format_date,
     _validate_email,
+    create_service,
 )
 
 logger = structlog.get_logger()
@@ -31,29 +32,9 @@ logger = structlog.get_logger()
 @asynccontextmanager
 async def app_lifespan(server: "FastMCP"):
     """Initialize and cleanup service on server startup/shutdown."""
-    config = get_settings()
+    service = await create_service()
 
-    ticket_client = TicketClient(config.ticket_api_url)
-    odoo_client = OdooBridgeClient(config.odoo_bridge_url)
-
-    # Initialize RabbitMQ but don't fail if unavailable (graceful degradation)
-    mq_publisher: RabbitMQPublisher | None = None
-    try:
-        mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
-        await mq_publisher.connect()
-        logger.info("rabbitmq.connected")
-    except Exception as e:
-        logger.warning("rabbitmq.unavailable", error=str(e))
-
-    service = GaramaticService(
-        ticket_client=ticket_client,
-        odoo_client=odoo_client,
-        mq_publisher=mq_publisher,
-    )
-
-    logger.info("service.started",
-                ticket_api=config.ticket_api_url,
-                odoo_bridge=config.odoo_bridge_url)
+    logger.info("service.started")
 
     try:
         yield {"service": service}

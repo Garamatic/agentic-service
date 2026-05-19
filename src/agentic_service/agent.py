@@ -23,11 +23,10 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
-from .clients import OdooBridgeClient, RabbitMQPublisher, TicketClient
-from .config import get_settings
 from .service import (
     GaramaticService,
     _generate_request_id,
+    create_service,
 )
 
 logger = structlog.get_logger()
@@ -457,26 +456,7 @@ class GaramaticAgent:
 async def init_clients():
     """Initialize GaramaticService for agent tools."""
     global service
-
-    config = get_settings()
-
-    ticket_client = TicketClient(config.ticket_api_url)
-    odoo_client = OdooBridgeClient(config.odoo_bridge_url)
-
-    mq_publisher: RabbitMQPublisher | None = None
-    try:
-        mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
-        await mq_publisher.connect()
-        logger.info("agent.rabbitmq.connected")
-    except Exception as e:
-        logger.warning("agent.rabbitmq.unavailable", error=str(e))
-
-    service = GaramaticService(
-        ticket_client=ticket_client,
-        odoo_client=odoo_client,
-        mq_publisher=mq_publisher,
-    )
-
+    service = await create_service()
     logger.info("agent.service.initialized")
 
 

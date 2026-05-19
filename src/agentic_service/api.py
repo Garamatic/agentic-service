@@ -8,7 +8,6 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
-from .clients import OdooBridgeClient, RabbitMQPublisher, TicketClient
 from .config import get_settings
 from .service import (
     GaramaticService,
@@ -17,6 +16,7 @@ from .service import (
     UpstreamError,
     ValidationError,
     _generate_request_id,
+    create_service,
 )
 
 logger = structlog.get_logger()
@@ -74,24 +74,13 @@ class SendEmailRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup service."""
-    config = get_settings()
+    app.state.service = await create_service()
 
-    ticket_client = TicketClient(config.ticket_api_url)
-    odoo_client = OdooBridgeClient(config.odoo_bridge_url)
+    logger.info("api.started")
+    yield
 
-    mq_publisher: RabbitMQPublisher | None = None
-    try:
-        mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
-        await mq_publisher.connect()
-        logger.info("api.rabbitmq.connected")
-    except Exception as e:
-        logger.warning("api.rabbitmq.unavailable", error=str(e))
-
-    app.state.service = GaramaticService(
-        ticket_client=ticket_client,
-        odoo_client=odoo_client,
-        mq_publisher=mq_publisher,
-    )
+    await app.state.service.close()
+    logger.info("api.stopped")
 
     logger.info("api.started")
     yield
