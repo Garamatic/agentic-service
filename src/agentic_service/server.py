@@ -3,97 +3,79 @@ MCP Server for Garamatic Platform
 Exposes tickets, invoices, and emails as AI-callable tools
 """
 
-import asyncio
-import contextlib
 import json
-import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
-from typing import Any, Literal
+from typing import Any
 
-import httpx
 import structlog
 from fastmcp import Context, FastMCP
 
 from .clients import OdooBridgeClient, RabbitMQPublisher, TicketClient
 from .config import get_settings
+from .service import (
+    GaramaticService,
+    NotFoundError,
+    ServiceUnavailableError,
+    ValidationError,
+    _format_date,
+    _validate_email,
+)
 
 logger = structlog.get_logger()
 
-# Setup and teardown using lifespan context manager
+
+# ------------------------------------------------------------------
+# Lifespan: create service, inject into MCP context
+# ------------------------------------------------------------------
+
 @asynccontextmanager
 async def app_lifespan(server: "FastMCP"):
-    """Initialize and cleanup clients on server startup/shutdown."""
-    global ticket_client, odoo_client, mq_publisher
-
-    # Startup
+    """Initialize and cleanup service on server startup/shutdown."""
     config = get_settings()
 
     ticket_client = TicketClient(config.ticket_api_url)
     odoo_client = OdooBridgeClient(config.odoo_bridge_url)
 
     # Initialize RabbitMQ but don't fail if unavailable (graceful degradation)
+    mq_publisher: RabbitMQPublisher | None = None
     try:
         mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
         await mq_publisher.connect()
         logger.info("rabbitmq.connected")
     except Exception as e:
         logger.warning("rabbitmq.unavailable", error=str(e))
-        mq_publisher = None  # Flag as unavailable - write operations will fail gracefully
+
+    service = GaramaticService(
+        ticket_client=ticket_client,
+        odoo_client=odoo_client,
+        mq_publisher=mq_publisher,
+    )
 
     logger.info("service.started",
                 ticket_api=config.ticket_api_url,
                 odoo_bridge=config.odoo_bridge_url)
 
     try:
-        yield
+        yield {"service": service}
     finally:
-        # Shutdown
-        for client in (ticket_client, odoo_client, mq_publisher):
-            if client:
-                with contextlib.suppress(Exception):
-                    await client.close()
-
+        await service.close()
         logger.info("service.stopped")
 
 
-# Create MCP server
 mcp = FastMCP("garamatic", lifespan=app_lifespan)
 
 
-def _format_date(d: str | None) -> str:
-    """Format an ISO date string to YYYY-MM-DD or return placeholder."""
-    return d[:10] if d and len(d) >= 10 else (d or "N/A")
+def _get_service(ctx: Context) -> GaramaticService:
+    """Extract service from MCP lifespan context."""
+    service = ctx.request_context.lifespan_context.get("service")
+    if service is None:
+        raise ServiceUnavailableError("Service not initialized")
+    return service
 
 
-def _validate_email(email: str) -> None:
-    """Validate email format, raise ValueError if invalid."""
-    if not email or not isinstance(email, str):
-        raise ValueError(f"Invalid email format: {email}")
-    if "@" not in email:
-        raise ValueError(f"Invalid email format: {email}")
-    local, _, domain = email.rpartition("@")
-    if not local or not domain:
-        raise ValueError(f"Invalid email format: {email}")
-    # Domain must contain at least one dot, not start/end with dot
-    if "." not in domain:
-        raise ValueError(f"Invalid email format: {email}")
-    if domain.startswith(".") or domain.endswith("."):
-        raise ValueError(f"Invalid email format: {email}")
-    # Local part cannot contain consecutive dots
-    if ".." in local:
-        raise ValueError(f"Invalid email format: {email}")
-
-
-def _generate_request_id() -> str:
-    """Generate unique request ID for tracing."""
-    return uuid.uuid4().hex
-
-# Global clients (initialized by lifespan context manager)
-ticket_client: TicketClient | None = None
-odoo_client: OdooBridgeClient | None = None
-mq_publisher: RabbitMQPublisher | None = None
-
+# ------------------------------------------------------------------
+# MCP Tools — thin wrappers over GaramaticService
+# ------------------------------------------------------------------
 
 @mcp.tool()
 async def get_ticket_status(
@@ -110,56 +92,39 @@ async def get_ticket_status(
     Returns:
         Ticket details including status, customer info, and resolution notes
     """
-    if not ticket_id or not ticket_id.strip():
-        raise ValueError("Ticket ID is required")
-    if ticket_client is None:
-        return {"error": "Ticket service unavailable", "ticket_id": ticket_id}
-
-    rid = _generate_request_id()
-    logger.info("Getting ticket status", ticket_id=ticket_id, request_id=rid)
-
+    service = _get_service(ctx)
     try:
-        result = await ticket_client.get_ticket(ticket_id)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            return {
-                "ticket_id": ticket_id,
-                "status": "not_found",
-                "message": "Ticket not found"
-            }
-        logger.error("get_ticket_status.failed", ticket_id=ticket_id, error=str(e), request_id=rid)
-        return {
-            "ticket_id": ticket_id,
-            "status": "error",
-            "message": f"Failed to retrieve ticket: {e}"
-        }
+        ticket = await service.get_ticket(ticket_id)
+    except ValidationError as e:
+        return {"ticket_id": ticket_id, "status": "error", "message": str(e)}
+    except NotFoundError:
+        return {"ticket_id": ticket_id, "status": "not_found", "message": "Ticket not found"}
     except Exception as e:
-        logger.error("get_ticket_status.failed", ticket_id=ticket_id, error=str(e), request_id=rid)
         return {
             "ticket_id": ticket_id,
             "status": "error",
-            "message": f"Failed to retrieve ticket: {e}"
+            "message": f"Failed to retrieve ticket: {e}",
         }
 
-    await ctx.info(f"Found ticket {ticket_id} with status: {result.get('status')}")
+    await ctx.info(f"Found ticket {ticket_id} with status: {ticket.status}")
 
     return {
         "ticket_id": ticket_id,
-        "status": result.get("status") or "unknown",
-        "customer_id": result.get("customerId"),  # NOTE: API returns CustomerId, not customerEmail
-        "title": result.get("title") or "Untitled",
-        "description": result.get("description"),
-        "created_at": result.get("createdAt"),
-        "resolved_at": result.get("resolvedAt") or result.get("completedAt"),
-        "resolution_notes": result.get("resolutionNotes"),
-        "billable_amount": result.get("billableAmount")
+        "status": ticket.status,
+        "customer_id": ticket.customer_email,
+        "title": ticket.title,
+        "description": ticket.description,
+        "created_at": ticket.created_at,
+        "resolved_at": ticket.resolved_at,
+        "resolution_notes": ticket.resolution_notes,
+        "billable_amount": ticket.billable_amount,
     }
 
 
 @mcp.tool()
 async def list_customer_tickets(
     customer_email: str,
-    status: Literal["open", "resolved", "closed"] | None = None,
+    status: str | None = None,
     limit: int = 10,
     *,
     ctx: Context
@@ -175,38 +140,31 @@ async def list_customer_tickets(
     Returns:
         Dict containing "tickets" list with status and brief details
     """
-    if ticket_client is None:
-        return {"error": "Ticket service unavailable", "tickets": []}
-
-    _validate_email(customer_email)
-    rid = _generate_request_id()
-    logger.info("Listing customer tickets", email=customer_email, status=status, request_id=rid)
-
-    # NOTE: In this system customerId is stored as the email address,
-    # so we can filter directly via the API when supported.
+    service = _get_service(ctx)
     try:
-        tickets = await ticket_client.list_tickets(
-            customer_id=customer_email,
-            status=status,
-            limit=limit
+        _validate_email(customer_email)
+    except ValidationError as e:
+        raise ValueError(str(e)) from e
+
+    try:
+        tickets = await service.list_tickets(
+            customer_email=customer_email,
+            status=status,  # type: ignore[arg-type]
+            limit=limit,
         )
     except Exception as e:
-        logger.error("list_customer_tickets.failed", error=str(e), request_id=rid)
-        return {
-            "error": f"Failed to list tickets: {e}",
-            "tickets": []
-        }
+        return {"error": f"Failed to list tickets: {e}", "tickets": []}
 
     await ctx.info(f"Found {len(tickets)} tickets for {customer_email}")
 
     return {
         "tickets": [
             {
-                "ticket_id": t.get("id"),
-                "title": t.get("title") or "Untitled",
-                "status": t.get("status") or "unknown",
-                "created_at": t.get("createdAt"),
-                "resolved_at": t.get("resolvedAt") or t.get("completedAt")
+                "ticket_id": t.id,
+                "title": t.title,
+                "status": t.status,
+                "created_at": t.created_at,
+                "resolved_at": t.resolved_at,
             }
             for t in tickets
         ]
@@ -219,7 +177,7 @@ async def create_ticket(
     description: str,
     customer_email: str,
     customer_name: str,
-    priority: Literal["low", "medium", "high", "urgent"] = "medium",
+    priority: str = "medium",
     *,
     ctx: Context
 ) -> dict[str, Any]:
@@ -236,38 +194,27 @@ async def create_ticket(
     Returns:
         Created ticket details including the new ticket ID
     """
-    if ticket_client is None:
-        return {"error": "Ticket service unavailable"}
-
-    _validate_email(customer_email)
-    if not title or not title.strip():
-        raise ValueError("Title is required")
-    rid = _generate_request_id()
-    logger.info("Creating ticket", title=title, customer=customer_email, request_id=rid)
-
-    # NOTE: API expects CustomerId (user ID), not email.
-    # Using email as customer_id - this works if the system stores email as the user identifier
+    service = _get_service(ctx)
     try:
-        result = await ticket_client.create_ticket(
+        ticket = await service.create_ticket(
             title=title,
             description=description,
-            customer_id=customer_email,
+            customer_email=customer_email,
             customer_name=customer_name,
-            priority=priority
+            priority=priority,  # type: ignore[arg-type]
         )
+    except ValidationError as e:
+        raise ValueError(str(e)) from e
     except Exception as e:
-        logger.error("create_ticket.failed", error=str(e), request_id=rid)
-        return {
-            "error": f"Failed to create ticket: {e}",
-            "status": "failed"
-        }
+        return {"error": f"Failed to create ticket: {e}", "status": "failed"}
 
-    ticket_id = result.get("id")
-    if not ticket_id:
+    ticket_id = ticket.id
+    if not ticket_id or ticket_id == "N/A":
         return {
             "error": "Ticket created but no ID returned by upstream API",
-            "status": "created"
+            "status": "created",
         }
+
     await ctx.info(f"Created ticket {ticket_id}")
 
     return {
@@ -278,7 +225,7 @@ async def create_ticket(
         "message": (
             f"Ticket {ticket_id} created successfully. "
             "Customer will receive confirmation email."
-        )
+        ),
     }
 
 
@@ -301,91 +248,38 @@ async def resolve_ticket(
     Returns:
         Resolution confirmation and invoice info if billable
     """
-    if not ticket_id or not ticket_id.strip():
-        raise ValueError("Ticket ID is required")
-    if ticket_client is None:
-        return {"error": "Ticket service unavailable", "ticket_id": ticket_id}
-
-    if not resolution_notes or not resolution_notes.strip():
-        raise ValueError("Resolution notes are required")
-    if billable_amount is not None and billable_amount < 0:
-        raise ValueError("Billable amount cannot be negative")
-    rid = _generate_request_id()
-    logger.info("Resolving ticket", ticket_id=ticket_id, billable=billable_amount, request_id=rid)
-
-    # Resolve in ticket-masala
+    service = _get_service(ctx)
     try:
-        result = await ticket_client.resolve_ticket(
+        result = await service.resolve_ticket(
             ticket_id=ticket_id,
             resolution_notes=resolution_notes,
-            billable_amount=billable_amount
+            billable_amount=billable_amount,
         )
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            return {
-                "ticket_id": ticket_id,
-                "status": "not_found",
-                "message": "Ticket not found"
-            }
-        logger.error("resolve_ticket.failed", ticket_id=ticket_id, error=str(e), request_id=rid)
-        return {
-            "ticket_id": ticket_id,
-            "status": "error",
-            "message": f"Failed to resolve ticket: {e}"
-        }
+    except ValidationError as e:
+        raise ValueError(str(e)) from e
+    except NotFoundError:
+        return {"ticket_id": ticket_id, "status": "not_found", "message": "Ticket not found"}
     except Exception as e:
-        logger.error("resolve_ticket.failed", ticket_id=ticket_id, error=str(e), request_id=rid)
         return {
             "ticket_id": ticket_id,
             "status": "error",
-            "message": f"Failed to resolve ticket: {e}"
+            "message": f"Failed to resolve ticket: {e}",
         }
 
     await ctx.info(f"Ticket {ticket_id} resolved")
 
-    response = {
+    response: dict[str, Any] = {
         "ticket_id": ticket_id,
         "status": "resolved",
-        "resolution_notes": resolution_notes
+        "resolution_notes": resolution_notes,
     }
 
-    if billable_amount is not None:
-        if mq_publisher is not None:
-            payload = {
-                "event_type": "invoice.create_requested",
-                "ticket_id": ticket_id,
-                "customer_email": result.get("customerId"),
-                "customer_name": result.get("customerName"),
-                "amount": billable_amount,
-                "description": resolution_notes[:100],
-                "requested_at": datetime.now().isoformat()
-            }
-            try:
-                await mq_publisher.publish("invoice.create_requested", payload)
-                response["invoice"] = {
-                    "status": "queued",
-                    "estimated_amount": billable_amount,
-                    "message": "Invoice creation queued. Will be created in Odoo within 1 minute."
-                }
-            except Exception as e:
-                logger.error("resolve_ticket.publish_failed", ticket_id=ticket_id, error=str(e))
-                response["invoice"] = {
-                    "status": "unavailable",
-                    "estimated_amount": billable_amount,
-                    "message": (
-                        "Invoice service unavailable. "
-                        "Ticket resolved but invoice was not created."
-                    )
-                }
-        else:
-            response["invoice"] = {
-                "status": "unavailable",
-                "estimated_amount": billable_amount,
-                "message": (
-                    "Invoice service unavailable. "
-                    "Ticket resolved but invoice was not created."
-                )
-            }
+    if result.invoice is not None:
+        response["invoice"] = {
+            "status": result.invoice.status,
+            "estimated_amount": result.invoice.estimated_amount,
+            "message": result.invoice.message,
+        }
 
     return response
 
@@ -409,65 +303,29 @@ async def create_invoice(
     Returns:
         Invoice creation confirmation with estimated processing time
     """
-    if not ticket_id or not ticket_id.strip():
-        raise ValueError("Ticket ID is required")
-    if ticket_client is None:
-        return {"error": "Ticket service unavailable", "status": "failed", "ticket_id": ticket_id}
-    if amount <= 0:
-        raise ValueError("Invoice amount must be positive")
-    if mq_publisher is None:
-        return {
-            "error": "Invoice service unavailable",
-            "status": "failed",
-            "ticket_id": ticket_id
-        }
-    rid = _generate_request_id()
-    logger.info("Creating invoice", ticket_id=ticket_id, amount=amount, request_id=rid)
-
-    # Get ticket details first
+    service = _get_service(ctx)
     try:
-        ticket = await ticket_client.get_ticket(ticket_id)
+        result = await service.queue_invoice(
+            ticket_id=ticket_id,
+            amount=amount,
+            description=description,
+        )
+    except ValidationError as e:
+        raise ValueError(str(e)) from e
     except Exception as e:
-        logger.error("create_invoice.ticket_lookup_failed", ticket_id=ticket_id, error=str(e))
-        return {
-            "error": f"Failed to get ticket: {e}",
-            "status": "failed",
-            "ticket_id": ticket_id
-        }
-
-    # Emit event to RabbitMQ for odoo-bridge to process (flat snake_case per schema)
-    # NOTE: ticket-masala API returns CustomerId, not customerEmail.
-    # Using ticket_id to lookup customer.
-    payload = {
-        "event_type": "invoice.create_requested",
-        "ticket_id": ticket_id,
-        # customerId IS the email in this system
-        "customer_email": ticket.get("customerId"),
-        # Use customerName if available, title as fallback
-        "customer_name": ticket.get("customerName") or ticket.get("title") or "Customer",
-        "amount": amount,
-        "description": description or ticket.get("description") or "Service",
-        "requested_at": datetime.now().isoformat()
-    }
-
-    try:
-        await mq_publisher.publish("invoice.create_requested", payload)
-    except Exception as e:
-        logger.error("create_invoice.publish_failed", ticket_id=ticket_id, error=str(e))
         return {
             "error": f"Failed to queue invoice: {e}",
             "status": "failed",
-            "ticket_id": ticket_id
+            "ticket_id": ticket_id,
         }
 
     await ctx.info(f"Invoice creation requested for ticket {ticket_id}")
 
     return {
-        "status": "queued",
+        "status": result.status,
         "ticket_id": ticket_id,
         "amount": amount,
-        "customer_email": ticket.get("customerId"),  # customerId IS the email
-        "message": "Invoice creation queued. Odoo integration will process this within 30 seconds."
+        "message": result.message,
     }
 
 
@@ -486,42 +344,32 @@ async def get_invoice_status(
     Returns:
         Invoice status: draft, sent, paid, or not_found
     """
-    if not ticket_id or not ticket_id.strip():
-        raise ValueError("Ticket ID is required")
-    if odoo_client is None:
-        return {
-            "ticket_id": ticket_id,
-            "status": "error",
-            "message": "Invoice service unavailable"
-        }
-
-    rid = _generate_request_id()
-    logger.info("Checking invoice status", ticket_id=ticket_id, request_id=rid)
-
+    service = _get_service(ctx)
     try:
-        result = await odoo_client.get_invoice_status(ticket_id)
+        invoice = await service.get_invoice_status(ticket_id)
+    except ValidationError as e:
+        raise ValueError(str(e)) from e
     except Exception as e:
-        logger.error("get_invoice_status.failed", ticket_id=ticket_id, error=str(e), request_id=rid)
         return {
             "ticket_id": ticket_id,
             "status": "error",
-            "message": f"Failed to check invoice status: {e}"
+            "message": f"Failed to check invoice status: {e}",
         }
 
-    if not result:
+    if invoice.status == "not_found":
         return {
             "ticket_id": ticket_id,
             "status": "not_found",
-            "message": "No invoice found for this ticket"
+            "message": "No invoice found for this ticket",
         }
 
     return {
         "ticket_id": ticket_id,
-        "invoice_id": result.get("invoice_id"),
-        "status": result.get("status") or "unknown",  # draft, sent, paid
-        "amount": result.get("amount"),
-        "created_at": result.get("created_at"),
-        "paid_at": result.get("paid_at")
+        "invoice_id": invoice.invoice_id,
+        "status": invoice.status,
+        "amount": invoice.amount,
+        "created_at": invoice.created_at,
+        "paid_at": invoice.paid_at,
     }
 
 
@@ -546,106 +394,26 @@ async def send_email(
     Returns:
         Send confirmation
     """
-    _validate_email(to_email)
-    if not subject or not subject.strip():
-        raise ValueError("Email subject is required")
-    if mq_publisher is None:
-        return {
-            "error": "Email service unavailable",
-            "status": "failed",
-            "to_email": to_email
-        }
-    rid = _generate_request_id()
-    logger.info("Sending email", to=to_email, subject=subject, request_id=rid)
-
-    # Emit event for mailing-service (flat snake_case per email.send schema)
-    payload = {
-        "event_type": "email.send",
-        "to_email": to_email,
-        "from_email": "support@garamatic.com",
-        "from_name": from_name,
-        "subject": subject,
-        "body_html": body,
-    }
-
+    service = _get_service(ctx)
     try:
-        await mq_publisher.publish("email.send", payload)
+        result = await service.send_email(
+            to_email=to_email,
+            subject=subject,
+            body=body,
+            from_name=from_name,
+        )
+    except ValidationError as e:
+        raise ValueError(str(e)) from e
     except Exception as e:
-        logger.error("send_email.publish_failed", to=to_email, error=str(e))
-        return {
-            "error": f"Failed to queue email: {e}",
-            "status": "failed",
-            "to_email": to_email
-        }
+        return {"error": f"Failed to queue email: {e}", "status": "failed", "to_email": to_email}
 
     await ctx.info(f"Email queued for {to_email}")
 
     return {
-        "status": "queued",
+        "status": result.status,
         "to_email": to_email,
         "subject": subject,
-        "message": "Email queued for sending. Will be delivered within 1 minute."
-    }
-
-
-async def _get_customer_context_internal(customer_email: str) -> dict[str, Any]:
-    """Internal helper to fetch customer context without MCP context."""
-    _validate_email(customer_email)
-
-    if ticket_client is None or odoo_client is None:
-        raise RuntimeError("Required services unavailable")
-
-    rid = _generate_request_id()
-    logger.info("Getting customer context", email=customer_email, request_id=rid)
-
-    # Parallel queries
-    tickets_task = ticket_client.list_tickets(
-        customer_id=customer_email, limit=50
-    )
-    invoices_task = odoo_client.list_customer_invoices(customer_email)
-
-    customer_tickets, invoices = await asyncio.gather(tickets_task, invoices_task)
-
-    # Defensive: billableAmount/amount may be None from upstream APIs
-    total_ticket_value = sum(
-        (t.get("billableAmount") or 0)
-        for t in customer_tickets
-        if t.get("status") == "resolved"
-    )
-
-    outstanding = sum(
-        (inv.get("amount") or 0)
-        for inv in invoices
-        if inv.get("status") != "paid"
-    )
-
-    return {
-        "customer_email": customer_email,
-        "summary": {
-            "total_tickets": len(customer_tickets),
-            "open_tickets": sum(1 for t in customer_tickets if t.get("status") == "open"),
-            "total_invoiced": sum((inv.get("amount") or 0) for inv in invoices),
-            "outstanding_balance": outstanding,
-            "lifetime_value": total_ticket_value
-        },
-        "recent_tickets": [
-            {
-                "id": t.get("id"),
-                "title": t.get("title"),
-                "status": t.get("status"),
-                "created_at": t.get("createdAt")
-            }
-            for t in customer_tickets[:3]
-        ],
-        "recent_invoices": [
-            {
-                "invoice_id": inv.get("invoice_id"),
-                "amount": inv.get("amount"),
-                "status": inv.get("status"),
-                "created_at": inv.get("created_at")
-            }
-            for inv in invoices[:3]
-        ]
+        "message": result.message,
     }
 
 
@@ -664,170 +432,167 @@ async def get_customer_context(
     Returns:
         Comprehensive profile: tickets, invoices, and activity
     """
-    if ticket_client is None or odoo_client is None:
-        return {
-            "error": "Required services unavailable",
-            "customer_email": customer_email,
-            "status": "error"
-        }
-
+    service = _get_service(ctx)
     try:
-        context = await _get_customer_context_internal(customer_email)
-    except ValueError as e:
-        return {
-            "error": f"Invalid email: {e}",
-            "customer_email": customer_email,
-            "status": "error"
-        }
+        context = await service.get_customer_context(customer_email)
+    except ValidationError as e:
+        return {"error": f"Invalid email: {e}", "customer_email": customer_email, "status": "error"}
     except Exception as e:
-        logger.error("get_customer_context.failed", email=customer_email, error=str(e))
         return {
             "error": f"Failed to retrieve customer context: {e}",
             "customer_email": customer_email,
-            "status": "error"
+            "status": "error",
         }
 
     await ctx.info(f"Retrieved context for {customer_email}")
-    return context
 
+    return {
+        "customer_email": context.customer_email,
+        "summary": {
+            "total_tickets": context.summary.total_tickets,
+            "open_tickets": context.summary.open_tickets,
+            "total_invoiced": context.summary.total_invoiced,
+            "outstanding_balance": context.summary.outstanding_balance,
+            "lifetime_value": context.summary.lifetime_value,
+        },
+        "recent_tickets": [
+            {"id": t.id, "title": t.title, "status": t.status, "created_at": t.created_at}
+            for t in context.recent_tickets
+        ],
+        "recent_invoices": [
+            {
+                "invoice_id": i.invoice_id,
+                "amount": i.amount,
+                "status": i.status,
+                "created_at": i.created_at,
+            }
+            for i in context.recent_invoices
+        ],
+    }
+
+
+# ------------------------------------------------------------------
+# MCP Resources
+# ------------------------------------------------------------------
 
 @mcp.resource("ticket://{ticket_id}")
 async def get_ticket_resource(ticket_id: str) -> str:
-    """
-    MCP Resource: Single ticket details as formatted text.
-    AI can read this for ticket-specific context.
-    """
+    """MCP Resource: Single ticket details as formatted text."""
     if not ticket_id or not ticket_id.strip():
         return "Error: Ticket ID is required"
-    if ticket_client is None:
-        return "Error: Ticket service unavailable"
 
+    # Resources don't have lifespan context; we can't reach the service here.
+    # Keep raw client access for resources as a transitional measure,
+    # or initialize a temporary service from config.
+    config = get_settings()
+    service = GaramaticService(
+        ticket_client=TicketClient(config.ticket_api_url),
+        odoo_client=OdooBridgeClient(config.odoo_bridge_url),
+        mq_publisher=None,
+    )
     try:
-        ticket = await ticket_client.get_ticket(ticket_id)
+        ticket = await service.get_ticket(ticket_id)
     except Exception as e:
         return f"Error: Could not retrieve ticket {ticket_id}: {e}"
+    finally:
+        await service.close()
 
-    invoice = None
-    if odoo_client is not None:
-        with contextlib.suppress(Exception):
-            invoice = await odoo_client.get_invoice_status(ticket_id)
+    try:
+        invoice = await service.get_invoice_status(ticket_id)
+    except Exception:
+        invoice = None
 
     invoice_info = ""
-    if invoice:
-        amount = (invoice.get('amount') or 0)
+    if invoice and invoice.status != "not_found":
+        amount = invoice.amount or 0
         invoice_info = f"""
 
 ## Invoice
-- ID: {invoice.get('invoice_id') or 'N/A'}
-- Status: {(invoice.get('status') or 'unknown').upper()}
+- ID: {invoice.invoice_id or 'N/A'}
+- Status: {invoice.status.upper()}
 - Amount: €{amount:.2f}
-- Paid At: {_format_date(invoice.get('paid_at'))}
+- Paid At: {_format_date(invoice.paid_at)}
 """
 
     return f"""
 # Ticket {ticket_id}
 
 ## Details
-- Status: {(ticket.get('status') or 'unknown').upper()}
-- Title: {ticket.get('title') or 'Untitled'}
-- Customer ID: {ticket.get('customerId') or 'Unknown'}
-- Priority Score: {ticket.get('priorityScore') or 'N/A'}
-- Created: {_format_date(ticket.get('createdAt'))}
-- Resolved: {_format_date(ticket.get('resolvedAt'))}
+- Status: {ticket.status.upper()}
+- Title: {ticket.title}
+- Customer ID: {ticket.customer_email or 'Unknown'}
+- Priority Score: {ticket.customer_name or 'N/A'}
+- Created: {_format_date(ticket.created_at)}
+- Resolved: {_format_date(ticket.resolved_at)}
 
 ## Description
-{ticket.get('description') or 'No description'}
+{ticket.description or 'No description'}
 
 ## Resolution Notes
-{ticket.get('resolutionNotes') or 'Not resolved'}{invoice_info}
+{ticket.resolution_notes or 'Not resolved'}{invoice_info}
 """
 
 
 @mcp.resource("system://health")
 async def get_health() -> str:
-    """
-    MCP Resource: System health status.
-    Check connectivity to all backend services.
-    """
-    health = {
-        "status": "healthy",
-        "services": {
-            "ticket_api": "unknown",
-            "odoo_bridge": "unknown",
-            "rabbitmq": (
-                mq_publisher is not None
-                and getattr(mq_publisher, 'connection', None) is not None
-            )
-        }
-    }
-
-    # Check ticket API
-    if ticket_client is None:
-        health["services"]["ticket_api"] = "not_initialized"
-        health["status"] = "degraded"
+    """MCP Resource: System health status."""
+    config = get_settings()
+    service = GaramaticService(
+        ticket_client=TicketClient(config.ticket_api_url),
+        odoo_client=OdooBridgeClient(config.odoo_bridge_url),
+        mq_publisher=None,
+    )
+    try:
+        health = await service.health_check()
+    except Exception as e:
+        health_json = {"status": "degraded", "services": {"error": str(e)}}
     else:
-        try:
-            await ticket_client.list_tickets(limit=1)
-            health["services"]["ticket_api"] = "connected"
-        except Exception as e:
-            health["services"]["ticket_api"] = f"error: {str(e)[:50]}"
-            health["status"] = "degraded"
+        health_json = {"status": health.status, "services": health.services}
+    finally:
+        await service.close()
 
-    # Check odoo bridge
-    if odoo_client is None:
-        health["services"]["odoo_bridge"] = "not_initialized"
-        health["status"] = "degraded"
-    else:
-        try:
-            await odoo_client.list_customer_invoices("test@example.com")
-            health["services"]["odoo_bridge"] = "connected"
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                health["services"]["odoo_bridge"] = "connected"
-            else:
-                health["services"]["odoo_bridge"] = f"error: {str(e)[:50]}"
-                health["status"] = "degraded"
-        except Exception as e:
-            health["services"]["odoo_bridge"] = f"error: {str(e)[:50]}"
-            health["status"] = "degraded"
-
-    return json.dumps(health, indent=2)
+    return json.dumps(health_json, indent=2)
 
 
 @mcp.resource("customer://{email}")
 async def get_customer_resource(email: str) -> str:
-    """
-    MCP Resource: Full customer profile as formatted text.
-    AI can read this for rich context about a customer.
-    """
+    """MCP Resource: Full customer profile as formatted text."""
     try:
         _validate_email(email)
-        context = await _get_customer_context_internal(email)
-    except ValueError as e:
+    except ValidationError as e:
         return f"Error: Invalid email: {e}"
+
+    config = get_settings()
+    service = GaramaticService(
+        ticket_client=TicketClient(config.ticket_api_url),
+        odoo_client=OdooBridgeClient(config.odoo_bridge_url),
+        mq_publisher=None,
+    )
+    try:
+        context = await service.get_customer_context(email)
     except Exception as e:
         return f"Error: Could not retrieve customer context: {e}"
+    finally:
+        await service.close()
 
     tickets_section = "\n".join(
-        f"- [{(t.get('status') or 'unknown').upper()}] "
-        f"{t.get('title') or 'Untitled'} ({_format_date(t.get('created_at'))})"
-        for t in context['recent_tickets']
-    ) if context['recent_tickets'] else "No recent tickets"
+        f"- [{t.status.upper()}] {t.title} ({_format_date(t.created_at)})"
+        for t in context.recent_tickets
+    ) if context.recent_tickets else "No recent tickets"
 
     invoices_section = "\n".join(
-        f"- [{(inv.get('status') or 'unknown').upper()}] "
-        f"€{(inv.get('amount') or 0):.2f}"
-        for inv in context['recent_invoices']
-    ) if context['recent_invoices'] else "No recent invoices"
+        f"- [{i.status.upper()}] €{i.amount:.2f}"
+        for i in context.recent_invoices
+    ) if context.recent_invoices else "No recent invoices"
 
     return f"""
 # Customer Profile: {email}
 
 ## Summary
-- Total Tickets: {context['summary']['total_tickets']}
-- Open Tickets: {context['summary']['open_tickets']}
-- Outstanding Balance: €{context['summary']['outstanding_balance']:.2f}
-- Lifetime Value: €{context['summary']['lifetime_value']:.2f}
+- Total Tickets: {context.summary.total_tickets}
+- Open Tickets: {context.summary.open_tickets}
+- Outstanding Balance: €{context.summary.outstanding_balance:.2f}
+- Lifetime Value: €{context.summary.lifetime_value:.2f}
 
 ## Recent Tickets
 {tickets_section}
@@ -837,11 +602,8 @@ async def get_customer_resource(email: str) -> str:
 """
 
 
-
-
 def main():
     """Run the MCP server."""
-    # FastMCP handles stdio or sse transport
     mcp.run()
 
 

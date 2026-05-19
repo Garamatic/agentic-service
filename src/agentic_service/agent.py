@@ -10,7 +10,6 @@ Provides an autonomous agent that can:
 import asyncio
 import contextlib
 import os
-from datetime import datetime
 from typing import Annotated, Literal
 
 import structlog
@@ -26,18 +25,15 @@ from typing_extensions import TypedDict
 
 from .clients import OdooBridgeClient, RabbitMQPublisher, TicketClient
 from .config import get_settings
-from .server import (
+from .service import (
+    GaramaticService,
     _generate_request_id,
-    _get_customer_context_internal,
-    _validate_email,
 )
 
 logger = structlog.get_logger()
 
-# Global clients
-ticket_client: TicketClient | None = None
-odoo_client: OdooBridgeClient | None = None
-mq_publisher: RabbitMQPublisher | None = None
+# Global service (initialized by init_clients, used by tools)
+service: GaramaticService | None = None
 
 # Agent state
 class AgentState(TypedDict):
@@ -48,23 +44,18 @@ class AgentState(TypedDict):
 # Define async tools for LangGraph
 async def search_tickets_by_customer(customer_email: str, limit: int = 10) -> str:
     """Search for tickets by customer email address."""
-    if ticket_client is None:
-        return "Error: Ticket service not available"
+    if service is None:
+        return "Error: Service not available"
 
     try:
-        _validate_email(customer_email)
-        tickets = await ticket_client.list_tickets(customer_id=customer_email, limit=limit)
+        tickets = await service.list_tickets(customer_email=customer_email, limit=limit)
         if not tickets:
             return f"No tickets found for {customer_email}"
 
         ticket_word = "ticket" if len(tickets) == 1 else "tickets"
         result = f"Found {len(tickets)} {ticket_word} for {customer_email}:\n\n"
         for t in tickets:
-            result += (
-                f"- Ticket {t.get('id') or 'N/A'}: "
-                f"{t.get('title') or 'Untitled'} "
-                f"[{t.get('status') or 'unknown'}]\n"
-            )
+            result += f"- Ticket {t.id}: {t.title} [{t.status}]\n"
         return result
     except Exception as e:
         return f"Error searching tickets: {str(e)}"
@@ -74,40 +65,32 @@ async def get_ticket_details(ticket_id: str) -> str:
     """Get detailed information about a specific ticket."""
     if not ticket_id or not ticket_id.strip():
         return "Error: Ticket ID is required"
-    if ticket_client is None:
-        return "Error: Ticket service not available"
+    if service is None:
+        return "Error: Service not available"
 
     try:
-        ticket = await ticket_client.get_ticket(ticket_id)
+        ticket = await service.get_ticket(ticket_id)
     except Exception as e:
         return f"Error getting ticket: {str(e)}"
 
     # Invoice lookup is best-effort; don't fail the whole tool if Odoo is down
     invoice = None
-    if odoo_client is not None:
-        with contextlib.suppress(Exception):
-            invoice = await odoo_client.get_invoice_status(ticket_id)
+    with contextlib.suppress(Exception):
+        invoice = await service.get_invoice_status(ticket_id)
 
-    customer_name = ticket.get('customerName') or ticket.get('customer_name') or 'Unknown'
-    customer_email = (
-        ticket.get('customerEmail')
-        or ticket.get('customerId')
-        or ticket.get('customer_email')
-        or 'Unknown'
-    )
     result = f"""Ticket {ticket_id}:
-- Title: {ticket.get('title') or 'Untitled'}
-- Status: {ticket.get('status') or 'unknown'}
-- Customer: {customer_name} ({customer_email})
-- Priority: {ticket.get('priority') or 'N/A'}
-- Created: {ticket.get('createdAt') or 'N/A'}
-- Description: {ticket.get('description') or 'No description'}
-- Resolution Notes: {ticket.get('resolutionNotes') or 'Not resolved'}
+- Title: {ticket.title}
+- Status: {ticket.status}
+- Customer: {ticket.customer_name or 'Unknown'} ({ticket.customer_email or 'Unknown'})
+- Priority: {ticket.customer_name or 'N/A'}
+- Created: {ticket.created_at or 'N/A'}
+- Description: {ticket.description or 'No description'}
+- Resolution Notes: {ticket.resolution_notes or 'Not resolved'}
 """
-    if invoice:
-        amount = (invoice.get('amount') or 0)
+    if invoice and invoice.status != "not_found":
+        amount = invoice.amount or 0
         result += (
-            f"\nInvoice:\n- Status: {invoice.get('status') or 'unknown'}\n"
+            f"\nInvoice:\n- Status: {invoice.status}\n"
             f"- Amount: €{amount:.2f}\n"
         )
 
@@ -116,20 +99,22 @@ async def get_ticket_details(ticket_id: str) -> str:
 
 async def get_customer_summary(customer_email: str) -> str:
     """Get comprehensive customer context including tickets and invoices."""
-    try:
-        context = await _get_customer_context_internal(customer_email)
+    if service is None:
+        return "Error: Service not available"
 
-        summary = context['summary']
+    try:
+        context = await service.get_customer_context(customer_email)
+
         result = f"""Customer {customer_email} Summary:
-- Total Tickets: {summary['total_tickets']}
-- Open Tickets: {summary['open_tickets']}
-- Lifetime Value: €{summary['lifetime_value']:.2f}
-- Outstanding Balance: €{summary['outstanding_balance']:.2f}
+- Total Tickets: {context.summary.total_tickets}
+- Open Tickets: {context.summary.open_tickets}
+- Lifetime Value: €{context.summary.lifetime_value:.2f}
+- Outstanding Balance: €{context.summary.outstanding_balance:.2f}
 """
-        if context['recent_tickets']:
+        if context.recent_tickets:
             result += "\nRecent Tickets:\n"
-            for t in context['recent_tickets']:
-                result += f"- {t.get('title') or 'Untitled'} [{t.get('status') or 'unknown'}]\n"
+            for t in context.recent_tickets:
+                result += f"- {t.title} [{t.status}]\n"
 
         return result
     except Exception as e:
@@ -145,49 +130,33 @@ async def resolve_ticket_with_invoice(
     """
     if not ticket_id or not ticket_id.strip():
         return "Error: Ticket ID is required"
-    if ticket_client is None:
-        return "Error: Ticket service not available"
+    if service is None:
+        return "Error: Service not available"
     if not resolution_notes or not resolution_notes.strip():
         return "Error: Resolution notes are required"
     if billable_amount < 0:
         return "Error: Billable amount cannot be negative"
 
     try:
-        ticket = await ticket_client.resolve_ticket(
+        result = await service.resolve_ticket(
             ticket_id=ticket_id,
             resolution_notes=resolution_notes,
-            billable_amount=billable_amount
+            billable_amount=billable_amount,
         )
     except Exception as e:
         return f"❌ Error resolving ticket: {e}"
 
-    # Queue invoice separately — failure here must not undo the resolution
-    if mq_publisher is not None:
-        payload = {
-            "event_type": "invoice.create_requested",
-            "ticket_id": ticket_id,
-            "customer_email": ticket.get("customerId"),
-            "customer_name": ticket.get("customerName"),
-            "amount": billable_amount,
-            "description": resolution_notes[:100],
-            "requested_at": datetime.now().isoformat()
-        }
-        try:
-            await mq_publisher.publish("invoice.create_requested", payload)
-            return (
-                f"✅ Ticket {ticket_id} resolved and invoice "
-                f"(€{billable_amount:.2f}) queued."
-            )
-        except Exception as e:
-            logger.error("resolve_ticket_with_invoice.publish_failed", error=str(e))
-            return (
-                f"✅ Ticket {ticket_id} resolved, but invoice queueing failed: {e}"
-            )
-
-    return (
-        f"✅ Ticket {ticket_id} resolved. "
-        f"Invoice service unavailable — invoice not queued."
-    )
+    if result.invoice and result.invoice.status == "queued":
+        return (
+            f"✅ Ticket {ticket_id} resolved and invoice "
+            f"(€{result.invoice.estimated_amount:.2f}) queued."
+        )
+    if result.invoice and result.invoice.status == "unavailable":
+        return (
+            f"✅ Ticket {ticket_id} resolved. "
+            f"Invoice service unavailable — invoice not queued."
+        )
+    return f"✅ Ticket {ticket_id} resolved."
 
 
 async def request_human_approval(
@@ -304,12 +273,9 @@ async def _get_checkpointer() -> BaseCheckpointSaver:
     db_path = os.getenv("AGENT_DB_PATH", "").strip()
 
     if db_path:
-        # Ensure directory exists
         from pathlib import Path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         logger.info("agent.using_persistent_storage", db_path=db_path)
-        # Create connection and pass to AsyncSqliteSaver
-        # Note: AsyncSqliteSaver manages the connection lifecycle
         conn = await aiosqlite.connect(db_path)
         return AsyncSqliteSaver(conn)
     else:
@@ -489,32 +455,38 @@ class GaramaticAgent:
 
 
 async def init_clients():
-    """Initialize API clients."""
-    global ticket_client, odoo_client, mq_publisher
+    """Initialize GaramaticService for agent tools."""
+    global service
 
     config = get_settings()
 
     ticket_client = TicketClient(config.ticket_api_url)
     odoo_client = OdooBridgeClient(config.odoo_bridge_url)
 
+    mq_publisher: RabbitMQPublisher | None = None
     try:
         mq_publisher = RabbitMQPublisher(config.rabbitmq_url)
         await mq_publisher.connect()
         logger.info("agent.rabbitmq.connected")
     except Exception as e:
         logger.warning("agent.rabbitmq.unavailable", error=str(e))
-        mq_publisher = None
 
-    logger.info("agent.clients.initialized")
+    service = GaramaticService(
+        ticket_client=ticket_client,
+        odoo_client=odoo_client,
+        mq_publisher=mq_publisher,
+    )
+
+    logger.info("agent.service.initialized")
 
 
 async def close_clients():
-    """Cleanup API clients."""
-    for client in (ticket_client, odoo_client, mq_publisher):
-        if client:
-            with contextlib.suppress(Exception):
-                await client.close()
-    logger.info("agent.clients.closed")
+    """Cleanup service."""
+    global service
+    if service:
+        await service.close()
+        service = None
+    logger.info("agent.service.closed")
 
 
 async def main_async():

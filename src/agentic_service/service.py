@@ -1,0 +1,725 @@
+"""Deepened service layer for Garamatic Agentic Service.
+
+Owns all business logic, orchestration, validation, logging, and graceful
+degradation. Callers (MCP, FastAPI, LangGraph) only adapt results to their
+native response formats.
+"""
+
+import asyncio
+import contextlib
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Literal
+
+import structlog
+
+from .ports import MessageQueuePort, OdooClientPort, TicketClientPort
+
+logger = structlog.get_logger()
+
+
+# ------------------------------------------------------------------
+# Exception taxonomy
+# ------------------------------------------------------------------
+
+
+class ServiceError(Exception):
+    """Base for all service-layer errors."""
+
+    def __init__(self, message: str, request_id: str | None = None) -> None:
+        super().__init__(message)
+        self.request_id = request_id or _generate_request_id()
+
+
+class NotFoundError(ServiceError):
+    """Upstream returned 404."""
+
+
+class UpstreamError(ServiceError):
+    """Upstream 5xx or network failure (already retried by client)."""
+
+
+class ValidationError(ServiceError):
+    """Input failed business validation (e.g. invalid email)."""
+
+
+class ServiceUnavailableError(ServiceError):
+    """Required dependency not initialized (e.g. MQ down)."""
+
+
+# ------------------------------------------------------------------
+# Result dataclasses
+# ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Ticket:
+    id: str
+    status: str
+    customer_email: str | None
+    customer_name: str | None
+    title: str
+    description: str | None
+    created_at: str | None
+    resolved_at: str | None
+    resolution_notes: str | None
+    billable_amount: float | None
+
+
+@dataclass(frozen=True)
+class TicketSummary:
+    id: str
+    title: str
+    status: str
+    created_at: str | None
+    resolved_at: str | None
+
+
+@dataclass(frozen=True)
+class InvoiceStatus:
+    invoice_id: str | None
+    status: str  # draft | sent | paid | unknown | not_found
+    amount: float | None
+    created_at: str | None
+    paid_at: str | None
+
+
+@dataclass(frozen=True)
+class InvoiceSummary:
+    invoice_id: str
+    amount: float
+    status: str
+    created_at: str | None
+
+
+@dataclass(frozen=True)
+class InvoiceQueueResult:
+    status: Literal["queued", "unavailable"]
+    estimated_amount: float
+    message: str
+
+
+@dataclass(frozen=True)
+class ResolutionResult:
+    ticket_id: str
+    status: Literal["resolved"]
+    resolution_notes: str
+    invoice: InvoiceQueueResult | None
+
+
+@dataclass(frozen=True)
+class EmailQueueResult:
+    status: Literal["queued", "failed"]
+    to_email: str
+    subject: str
+    message: str
+
+
+@dataclass(frozen=True)
+class CustomerSummary:
+    total_tickets: int
+    open_tickets: int
+    total_invoiced: float
+    outstanding_balance: float
+    lifetime_value: float
+
+
+@dataclass(frozen=True)
+class CustomerContext:
+    customer_email: str
+    summary: CustomerSummary
+    recent_tickets: list[TicketSummary]
+    recent_invoices: list[InvoiceSummary]
+
+
+@dataclass(frozen=True)
+class HealthStatus:
+    status: Literal["healthy", "degraded"]
+    services: dict[str, str]
+
+
+# ------------------------------------------------------------------
+# Helpers (moved from server.py)
+# ------------------------------------------------------------------
+
+
+def _generate_request_id() -> str:
+    """Generate unique request ID for tracing."""
+    return uuid.uuid4().hex
+
+
+def _validate_email(email: str) -> None:
+    """Validate email format, raise ValidationError if invalid."""
+    if not email or not isinstance(email, str):
+        raise ValidationError(f"Invalid email format: {email}")
+    if "@" not in email:
+        raise ValidationError(f"Invalid email format: {email}")
+    local, _, domain = email.rpartition("@")
+    if not local or not domain:
+        raise ValidationError(f"Invalid email format: {email}")
+    if "." not in domain:
+        raise ValidationError(f"Invalid email format: {email}")
+    if domain.startswith(".") or domain.endswith("."):
+        raise ValidationError(f"Invalid email format: {email}")
+    if ".." in local:
+        raise ValidationError(f"Invalid email format: {email}")
+
+
+def _format_date(d: str | None) -> str:
+    """Format an ISO date string to YYYY-MM-DD or return placeholder."""
+    return d[:10] if d and len(d) >= 10 else (d or "N/A")
+
+
+def _ticket_from_dict(data: dict[str, Any]) -> Ticket:
+    """Map upstream ticket dict to domain Ticket."""
+    return Ticket(
+        id=data.get("id") or "N/A",
+        status=data.get("status") or "unknown",
+        customer_email=data.get("customerId") or data.get("customer_id"),
+        customer_name=data.get("customerName") or data.get("customer_name"),
+        title=data.get("title") or "Untitled",
+        description=data.get("description"),
+        created_at=data.get("createdAt"),
+        resolved_at=data.get("resolvedAt") or data.get("completedAt"),
+        resolution_notes=data.get("resolutionNotes") or data.get("resolution_notes"),
+        billable_amount=data.get("billableAmount") or data.get("billable_amount"),
+    )
+
+
+def _ticket_summary_from_dict(data: dict[str, Any]) -> TicketSummary:
+    return TicketSummary(
+        id=data.get("id") or "N/A",
+        title=data.get("title") or "Untitled",
+        status=data.get("status") or "unknown",
+        created_at=data.get("createdAt"),
+        resolved_at=data.get("resolvedAt") or data.get("completedAt"),
+    )
+
+
+def _invoice_status_from_dict(data: dict[str, Any] | None) -> InvoiceStatus:
+    if data is None:
+        return InvoiceStatus(
+            invoice_id=None,
+            status="not_found",
+            amount=None,
+            created_at=None,
+            paid_at=None,
+        )
+    return InvoiceStatus(
+        invoice_id=data.get("invoice_id"),
+        status=data.get("status") or "unknown",
+        amount=data.get("amount"),
+        created_at=data.get("created_at"),
+        paid_at=data.get("paid_at"),
+    )
+
+
+def _invoice_summary_from_dict(data: dict[str, Any]) -> InvoiceSummary:
+    return InvoiceSummary(
+        invoice_id=data.get("invoice_id") or "N/A",
+        amount=data.get("amount") or 0.0,
+        status=data.get("status") or "unknown",
+        created_at=data.get("created_at"),
+    )
+
+
+# ------------------------------------------------------------------
+# GaramaticService
+# ------------------------------------------------------------------
+
+
+class GaramaticService:
+    """Single entry point for all business logic.
+
+    Owns client lifecycle, orchestration, validation, logging, and
+    graceful degradation. Callers only adapt results to their formats.
+    """
+
+    def __init__(
+        self,
+        ticket_client: TicketClientPort,
+        odoo_client: OdooClientPort,
+        mq_publisher: MessageQueuePort | None,
+    ) -> None:
+        self._ticket = ticket_client
+        self._odoo = odoo_client
+        self._mq = mq_publisher
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def close(self) -> None:
+        for client in (self._ticket, self._odoo, self._mq):
+            if client:
+                with contextlib.suppress(Exception):
+                    await client.close()
+
+    async def __aenter__(self) -> "GaramaticService":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.close()
+
+    # ------------------------------------------------------------------
+    # Ticket operations
+    # ------------------------------------------------------------------
+
+    async def get_ticket(self, ticket_id: str) -> Ticket:
+        if not ticket_id or not ticket_id.strip():
+            raise ValidationError("Ticket ID is required")
+        rid = _generate_request_id()
+        logger.info("service.get_ticket", ticket_id=ticket_id, request_id=rid)
+        try:
+            data = await self._ticket.get_ticket(ticket_id)
+        except Exception as e:
+            logger.error(
+                "service.get_ticket.failed",
+                ticket_id=ticket_id,
+                error=str(e),
+                request_id=rid,
+            )
+            raise _map_client_error(e, rid) from e
+        return _ticket_from_dict(data)
+
+    async def list_tickets(
+        self,
+        *,
+        customer_email: str | None = None,
+        status: Literal["open", "resolved", "closed"] | None = None,
+        limit: int = 10,
+    ) -> list[TicketSummary]:
+        rid = _generate_request_id()
+        logger.info(
+            "service.list_tickets",
+            email=customer_email,
+            status=status,
+            limit=limit,
+            request_id=rid,
+        )
+        try:
+            data = await self._ticket.list_tickets(
+                customer_id=customer_email,
+                status=status,
+                limit=limit,
+            )
+        except Exception as e:
+            logger.error("service.list_tickets.failed", error=str(e), request_id=rid)
+            raise _map_client_error(e, rid) from e
+        return [_ticket_summary_from_dict(d) for d in data]
+
+    async def create_ticket(
+        self,
+        *,
+        title: str,
+        description: str,
+        customer_email: str,
+        customer_name: str,
+        priority: Literal["low", "medium", "high", "urgent"] = "medium",
+    ) -> Ticket:
+        _validate_email(customer_email)
+        if not title or not title.strip():
+            raise ValidationError("Title is required")
+        rid = _generate_request_id()
+        logger.info("service.create_ticket", title=title, customer=customer_email, request_id=rid)
+        try:
+            data = await self._ticket.create_ticket(
+                title=title,
+                description=description,
+                customer_id=customer_email,
+                customer_name=customer_name,
+                priority=priority,
+            )
+        except Exception as e:
+            logger.error("service.create_ticket.failed", error=str(e), request_id=rid)
+            raise _map_client_error(e, rid) from e
+        return _ticket_from_dict(data)
+
+    async def resolve_ticket(
+        self,
+        *,
+        ticket_id: str,
+        resolution_notes: str,
+        billable_amount: float | None = None,
+    ) -> ResolutionResult:
+        if not ticket_id or not ticket_id.strip():
+            raise ValidationError("Ticket ID is required")
+        if not resolution_notes or not resolution_notes.strip():
+            raise ValidationError("Resolution notes are required")
+        if billable_amount is not None and billable_amount < 0:
+            raise ValidationError("Billable amount cannot be negative")
+        rid = _generate_request_id()
+        logger.info(
+            "service.resolve_ticket",
+            ticket_id=ticket_id,
+            billable=billable_amount,
+            request_id=rid,
+        )
+
+        try:
+            ticket_data = await self._ticket.resolve_ticket(
+                ticket_id=ticket_id,
+                resolution_notes=resolution_notes,
+                billable_amount=billable_amount,
+            )
+        except Exception as e:
+            logger.error(
+                "service.resolve_ticket.failed",
+                ticket_id=ticket_id,
+                error=str(e),
+                request_id=rid,
+            )
+            raise _map_client_error(e, rid) from e
+
+        invoice_result: InvoiceQueueResult | None = None
+        if billable_amount is not None:
+            invoice_result = await self._queue_invoice(
+                ticket_id=ticket_id,
+                customer_email=ticket_data.get("customerId"),
+                customer_name=ticket_data.get("customerName"),
+                amount=billable_amount,
+                description=resolution_notes[:100],
+                rid=rid,
+            )
+
+        return ResolutionResult(
+            ticket_id=ticket_id,
+            status="resolved",
+            resolution_notes=resolution_notes,
+            invoice=invoice_result,
+        )
+
+    # ------------------------------------------------------------------
+    # Invoice operations
+    # ------------------------------------------------------------------
+
+    async def get_invoice_status(self, ticket_id: str) -> InvoiceStatus:
+        if not ticket_id or not ticket_id.strip():
+            raise ValidationError("Ticket ID is required")
+        rid = _generate_request_id()
+        logger.info("service.get_invoice_status", ticket_id=ticket_id, request_id=rid)
+        try:
+            data = await self._odoo.get_invoice_status(ticket_id)
+        except Exception as e:
+            logger.error(
+                "service.get_invoice_status.failed",
+                ticket_id=ticket_id,
+                error=str(e),
+                request_id=rid,
+            )
+            raise _map_client_error(e, rid) from e
+        return _invoice_status_from_dict(data)
+
+    async def queue_invoice(
+        self,
+        *,
+        ticket_id: str,
+        amount: float,
+        description: str | None = None,
+    ) -> InvoiceQueueResult:
+        if not ticket_id or not ticket_id.strip():
+            raise ValidationError("Ticket ID is required")
+        if amount <= 0:
+            raise ValidationError("Invoice amount must be positive")
+        rid = _generate_request_id()
+        logger.info("service.queue_invoice", ticket_id=ticket_id, amount=amount, request_id=rid)
+
+        try:
+            ticket_data = await self._ticket.get_ticket(ticket_id)
+        except Exception as e:
+            logger.error(
+                "service.queue_invoice.lookup_failed",
+                ticket_id=ticket_id,
+                error=str(e),
+                request_id=rid,
+            )
+            raise _map_client_error(e, rid) from e
+
+        return await self._queue_invoice(
+            ticket_id=ticket_id,
+            customer_email=ticket_data.get("customerId"),
+            customer_name=ticket_data.get("customerName") or ticket_data.get("title") or "Customer",
+            amount=amount,
+            description=description or ticket_data.get("description") or "Service",
+            rid=rid,
+        )
+
+    async def _queue_invoice(
+        self,
+        *,
+        ticket_id: str,
+        customer_email: str | None,
+        customer_name: str | None,
+        amount: float,
+        description: str,
+        rid: str,
+    ) -> InvoiceQueueResult:
+        if self._mq is None:
+            return InvoiceQueueResult(
+                status="unavailable",
+                estimated_amount=amount,
+                message=(
+                    "Invoice service unavailable. "
+                    "Ticket resolved but invoice was not created."
+                ),
+            )
+
+        payload = {
+            "event_type": "invoice.create_requested",
+            "ticket_id": ticket_id,
+            "customer_email": customer_email,
+            "customer_name": customer_name or "Customer",
+            "amount": amount,
+            "description": description,
+            "requested_at": datetime.now().isoformat(),
+        }
+
+        try:
+            await self._mq.publish("invoice.create_requested", payload)
+            return InvoiceQueueResult(
+                status="queued",
+                estimated_amount=amount,
+                message="Invoice creation queued. Will be created in Odoo within 1 minute.",
+            )
+        except Exception as e:
+            logger.error(
+                "service.queue_invoice.publish_failed",
+                ticket_id=ticket_id,
+                error=str(e),
+                request_id=rid,
+            )
+            return InvoiceQueueResult(
+                status="unavailable",
+                estimated_amount=amount,
+                message=(
+                    "Invoice service unavailable. "
+                    "Ticket resolved but invoice was not created."
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # Messaging operations
+    # ------------------------------------------------------------------
+
+    async def send_email(
+        self,
+        *,
+        to_email: str,
+        subject: str,
+        body: str,
+        from_name: str = "Garamatic Support",
+        from_email: str = "support@garamatic.com",
+    ) -> EmailQueueResult:
+        _validate_email(to_email)
+        if not subject or not subject.strip():
+            raise ValidationError("Email subject is required")
+        rid = _generate_request_id()
+        logger.info("service.send_email", to=to_email, subject=subject, request_id=rid)
+
+        if self._mq is None:
+            return EmailQueueResult(
+                status="failed",
+                to_email=to_email,
+                subject=subject,
+                message="Email service unavailable",
+            )
+
+        payload = {
+            "event_type": "email.send",
+            "to_email": to_email,
+            "from_email": from_email,
+            "from_name": from_name,
+            "subject": subject,
+            "body_html": body,
+        }
+
+        try:
+            await self._mq.publish("email.send", payload)
+            return EmailQueueResult(
+                status="queued",
+                to_email=to_email,
+                subject=subject,
+                message="Email queued for sending. Will be delivered within 1 minute.",
+            )
+        except Exception as e:
+            logger.error("service.send_email.failed", to=to_email, error=str(e), request_id=rid)
+            return EmailQueueResult(
+                status="failed",
+                to_email=to_email,
+                subject=subject,
+                message=f"Failed to queue email: {e}",
+            )
+
+    # ------------------------------------------------------------------
+    # Customer intelligence
+    # ------------------------------------------------------------------
+
+    async def get_customer_context(self, customer_email: str) -> CustomerContext:
+        _validate_email(customer_email)
+        rid = _generate_request_id()
+        logger.info("service.get_customer_context", email=customer_email, request_id=rid)
+
+        tickets_task = self._ticket.list_tickets(customer_id=customer_email, limit=50)
+        invoices_task = self._odoo.list_customer_invoices(customer_email)
+
+        try:
+            tickets_data, invoices_data = await asyncio.gather(tickets_task, invoices_task)
+        except Exception as e:
+            logger.error(
+                "service.get_customer_context.failed",
+                email=customer_email,
+                error=str(e),
+                request_id=rid,
+            )
+            raise _map_client_error(e, rid) from e
+
+        total_ticket_value = sum(
+            (t.get("billableAmount") or 0)
+            for t in tickets_data
+            if t.get("status") == "resolved"
+        )
+        outstanding = sum(
+            (inv.get("amount") or 0)
+            for inv in invoices_data
+            if inv.get("status") != "paid"
+        )
+
+        return CustomerContext(
+            customer_email=customer_email,
+            summary=CustomerSummary(
+                total_tickets=len(tickets_data),
+                open_tickets=sum(1 for t in tickets_data if t.get("status") == "open"),
+                total_invoiced=sum((inv.get("amount") or 0) for inv in invoices_data),
+                outstanding_balance=outstanding,
+                lifetime_value=total_ticket_value,
+            ),
+            recent_tickets=[_ticket_summary_from_dict(t) for t in tickets_data[:3]],
+            recent_invoices=[_invoice_summary_from_dict(inv) for inv in invoices_data[:3]],
+        )
+
+    # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    async def health_check(self) -> HealthStatus:
+        services: dict[str, str] = {}
+
+        try:
+            await self._ticket.list_tickets(limit=1)
+            services["ticket_api"] = "connected"
+        except Exception as e:
+            services["ticket_api"] = f"error: {str(e)[:50]}"
+
+        try:
+            await self._odoo.list_customer_invoices("test@example.com")
+            services["odoo_bridge"] = "connected"
+        except Exception as e:
+            if hasattr(e, "response") and getattr(e.response, "status_code", None) == 404:
+                services["odoo_bridge"] = "connected"
+            else:
+                services["odoo_bridge"] = f"error: {str(e)[:50]}"
+
+        services["rabbitmq"] = "connected" if self._mq is not None else "not_initialized"
+
+        status: Literal["healthy", "degraded"] = (
+            "healthy" if all(v == "connected" for v in services.values()) else "degraded"
+        )
+        return HealthStatus(status=status, services=services)
+
+    # ------------------------------------------------------------------
+    # Optimized default: customer session
+    # ------------------------------------------------------------------
+
+    def for_customer(self, email: str) -> "CustomerSession":
+        """Return a session scoped to a single customer.
+
+        Usage:
+            async with service.for_customer("alice@example.com") as session:
+                tickets = await session.list_tickets()
+                result = await session.resolve_ticket("T-123", "Fixed", 150.0)
+        """
+        _validate_email(email)
+        return CustomerSession(service=self, email=email)
+
+
+# ------------------------------------------------------------------
+# CustomerSession
+# ------------------------------------------------------------------
+
+
+class CustomerSession:
+    """Scoped to a single customer — the trivial default case."""
+
+    def __init__(self, service: GaramaticService, email: str) -> None:
+        self._svc = service
+        self.email = email
+
+    async def list_tickets(
+        self,
+        status: Literal["open", "resolved", "closed"] | None = None,
+        limit: int = 10,
+    ) -> list[TicketSummary]:
+        return await self._svc.list_tickets(customer_email=self.email, status=status, limit=limit)
+
+    async def get_context(self) -> CustomerContext:
+        return await self._svc.get_customer_context(self.email)
+
+    async def resolve_ticket(
+        self,
+        ticket_id: str,
+        resolution_notes: str,
+        billable_amount: float | None = None,
+    ) -> ResolutionResult:
+        return await self._svc.resolve_ticket(
+            ticket_id=ticket_id,
+            resolution_notes=resolution_notes,
+            billable_amount=billable_amount,
+        )
+
+    async def send_email(
+        self,
+        subject: str,
+        body: str,
+        from_name: str = "Garamatic Support",
+        from_email: str = "support@garamatic.com",
+    ) -> EmailQueueResult:
+        return await self._svc.send_email(
+            to_email=self.email,
+            subject=subject,
+            body=body,
+            from_name=from_name,
+            from_email=from_email,
+        )
+
+    async def queue_invoice(
+        self,
+        ticket_id: str,
+        amount: float,
+        description: str | None = None,
+    ) -> InvoiceQueueResult:
+        return await self._svc.queue_invoice(
+            ticket_id=ticket_id,
+            amount=amount,
+            description=description,
+        )
+
+
+# ------------------------------------------------------------------
+# Error mapping helper
+# ------------------------------------------------------------------
+
+
+def _map_client_error(e: Exception, rid: str) -> ServiceError:
+    """Map client-level exceptions to service-level exceptions."""
+    import httpx
+
+    # Pass through circuit breaker errors so FastAPI's global handler can catch them
+    if hasattr(e, "__module__") and "pybreaker" in str(e.__module__):
+        raise e
+
+    if isinstance(e, httpx.HTTPStatusError):
+        if e.response.status_code == 404:
+            return NotFoundError(str(e), rid)
+        return UpstreamError(str(e), rid)
+    return UpstreamError(str(e), rid)

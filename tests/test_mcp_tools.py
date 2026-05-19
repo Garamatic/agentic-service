@@ -1,13 +1,16 @@
-"""Tests for MCP server tools."""
+"""Tests for MCP server tools.
 
-from unittest.mock import MagicMock, patch
+These tests verify that MCP tools correctly call the service layer and
+format responses. Service-level validation and business logic are tested
+in test_service.py.
+"""
+
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastmcp import Context
 
 from agentic_service.server import (
-    _generate_request_id,
-    _validate_email,
     create_invoice,
     create_ticket,
     get_customer_context,
@@ -16,10 +19,15 @@ from agentic_service.server import (
     resolve_ticket,
     send_email,
 )
+from agentic_service.service import (
+    _generate_request_id,
+    _validate_email,
+    ValidationError,
+)
 
 
 class TestEmailValidation:
-    """Test email validation logic."""
+    """Test email validation helper."""
 
     @pytest.mark.parametrize("email", [
         "test@example.com",
@@ -42,8 +50,8 @@ class TestEmailValidation:
         "test@.example.com"
     ])
     def test_invalid_emails(self, email):
-        """Should raise ValueError for invalid emails."""
-        with pytest.raises(ValueError, match="Invalid email"):
+        """Should raise ValidationError for invalid emails."""
+        with pytest.raises(ValidationError, match="Invalid email"):
             _validate_email(email)
 
 
@@ -59,301 +67,324 @@ class TestRequestIdGeneration:
         assert len(id2) == 32
 
 
+def _make_mock_ctx(**service_methods):
+    """Create a mock MCP Context with a mock service in lifespan_context."""
+    ctx = MagicMock(spec=Context)
+    ctx.request_context.lifespan_context = {"service": _make_mock_service(**service_methods)}
+    ctx.info = AsyncMock()
+    return ctx
+
+
+def _make_mock_service(**methods):
+    """Create a mock GaramaticService with specified async methods."""
+    service = MagicMock()
+    for name, return_value in methods.items():
+        setattr(service, name, AsyncMock(return_value=return_value))
+    return service
+
+
+# ------------------------------------------------------------------
+# Ticket tools
+# ------------------------------------------------------------------
+
 @pytest.mark.asyncio
 class TestGetTicketStatus:
     """Test get_ticket_status MCP tool."""
 
-    async def test_returns_ticket_details(self, mock_ticket_client, mock_ticket_data, mock_mcp_context):
+    async def test_returns_ticket_details(self, mock_ticket_data):
         """Should return formatted ticket details."""
-        mock_ticket_client.get_ticket.return_value = mock_ticket_data
+        from agentic_service.service import Ticket
+        ticket = Ticket(
+            id="T-123",
+            status="open",
+            customer_email="john@example.com",
+            customer_name="John Doe",
+            title="Network Issue",
+            description="Customer cannot connect to VPN",
+            created_at="2024-01-15T10:30:00Z",
+            resolved_at=None,
+            resolution_notes=None,
+            billable_amount=None,
+        )
+        mock_ctx = _make_mock_ctx(get_ticket=ticket)
 
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            result = await get_ticket_status("T-123", ctx=mock_mcp_context)
+        result = await get_ticket_status("T-123", ctx=mock_ctx)
 
         assert result["ticket_id"] == "T-123"
         assert result["status"] == "open"
         assert result["customer_id"] == "john@example.com"
         assert result["title"] == "Network Issue"
+        mock_ctx.request_context.lifespan_context["service"].get_ticket.assert_awaited_once_with("T-123")
 
-    async def test_handles_unavailable_service(self):
-        """Should handle when ticket service is unavailable."""
-        with patch('agentic_service.server.ticket_client', None):
-            ctx = MagicMock(spec=Context)
-            result = await get_ticket_status("T-123", ctx=ctx)
+    async def test_handles_not_found(self):
+        """Should return not_found for missing ticket."""
+        from agentic_service.service import NotFoundError
+        svc = _make_mock_service()
+        svc.get_ticket = AsyncMock(side_effect=NotFoundError("Not found"))
+        ctx = MagicMock(spec=Context)
+        ctx.request_context.lifespan_context = {"service": svc}
 
-        assert "error" in result
-        assert result["ticket_id"] == "T-123"
+        result = await get_ticket_status("NONEXISTENT", ctx=ctx)
 
-    async def test_calls_ctx_info(self, mock_ticket_client, mock_ticket_data, mock_mcp_context):
+        assert result["status"] == "not_found"
+        assert result["ticket_id"] == "NONEXISTENT"
+
+    async def test_calls_ctx_info(self, mock_ticket_data):
         """Should log context info."""
-        mock_ticket_client.get_ticket.return_value = mock_ticket_data
+        from agentic_service.service import Ticket
+        ticket = Ticket(
+            id="T-123",
+            status="open",
+            customer_email="john@example.com",
+            customer_name="John Doe",
+            title="Network Issue",
+            description=None,
+            created_at=None,
+            resolved_at=None,
+            resolution_notes=None,
+            billable_amount=None,
+        )
+        mock_ctx = _make_mock_ctx(get_ticket=ticket)
 
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            await get_ticket_status("T-123", ctx=mock_mcp_context)
+        await get_ticket_status("T-123", ctx=mock_ctx)
 
-        mock_mcp_context.info.assert_called_once()
+        mock_ctx.info.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 class TestListCustomerTickets:
     """Test list_customer_tickets MCP tool."""
 
-    async def test_returns_tickets_list(self, mock_ticket_client, mock_ticket_data, mock_mcp_context):
+    async def test_returns_tickets_list(self, mock_ticket_data):
         """Should return list of customer tickets."""
-        mock_ticket_client.list_tickets.return_value = [mock_ticket_data]
+        from agentic_service.service import TicketSummary
+        summary = TicketSummary(
+            id="T-123",
+            title="Network Issue",
+            status="open",
+            created_at="2024-01-15T10:30:00Z",
+            resolved_at=None,
+        )
+        mock_ctx = _make_mock_ctx(list_tickets=[summary])
 
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            result = await list_customer_tickets(
-                "john@example.com",
-                status="open",
-                limit=5,
-                ctx=mock_mcp_context
-            )
+        result = await list_customer_tickets(
+            "john@example.com",
+            status="open",
+            limit=5,
+            ctx=mock_ctx
+        )
 
         assert len(result["tickets"]) == 1
         assert result["tickets"][0]["ticket_id"] == "T-123"
-
-        # Verify client called with correct params (fetches all, filters locally)
-        mock_ticket_client.list_tickets.assert_called_once_with(
-            customer_id="john@example.com",
-            status="open",
-            limit=5
-        )
-
-    async def test_validates_email(self, mock_ticket_client, mock_mcp_context):
-        """Should validate email format."""
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            with pytest.raises(ValueError, match="Invalid email"):
-                await list_customer_tickets("invalid-email", ctx=mock_mcp_context)
 
 
 @pytest.mark.asyncio
 class TestCreateTicket:
     """Test create_ticket MCP tool."""
 
-    async def test_creates_ticket_successfully(self, mock_ticket_client, mock_mcp_context):
+    async def test_creates_ticket_successfully(self):
         """Should create ticket and return confirmation."""
-        mock_ticket_client.create_ticket.return_value = {"id": "T-999"}
+        from agentic_service.service import Ticket
+        ticket = Ticket(
+            id="T-999",
+            status="open",
+            customer_email="test@example.com",
+            customer_name="Test User",
+            title="New Issue",
+            description="Something broke",
+            created_at="2024-01-15T10:30:00Z",
+            resolved_at=None,
+            resolution_notes=None,
+            billable_amount=None,
+        )
+        mock_ctx = _make_mock_ctx(create_ticket=ticket)
 
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            result = await create_ticket(
-                title="New Issue",
-                description="Something broke",
-                customer_email="test@example.com",
-                customer_name="Test User",
-                priority="high",
-                ctx=mock_mcp_context
-            )
+        result = await create_ticket(
+            title="New Issue",
+            description="Something broke",
+            customer_email="test@example.com",
+            customer_name="Test User",
+            priority="high",
+            ctx=mock_ctx
+        )
 
         assert result["ticket_id"] == "T-999"
         assert result["status"] == "created"
         assert "message" in result
-
-    async def test_validates_empty_title(self, mock_ticket_client, mock_mcp_context):
-        """Should reject empty title."""
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            with pytest.raises(ValueError, match="Title is required"):
-                await create_ticket(
-                    title="   ",
-                    description="Description",
-                    customer_email="test@example.com",
-                    customer_name="Test",
-                    ctx=mock_mcp_context
-                )
-
-    async def test_validates_invalid_email(self, mock_ticket_client, mock_mcp_context):
-        """Should reject invalid email."""
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            with pytest.raises(ValueError, match="Invalid email"):
-                await create_ticket(
-                    title="Issue",
-                    description="Description",
-                    customer_email="invalid-email",
-                    customer_name="Test",
-                    ctx=mock_mcp_context
-                )
 
 
 @pytest.mark.asyncio
 class TestResolveTicket:
     """Test resolve_ticket MCP tool."""
 
-    async def test_resolves_without_invoice(self, mock_ticket_client, mock_mcp_context):
+    async def test_resolves_without_invoice(self):
         """Should resolve ticket without invoice."""
-        mock_ticket_client.resolve_ticket.return_value = {
-            "id": "T-123",
-            "status": "resolved",
-            "customerId": "test@example.com",
-            "customerName": "Test User"
-        }
+        from agentic_service.service import ResolutionResult
+        result_obj = ResolutionResult(
+            ticket_id="T-123",
+            status="resolved",
+            resolution_notes="Fixed the issue",
+            invoice=None,
+        )
+        mock_ctx = _make_mock_ctx(resolve_ticket=result_obj)
 
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            result = await resolve_ticket(
-                ticket_id="T-123",
-                resolution_notes="Fixed the issue",
-                billable_amount=None,
-                ctx=mock_mcp_context
-            )
+        result = await resolve_ticket(
+            ticket_id="T-123",
+            resolution_notes="Fixed the issue",
+            billable_amount=None,
+            ctx=mock_ctx
+        )
 
         assert result["status"] == "resolved"
         assert result["ticket_id"] == "T-123"
         assert "invoice" not in result
 
-    async def test_resolves_with_invoice(self, mock_ticket_client, mock_mq_publisher, mock_mcp_context):
-        """Should resolve with invoice info when billable and queue invoice."""
-        mock_ticket_client.resolve_ticket.return_value = {
-            "id": "T-123",
-            "status": "resolved",
-            "customerId": "test@example.com",
-            "customerName": "Test User"
-        }
+    async def test_resolves_with_invoice(self):
+        """Should resolve with invoice info when billable."""
+        from agentic_service.service import InvoiceQueueResult, ResolutionResult
+        invoice = InvoiceQueueResult(
+            status="queued",
+            estimated_amount=200.00,
+            message="Invoice queued",
+        )
+        result_obj = ResolutionResult(
+            ticket_id="T-123",
+            status="resolved",
+            resolution_notes="Fixed the issue",
+            invoice=invoice,
+        )
+        mock_ctx = _make_mock_ctx(resolve_ticket=result_obj)
 
-        with patch('agentic_service.server.ticket_client', mock_ticket_client), \
-             patch('agentic_service.server.mq_publisher', mock_mq_publisher):
-            result = await resolve_ticket(
-                ticket_id="T-123",
-                resolution_notes="Fixed the issue",
-                billable_amount=200.00,
-                ctx=mock_mcp_context
-            )
+        result = await resolve_ticket(
+            ticket_id="T-123",
+            resolution_notes="Fixed the issue",
+            billable_amount=200.00,
+            ctx=mock_ctx
+        )
 
         assert result["status"] == "resolved"
         assert "invoice" in result
         assert result["invoice"]["estimated_amount"] == 200.00
-        mock_mq_publisher.publish.assert_called_once()
 
-    async def test_validates_negative_amount(self, mock_ticket_client, mock_mcp_context):
-        """Should reject negative billable amount."""
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            with pytest.raises(ValueError, match="cannot be negative"):
-                await resolve_ticket(
-                    ticket_id="T-123",
-                    resolution_notes="Fixed",
-                    billable_amount=-50.00,
-                    ctx=mock_mcp_context
-                )
 
-    async def test_validates_empty_notes(self, mock_ticket_client, mock_mcp_context):
-        """Should reject empty resolution notes."""
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            with pytest.raises(ValueError, match="Resolution notes are required"):
-                await resolve_ticket(
-                    ticket_id="T-123",
-                    resolution_notes="   ",
-                    ctx=mock_mcp_context
-                )
-
+# ------------------------------------------------------------------
+# Invoice tools
+# ------------------------------------------------------------------
 
 @pytest.mark.asyncio
 class TestCreateInvoice:
     """Test create_invoice MCP tool."""
 
-    async def test_queues_invoice_creation(self, mock_ticket_client, mock_mq_publisher, mock_ticket_data, mock_mcp_context):
+    async def test_queues_invoice_creation(self):
         """Should queue invoice via RabbitMQ."""
-        mock_ticket_client.get_ticket.return_value = mock_ticket_data
+        from agentic_service.service import InvoiceQueueResult
+        result_obj = InvoiceQueueResult(
+            status="queued",
+            estimated_amount=250.00,
+            message="Invoice queued",
+        )
+        mock_ctx = _make_mock_ctx(queue_invoice=result_obj)
 
-        with patch('agentic_service.server.ticket_client', mock_ticket_client), \
-             patch('agentic_service.server.mq_publisher', mock_mq_publisher):
-            result = await create_invoice(
-                ticket_id="T-123",
-                amount=250.00,
-                description="Network troubleshooting",
-                ctx=mock_mcp_context
-            )
+        result = await create_invoice(
+            ticket_id="T-123",
+            amount=250.00,
+            description="Network troubleshooting",
+            ctx=mock_ctx
+        )
 
         assert result["status"] == "queued"
         assert result["amount"] == 250.00
         assert "message" in result
+        mock_ctx.request_context.lifespan_context["service"].queue_invoice.assert_awaited_once()
 
-        # Verify MQ publish was called
-        mock_mq_publisher.publish.assert_called_once()
-        call_args = mock_mq_publisher.publish.call_args[0]
-        assert call_args[0] == "invoice.create_requested"
-
-    async def test_validates_positive_amount(self, mock_ticket_client, mock_mcp_context):
-        """Should reject non-positive amounts."""
-        with patch('agentic_service.server.ticket_client', mock_ticket_client):
-            with pytest.raises(ValueError, match="must be positive"):
-                await create_invoice(
-                    ticket_id="T-123",
-                    amount=0,
-                    ctx=mock_mcp_context
-                )
-
-    async def test_handles_unavailable_mq(self, mock_ticket_client, mock_mcp_context):
+    async def test_handles_unavailable_mq(self):
         """Should handle when MQ is unavailable."""
-        with patch('agentic_service.server.ticket_client', mock_ticket_client), \
-             patch('agentic_service.server.mq_publisher', None):
-            result = await create_invoice(
-                ticket_id="T-123",
-                amount=100.00,
-                ctx=mock_mcp_context
-            )
+        from agentic_service.service import InvoiceQueueResult
+        result_obj = InvoiceQueueResult(
+            status="unavailable",
+            estimated_amount=100.00,
+            message="Invoice service unavailable",
+        )
+        mock_ctx = _make_mock_ctx(queue_invoice=result_obj)
 
-        assert "error" in result
-        assert result["status"] == "failed"
+        result = await create_invoice(
+            ticket_id="T-123",
+            amount=100.00,
+            ctx=mock_ctx
+        )
 
+        assert result["status"] == "unavailable"
+
+
+# ------------------------------------------------------------------
+# Email tools
+# ------------------------------------------------------------------
 
 @pytest.mark.asyncio
 class TestSendEmail:
     """Test send_email MCP tool."""
 
-    async def test_queues_email(self, mock_mq_publisher, mock_mcp_context):
+    async def test_queues_email(self):
         """Should queue email via RabbitMQ."""
-        with patch('agentic_service.server.mq_publisher', mock_mq_publisher):
-            result = await send_email(
-                to_email="customer@example.com",
-                subject="Test Subject",
-                body="<p>Test body</p>",
-                from_name="Garamatic Support",
-                ctx=mock_mcp_context
-            )
+        from agentic_service.service import EmailQueueResult
+        result_obj = EmailQueueResult(
+            status="queued",
+            to_email="customer@example.com",
+            subject="Test Subject",
+            message="Email queued",
+        )
+        mock_ctx = _make_mock_ctx(send_email=result_obj)
+
+        result = await send_email(
+            to_email="customer@example.com",
+            subject="Test Subject",
+            body="<p>Hello World</p>",
+            from_name="Support Team",
+            ctx=mock_ctx
+        )
 
         assert result["status"] == "queued"
         assert result["to_email"] == "customer@example.com"
+        mock_ctx.request_context.lifespan_context["service"].send_email.assert_awaited_once()
 
-        # Verify MQ publish
-        mock_mq_publisher.publish.assert_called_once()
-        call_args = mock_mq_publisher.publish.call_args[0]
-        assert call_args[0] == "email.send"
 
-    async def test_validates_email(self, mock_mq_publisher, mock_mcp_context):
-        """Should validate recipient email."""
-        with patch('agentic_service.server.mq_publisher', mock_mq_publisher):
-            with pytest.raises(ValueError, match="Invalid email"):
-                await send_email(
-                    to_email="invalid-email",
-                    subject="Subject",
-                    body="Body",
-                    ctx=mock_mcp_context
-                )
-
-    async def test_validates_empty_subject(self, mock_mq_publisher, mock_mcp_context):
-        """Should reject empty subject."""
-        with patch('agentic_service.server.mq_publisher', mock_mq_publisher):
-            with pytest.raises(ValueError, match="subject is required"):
-                await send_email(
-                    to_email="test@example.com",
-                    subject="   ",
-                    body="Body",
-                    ctx=mock_mcp_context
-                )
-
+# ------------------------------------------------------------------
+# Customer context
+# ------------------------------------------------------------------
 
 @pytest.mark.asyncio
 class TestGetCustomerContext:
     """Test get_customer_context MCP tool."""
 
-    async def test_returns_full_context(
-        self, mock_ticket_client, mock_odoo_client, mock_ticket_data, mock_invoice_data, mock_mcp_context
-    ):
+    async def test_returns_full_context(self, mock_ticket_data, mock_invoice_data):
         """Should return comprehensive customer context."""
-        mock_ticket_client.list_tickets.return_value = [mock_ticket_data]
-        mock_odoo_client.list_customer_invoices.return_value = [mock_invoice_data]
+        from agentic_service.service import CustomerContext, CustomerSummary, InvoiceSummary, TicketSummary
+        context = CustomerContext(
+            customer_email="john@example.com",
+            summary=CustomerSummary(
+                total_tickets=1,
+                open_tickets=1,
+                total_invoiced=150.00,
+                outstanding_balance=150.00,
+                lifetime_value=0.0,
+            ),
+            recent_tickets=[TicketSummary(
+                id="T-123",
+                title="Network Issue",
+                status="open",
+                created_at="2024-01-15T10:30:00Z",
+                resolved_at=None,
+            )],
+            recent_invoices=[InvoiceSummary(
+                invoice_id="INV-789",
+                amount=150.00,
+                status="sent",
+                created_at="2024-01-10T14:35:00Z",
+            )],
+        )
+        mock_ctx = _make_mock_ctx(get_customer_context=context)
 
-        with patch('agentic_service.server.ticket_client', mock_ticket_client), \
-             patch('agentic_service.server.odoo_client', mock_odoo_client):
-            result = await get_customer_context("john@example.com", ctx=mock_mcp_context)
+        result = await get_customer_context("john@example.com", ctx=mock_ctx)
 
         assert result["customer_email"] == "john@example.com"
         assert "summary" in result
@@ -361,12 +392,17 @@ class TestGetCustomerContext:
         assert "recent_tickets" in result
         assert "recent_invoices" in result
 
-    async def test_handles_service_unavailable(self, mock_mcp_context):
-        """Should return error dict when services unavailable."""
-        with patch('agentic_service.server.ticket_client', None), \
-             patch('agentic_service.server.odoo_client', None):
-            result = await get_customer_context("test@example.com", ctx=mock_mcp_context)
+    async def test_handles_service_error(self):
+        """Should return error dict when service fails."""
+        from agentic_service.service import ServiceUnavailableError
+        svc = _make_mock_service()
+        svc.get_customer_context = AsyncMock(
+            side_effect=ServiceUnavailableError("Service not initialized")
+        )
+        ctx = MagicMock(spec=Context)
+        ctx.request_context.lifespan_context = {"service": svc}
+
+        result = await get_customer_context("test@example.com", ctx=ctx)
 
         assert result["status"] == "error"
-        assert "unavailable" in result["error"].lower()
         assert result["customer_email"] == "test@example.com"

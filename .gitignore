@@ -52,3 +52,4 @@ htmlcov/
 
 # macOS
 .DS_Store
+.ralph/

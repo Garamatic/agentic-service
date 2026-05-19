@@ -1,31 +1,26 @@
 """Tests for REST API endpoints."""
 
-from unittest.mock import MagicMock, patch
-
-import pybreaker
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from agentic_service.api import app
+from agentic_service.service import GaramaticService
 
 
 @pytest_asyncio.fixture
 async def api_client(mock_ticket_client, mock_odoo_client, mock_mq_publisher):
-    """Create FastAPI test client with mocked dependencies.
-    
-    Patches both api.* and server.* globals since _get_customer_context_internal
-    is shared between modules and uses server-level globals.
-    """
-    with patch('agentic_service.api.ticket_client', mock_ticket_client), \
-         patch('agentic_service.api.odoo_client', mock_odoo_client), \
-         patch('agentic_service.api.mq_publisher', mock_mq_publisher), \
-         patch('agentic_service.server.ticket_client', mock_ticket_client), \
-         patch('agentic_service.server.odoo_client', mock_odoo_client):
+    """Create FastAPI test client with injected service.
 
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            yield client
+    Bypasses lifespan by directly setting app.state.service with a
+    GaramaticService backed by mock clients.
+    """
+    service = GaramaticService(mock_ticket_client, mock_odoo_client, mock_mq_publisher)
+    app.state.service = service
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+    app.state.service = None
 
 
 @pytest.mark.asyncio
@@ -77,6 +72,7 @@ class TestTicketsEndpoints:
     async def test_get_ticket_not_found(self, api_client, mock_ticket_client):
         """Should return 404 for non-existent ticket."""
         from httpx import HTTPStatusError
+        from unittest.mock import MagicMock
         mock_response = MagicMock()
         mock_response.status_code = 404
         mock_ticket_client.get_ticket.side_effect = HTTPStatusError(
@@ -295,6 +291,7 @@ class TestErrorHandling:
 
         response = await api_client.get("/tickets/T-123")
 
+        # Generic client exceptions become UpstreamError -> 500 via catch-all handler
         assert response.status_code == 500
         data = response.json()
         # Endpoint-specific handler returns a sanitized detail dict
@@ -305,6 +302,7 @@ class TestErrorHandling:
 
     async def test_circuit_breaker_returns_503(self, api_client, mock_ticket_client):
         """Should return 503 when circuit breaker is open."""
+        import pybreaker
         # CircuitBreakerError is raised by the decorator when circuit is open
         # We need to simulate the circuit being open by raising it manually
         mock_ticket_client.get_ticket.side_effect = pybreaker.CircuitBreakerError("Circuit open")
@@ -323,11 +321,15 @@ class TestClientInitialization:
 
     async def test_returns_503_when_clients_not_initialized(self, api_client):
         """Should return 503 when required clients unavailable."""
-        with patch('agentic_service.api.ticket_client', None), \
-             patch('agentic_service.server.ticket_client', None):
+        # Remove the service from app state to simulate unavailability
+        original_service = app.state.service
+        app.state.service = None
+        try:
             response = await api_client.get("/tickets/T-123")
 
-        assert response.status_code == 503
-        data = response.json()
-        # detail is now a dict with error response structure
-        assert "unavailable" in data["detail"]["error"].lower()
+            assert response.status_code == 503
+            data = response.json()
+            # Service unavailable handler returns {"error": "...", "request_id": "..."}
+            assert "unavailable" in data["error"].lower()
+        finally:
+            app.state.service = original_service
