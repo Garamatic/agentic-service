@@ -8,6 +8,7 @@ Provides an autonomous agent that can:
 """
 
 import asyncio
+import contextlib
 import os
 from datetime import datetime
 from typing import Annotated, Literal
@@ -52,13 +53,18 @@ async def search_tickets_by_customer(customer_email: str, limit: int = 10) -> st
 
     try:
         _validate_email(customer_email)
-        tickets = await ticket_client.list_tickets(customer_email=customer_email, limit=limit)
+        tickets = await ticket_client.list_tickets(customer_id=customer_email, limit=limit)
         if not tickets:
             return f"No tickets found for {customer_email}"
 
-        result = f"Found {len(tickets)} tickets for {customer_email}:\n\n"
+        ticket_word = "ticket" if len(tickets) == 1 else "tickets"
+        result = f"Found {len(tickets)} {ticket_word} for {customer_email}:\n\n"
         for t in tickets:
-            result += f"- Ticket {t.get('id')}: {t.get('title')} [{t.get('status')}]\n"
+            result += (
+                f"- Ticket {t.get('id') or 'N/A'}: "
+                f"{t.get('title') or 'Untitled'} "
+                f"[{t.get('status') or 'unknown'}]\n"
+            )
         return result
     except Exception as e:
         return f"Error searching tickets: {str(e)}"
@@ -66,30 +72,46 @@ async def search_tickets_by_customer(customer_email: str, limit: int = 10) -> st
 
 async def get_ticket_details(ticket_id: str) -> str:
     """Get detailed information about a specific ticket."""
+    if not ticket_id or not ticket_id.strip():
+        return "Error: Ticket ID is required"
     if ticket_client is None:
         return "Error: Ticket service not available"
-    if odoo_client is None:
-        return "Error: Invoice service not available"
 
     try:
         ticket = await ticket_client.get_ticket(ticket_id)
-        invoice = await odoo_client.get_invoice_status(ticket_id)
-
-        result = f"""Ticket {ticket_id}:
-- Title: {ticket.get('title')}
-- Status: {ticket.get('status')}
-- Customer: {ticket.get('customerName')} ({ticket.get('customerEmail')})
-- Priority: {ticket.get('priority')}
-- Created: {ticket.get('createdAt')}
-- Description: {ticket.get('description')}
-- Resolution Notes: {ticket.get('resolutionNotes', 'Not resolved')}
-"""
-        if invoice:
-            result += f"\nInvoice:\n- Status: {invoice.get('status')}\n- Amount: €{invoice.get('amount', 0):.2f}\n"
-
-        return result
     except Exception as e:
         return f"Error getting ticket: {str(e)}"
+
+    # Invoice lookup is best-effort; don't fail the whole tool if Odoo is down
+    invoice = None
+    if odoo_client is not None:
+        with contextlib.suppress(Exception):
+            invoice = await odoo_client.get_invoice_status(ticket_id)
+
+    customer_name = ticket.get('customerName') or ticket.get('customer_name') or 'Unknown'
+    customer_email = (
+        ticket.get('customerEmail')
+        or ticket.get('customerId')
+        or ticket.get('customer_email')
+        or 'Unknown'
+    )
+    result = f"""Ticket {ticket_id}:
+- Title: {ticket.get('title') or 'Untitled'}
+- Status: {ticket.get('status') or 'unknown'}
+- Customer: {customer_name} ({customer_email})
+- Priority: {ticket.get('priority') or 'N/A'}
+- Created: {ticket.get('createdAt') or 'N/A'}
+- Description: {ticket.get('description') or 'No description'}
+- Resolution Notes: {ticket.get('resolutionNotes') or 'Not resolved'}
+"""
+    if invoice:
+        amount = (invoice.get('amount') or 0)
+        result += (
+            f"\nInvoice:\n- Status: {invoice.get('status') or 'unknown'}\n"
+            f"- Amount: €{amount:.2f}\n"
+        )
+
+    return result
 
 
 async def get_customer_summary(customer_email: str) -> str:
@@ -107,30 +129,40 @@ async def get_customer_summary(customer_email: str) -> str:
         if context['recent_tickets']:
             result += "\nRecent Tickets:\n"
             for t in context['recent_tickets']:
-                result += f"- {t.get('title')} [{t.get('status')}]\n"
+                result += f"- {t.get('title') or 'Untitled'} [{t.get('status') or 'unknown'}]\n"
 
         return result
     except Exception as e:
         return f"Error getting customer context: {str(e)}"
 
 
-async def resolve_ticket_with_invoice(ticket_id: str, resolution_notes: str, billable_amount: float) -> str:
+async def resolve_ticket_with_invoice(
+    ticket_id: str, resolution_notes: str, billable_amount: float
+) -> str:
     """
     Resolve a ticket AND create an invoice in one action.
     Only use when explicitly requested or when work is clearly billable.
     """
-    if ticket_client is None or mq_publisher is None:
-        return "Error: Services not available"
+    if not ticket_id or not ticket_id.strip():
+        return "Error: Ticket ID is required"
+    if ticket_client is None:
+        return "Error: Ticket service not available"
+    if not resolution_notes or not resolution_notes.strip():
+        return "Error: Resolution notes are required"
+    if billable_amount < 0:
+        return "Error: Billable amount cannot be negative"
 
     try:
-        # Resolve ticket
         ticket = await ticket_client.resolve_ticket(
             ticket_id=ticket_id,
             resolution_notes=resolution_notes,
             billable_amount=billable_amount
         )
+    except Exception as e:
+        return f"❌ Error resolving ticket: {e}"
 
-        # Create invoice with flat format per integration-contracts schema
+    # Queue invoice separately — failure here must not undo the resolution
+    if mq_publisher is not None:
         payload = {
             "event_type": "invoice.create_requested",
             "ticket_id": ticket_id,
@@ -140,14 +172,27 @@ async def resolve_ticket_with_invoice(ticket_id: str, resolution_notes: str, bil
             "description": resolution_notes[:100],
             "requested_at": datetime.now().isoformat()
         }
-        await mq_publisher.publish("invoice.create_requested", payload)
+        try:
+            await mq_publisher.publish("invoice.create_requested", payload)
+            return (
+                f"✅ Ticket {ticket_id} resolved and invoice "
+                f"(€{billable_amount:.2f}) queued."
+            )
+        except Exception as e:
+            logger.error("resolve_ticket_with_invoice.publish_failed", error=str(e))
+            return (
+                f"✅ Ticket {ticket_id} resolved, but invoice queueing failed: {e}"
+            )
 
-        return f"✅ Ticket {ticket_id} resolved and invoice (€{billable_amount:.2f}) queued."
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
+    return (
+        f"✅ Ticket {ticket_id} resolved. "
+        f"Invoice service unavailable — invoice not queued."
+    )
 
 
-async def request_human_approval(action: str, details: str, estimated_amount: float | None = None) -> str:
+async def request_human_approval(
+    action: str, details: str, estimated_amount: float | None = None
+) -> str:
     """
     Request human approval for sensitive actions like large invoices.
     Use when amount > €500 or when uncertain about action.
@@ -294,17 +339,16 @@ async def create_agent(checkpointer: BaseCheckpointSaver):
         # Otherwise end
         return END
 
+    from langchain_openai import ChatOpenAI
+
+    # Initialize model once (requires OPENAI_API_KEY env var)
+    model = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+    model_with_tools = model.bind_tools(tools)
+
     def call_model(state: AgentState):
         """Call the LLM with current state."""
-        from langchain_openai import ChatOpenAI
-
-        # Initialize model (requires OPENAI_API_KEY env var)
-        model = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
-        model_with_tools = model.bind_tools(tools)
-
         messages = state["messages"]
         response = model_with_tools.invoke(messages)
-
         return {"messages": [response]}
 
     # Build graph
@@ -336,18 +380,21 @@ class GaramaticAgent:
     or in-memory storage (development).
     """
 
-    def __init__(self, thread_id: str | None = None, checkpointer: BaseCheckpointSaver | None = None):
+    def __init__(
+        self, thread_id: str | None = None, checkpointer: BaseCheckpointSaver | None = None
+    ):
         """Initialize agent with optional thread_id for multi-user support.
-        
+
         Args:
             thread_id: Unique identifier for conversation thread. If not provided,
                       uses a default thread (single-user mode).
             checkpointer: Optional custom checkpoint saver. Uses environment
-                         config if not provided.
+                         config if not provided. Caller is responsible for cleanup.
         """
         self.thread_id = thread_id or "garamatic-session"
         self.config = {"configurable": {"thread_id": self.thread_id}}
         self._checkpointer = checkpointer
+        self._owns_checkpointer = checkpointer is None
         self._agent = None
 
     async def _get_agent(self):
@@ -361,15 +408,22 @@ class GaramaticAgent:
 
     async def process(self, message: str) -> str:
         """Process a user message and return the response.
-        
+
         State is automatically persisted based on checkpointer configuration.
         """
         agent = await self._get_agent()
 
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=message)
-        ]
+        # Only prepend system prompt on first interaction to avoid
+        # infinite accumulation in checkpointed state.
+        state = await agent.aget_state(self.config)
+        existing = state.values.get("messages", []) if state.values else []
+        if existing:
+            messages = [HumanMessage(content=message)]
+        else:
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=message)
+            ]
 
         result = await agent.ainvoke(
             {"messages": messages},
@@ -379,7 +433,7 @@ class GaramaticAgent:
         # Get last AI message
         for msg in reversed(result["messages"]):
             if isinstance(msg, AIMessage):
-                return msg.content
+                return msg.content or ""
 
         return "No response generated"
 
@@ -387,10 +441,11 @@ class GaramaticAgent:
         """Get current conversation state."""
         agent = await self._get_agent()
         state = await agent.aget_state(self.config)
+        messages = state.values.get("messages", []) if state.values else []
         return {
             "thread_id": self.thread_id,
-            "message_count": len(state.values.get("messages", [])),
-            "last_message": state.values.get("messages", [])[-1].content if state.values.get("messages") else None
+            "message_count": len(messages),
+            "last_message": messages[-1].content if messages else None
         }
 
     async def close(self):
@@ -398,14 +453,12 @@ class GaramaticAgent:
         if self._agent is not None:
             self._agent = None
 
-        # Close checkpointer connection if we manage it
-        if self._checkpointer is not None:
-            # AsyncSqliteSaver stores connection in .conn attribute
+        # Only close the checkpointer if we created it internally.
+        # Callers that pass an external checkpointer are responsible for its lifecycle.
+        if self._owns_checkpointer and self._checkpointer is not None:
             if hasattr(self._checkpointer, 'conn') and self._checkpointer.conn:
-                try:
+                with contextlib.suppress(Exception):
                     await self._checkpointer.conn.close()
-                except Exception:
-                    pass  # Best effort cleanup
             self._checkpointer = None
 
     async def run_conversation(self):
@@ -457,12 +510,10 @@ async def init_clients():
 
 async def close_clients():
     """Cleanup API clients."""
-    if ticket_client:
-        await ticket_client.close()
-    if odoo_client:
-        await odoo_client.close()
-    if mq_publisher:
-        await mq_publisher.close()
+    for client in (ticket_client, odoo_client, mq_publisher):
+        if client:
+            with contextlib.suppress(Exception):
+                await client.close()
     logger.info("agent.clients.closed")
 
 

@@ -1,8 +1,9 @@
 """Shared test fixtures for agentic-service tests."""
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 import pytest_asyncio
-from unittest.mock import AsyncMock, MagicMock
 import respx
 
 
@@ -96,23 +97,6 @@ async def mock_mcp_context():
 
 
 @pytest.fixture
-def valid_email():
-    return "test@example.com"
-
-
-@pytest.fixture
-def invalid_emails():
-    return [
-        "invalid-email",
-        "@example.com",
-        "test@",
-        "test@.com",
-        "",
-        None
-    ]
-
-
-@pytest.fixture
 def respx_mock():
     """Provide respx mock router for HTTP mocking."""
     with respx.mock:
@@ -122,7 +106,7 @@ def respx_mock():
 @pytest.fixture(autouse=True)
 def reset_breakers():
     """Reset circuit breakers before each test."""
-    from agentic_service.clients import ticket_api_breaker, odoo_bridge_breaker
+    from agentic_service.clients import odoo_bridge_breaker, ticket_api_breaker
     ticket_api_breaker.close()
     odoo_bridge_breaker.close()
     yield

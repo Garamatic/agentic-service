@@ -21,7 +21,7 @@ def _is_retryable_error(exception: BaseException) -> bool:
     """Module-level retryable error helper."""
     if isinstance(exception, httpx.HTTPStatusError):
         return exception.response.status_code >= 500
-    return isinstance(exception, (httpx.ConnectError, httpx.TimeoutException))
+    return isinstance(exception, (httpx.NetworkError, httpx.TimeoutException))
 
 
 ticket_api_breaker = pybreaker.CircuitBreaker(
@@ -54,7 +54,7 @@ class TicketClient:
         timeout: float = 30.0,
     ):
         """Initialize the ticket client.
-        
+
         Args:
             base_url: The base URL of the ticket-masala service
             api_key: Optional API key for authentication
@@ -75,10 +75,10 @@ class TicketClient:
     @ticket_api_breaker
     async def get_ticket(self, ticket_id: str) -> dict[str, Any]:
         """Fetch a ticket by ID.
-        
+
         Args:
             ticket_id: The ticket/work-item ID
-            
+
         Returns:
             The ticket data as a dictionary
         """
@@ -101,13 +101,13 @@ class TicketClient:
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         """List tickets with optional filters.
-        
+
         Args:
             customer_id: Filter by customer ID (not email)
             status: Filter by ticket status
             limit: Maximum number of results
             offset: Pagination offset
-            
+
         Returns:
             List of ticket data dictionaries
         """
@@ -139,13 +139,13 @@ class TicketClient:
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Create a new ticket.
-        
+
         Args:
             title: Ticket title
             description: Ticket description
             customer_id: Customer ID (not email)
             **kwargs: Additional ticket fields
-            
+
         Returns:
             The created ticket data
         """
@@ -174,12 +174,12 @@ class TicketClient:
         billable_amount: float | None = None,
     ) -> dict[str, Any]:
         """Resolve a ticket.
-        
+
         Args:
             ticket_id: The ticket ID to resolve
             resolution_notes: Notes about the resolution
             billable_amount: Billable amount for the resolution
-            
+
         Returns:
             The resolved ticket data
         """
@@ -300,3 +300,11 @@ class RabbitMQPublisher:
             self.connection = None
             self.channel = None
             self.exchange = None
+
+    async def __aenter__(self) -> "RabbitMQPublisher":
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        """Async context manager exit."""
+        await self.close()

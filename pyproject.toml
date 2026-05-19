@@ -21,6 +21,7 @@ dependencies = [
     "uvicorn>=0.32.0",
     "langgraph>=0.2.0",
     "langchain>=0.3.0",
+    "langchain-openai>=0.2.0",
     "pybreaker>=1.2.0",  # Circuit breakers
     "aiosqlite>=0.20.0",  # SQLite for persistent agent state
     "langgraph-checkpoint-sqlite>=2.0.0",
