@@ -1,7 +1,7 @@
 """Event Consumer for Garamatic Agentic Service.
 
-Consumes events from RabbitMQ and triggers automated workflows via
-WorkflowEngine + GaramaticService.
+Consumes events from RabbitMQ and triggers automated notifications via
+NotificationComposer + narrow ports.
 """
 
 import asyncio
@@ -13,8 +13,14 @@ import aio_pika
 import structlog
 
 from .clients import RabbitMQPublisher
+from .notification_adapters import (
+    HttpTicketLookup,
+    MessageQueueEmailSender,
+    ServiceEmailSender,
+    ServiceTicketLookup,
+)
+from .notifications import NotificationComposer
 from .service import GaramaticService, create_service
-from .workflows import WorkflowEngine
 
 logger = structlog.get_logger()
 
@@ -25,11 +31,27 @@ running = True
 class EventConsumer:
     """RabbitMQ event consumer with workflow automation."""
 
-    def __init__(self, service: GaramaticService, amqp_url: str):
+    def __init__(
+        self,
+        service: GaramaticService,
+        amqp_url: str,
+        mq_publisher: RabbitMQPublisher | None = None,
+    ):
         self._service = service
-        self._workflow_engine = WorkflowEngine(service)
         self.amqp_url = amqp_url
-        self._mq_publisher: RabbitMQPublisher | None = None
+        self._mq_publisher = mq_publisher
+
+        # Build notification composer with narrow ports
+        email_sender = (
+            MessageQueueEmailSender(mq_publisher)
+            if mq_publisher is not None
+            else ServiceEmailSender(service)
+        )
+        self._composer = NotificationComposer(
+            email_sender=email_sender,
+            ticket_lookup=ServiceTicketLookup(service),
+        )
+
         self.connection: aio_pika.RobustConnection | None = None
         self.channel: aio_pika.Channel | None = None
         self.queue: aio_pika.Queue | None = None
@@ -81,7 +103,13 @@ class EventConsumer:
 
             logger.info("consumer.received", routing_key=routing_key)
 
-            await self._workflow_engine.handle(routing_key, event_data)
+            result = await self._composer.notify(routing_key, event_data)
+            logger.info(
+                "notification.result",
+                routing_key=result.routing_key,
+                status=result.status,
+                reason=result.reason,
+            )
             await message.ack()
         except json.JSONDecodeError as e:
             logger.error("consumer.invalid_json", error=str(e))
