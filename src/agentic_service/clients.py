@@ -280,7 +280,12 @@ class RabbitMQPublisher:
         )
         logger.info("rabbitmq.connected", exchange=self._exchange_name)
 
-    async def publish(self, routing_key: str, message: dict[str, Any]) -> None:
+    async def publish(
+        self,
+        routing_key: str,
+        message: dict[str, Any],
+        headers: dict[str, Any] | None = None,
+    ) -> None:
         if not self.exchange:
             raise RuntimeError("Not connected to RabbitMQ")
         body = json.dumps(message, default=str).encode()
@@ -289,6 +294,7 @@ class RabbitMQPublisher:
                 body=body,
                 content_type="application/json",
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                headers=headers,
             ),
             routing_key=routing_key,
         )

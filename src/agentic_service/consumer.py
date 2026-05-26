@@ -62,38 +62,61 @@ class EventConsumer:
         self.channel = await self.connection.channel()
         await self.channel.set_qos(prefetch_count=1)
 
-        exchange = await self.channel.declare_exchange(
+        self._exchange = await self.channel.declare_exchange(
             "event_exchange",
             aio_pika.ExchangeType.TOPIC,
             durable=True
         )
 
-        self.queue = await self.channel.declare_queue(
-            "agentic_consumer",
+        dlx_exchange = await self.channel.declare_exchange(
+            "event_exchange.dlx",
+            aio_pika.ExchangeType.TOPIC,
             durable=True
         )
 
+        dlq_queue = await self.channel.declare_queue(
+            "agentic_consumer.dlq",
+            durable=True
+        )
+        await dlq_queue.bind(dlx_exchange, routing_key="agentic_consumer.dlq")
+
+        self.queue = await self.channel.declare_queue(
+            "agentic_consumer",
+            durable=True,
+            arguments={
+                "x-dead-letter-exchange": "garamatic.events.dlx",
+                "x-dead-letter-routing-key": "agentic_consumer.dlq"
+            }
+        )
+
         bindings = [
-            "payment.received",
-            "invoice.created",
-            "invoice.overdue",
-            "ticket.resolved",
-            "ticket.escalated",
-            "ticket.created",
+            "event.payment.received",
+            "event.invoice.created",
+            "event.invoice.overdue",
+            "event.ticket.resolved",
+            "event.ticket.escalated",
+            "event.ticket.created",
         ]
 
         for routing_key in bindings:
-            await self.queue.bind(exchange, routing_key=routing_key)
+            await self.queue.bind(self._exchange, routing_key=routing_key)
 
         logger.info("consumer.connected", queue=self.queue.name)
         return self.queue
+
+    MAX_RETRIES = 3
 
     async def handle_message(self, message: aio_pika.IncomingMessage):
         """Process a single message with explicit ack/reject control.
 
         Bad JSON is acked (won't get better with retries).
-        Processing failures are requeued so they can be retried.
+        Processing failures are requeued with a retry counter; after MAX_RETRIES
+        the message is dead-lettered to prevent infinite poison-pill loops.
         """
+        retry_count = 0
+        if message.headers and "x-retry-count" in message.headers:
+            retry_count = int(message.headers["x-retry-count"])
+
         try:
             body = json.loads(message.body)
             routing_key = message.routing_key
@@ -101,7 +124,7 @@ class EventConsumer:
             # Check for integration-contract envelope, fallback to flat object
             event_data = body.get("data") if "data" in body else body
 
-            logger.info("consumer.received", routing_key=routing_key)
+            logger.info("consumer.received", routing_key=routing_key, retry_count=retry_count)
 
             result = await self._composer.notify(routing_key, event_data)
             logger.info(
@@ -115,8 +138,39 @@ class EventConsumer:
             logger.error("consumer.invalid_json", error=str(e))
             await message.ack()  # Bad JSON won't get better with retries
         except Exception as e:
-            logger.error("consumer.message_failed", error=str(e))
-            await message.reject(requeue=True)
+            logger.error("consumer.message_failed", error=str(e), retry_count=retry_count)
+            if retry_count < self.MAX_RETRIES:
+                # Republish with incremented retry count so the next delivery
+                # can be tracked. We ack the original and publish a new copy
+                # because RabbitMQ doesn't let us update headers on reject.
+                await message.ack()
+                new_headers = dict(message.headers or {})
+                new_headers["x-retry-count"] = retry_count + 1
+                if self._exchange is not None:
+                    await self._exchange.publish(
+                        aio_pika.Message(
+                            body=message.body,
+                            headers=new_headers,
+                            content_type=message.content_type,
+                            delivery_mode=message.delivery_mode,
+                        ),
+                        routing_key=message.routing_key,
+                    )
+                logger.warning(
+                    "consumer.requeued",
+                    routing_key=message.routing_key,
+                    retry_count=retry_count + 1,
+                    max_retries=self.MAX_RETRIES,
+                )
+            else:
+                # Max retries exceeded — dead-letter to avoid poison loop
+                await message.reject(requeue=False)
+                logger.error(
+                    "consumer.dead_lettered",
+                    routing_key=message.routing_key,
+                    retry_count=retry_count,
+                    max_retries=self.MAX_RETRIES,
+                )
 
     async def run(self):
         """Main consumer loop."""
