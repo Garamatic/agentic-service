@@ -7,6 +7,7 @@ native response formats.
 
 import asyncio
 import contextlib
+import typing
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -15,6 +16,9 @@ from typing import Any, Literal
 import structlog
 
 from .ports import MessageQueuePort, OdooClientPort, TicketClientPort
+
+if typing.TYPE_CHECKING:
+    from .clients import AgenticService
 
 logger = structlog.get_logger()
 
@@ -757,3 +761,36 @@ async def create_service() -> GaramaticService:
         odoo_client=odoo_client,
         mq_publisher=mq_publisher,
     )
+
+
+async def create_facade_service() -> tuple[AgenticService, GaramaticService]:
+    """Factory: create AgenticService facade + GaramaticService from config.
+
+    The facade hides all transport detail; the GaramaticService is the
+    same business-logic layer that existing callers expect.
+
+    Returns:
+        (facade, service) — callers can use the facade directly or
+        inject facade.tickets / facade.odoo / facade.messages into
+        downstream consumers.
+    """
+    from .clients import AgenticService, ServiceConfig
+    from .config import get_settings
+
+    config = get_settings()
+
+    facade = AgenticService(
+        ServiceConfig(
+            ticket_api_url=config.ticket_api_url,
+            amqp_url=config.rabbitmq_url,
+            odoo_base_url=config.odoo_bridge_url,
+        )
+    )
+
+    service = GaramaticService(
+        ticket_client=facade.tickets,
+        odoo_client=facade._odoo,
+        mq_publisher=facade.messages,
+    )
+
+    return facade, service

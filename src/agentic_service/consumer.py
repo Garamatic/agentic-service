@@ -69,7 +69,7 @@ class EventConsumer:
         )
 
         dlx_exchange = await self.channel.declare_exchange(
-            "event_exchange.dlx",
+            "garamatic.events.dlx",
             aio_pika.ExchangeType.TOPIC,
             durable=True
         )
@@ -141,27 +141,37 @@ class EventConsumer:
             logger.error("consumer.message_failed", error=str(e), retry_count=retry_count)
             if retry_count < self.MAX_RETRIES:
                 # Republish with incremented retry count so the next delivery
-                # can be tracked. We ack the original and publish a new copy
-                # because RabbitMQ doesn't let us update headers on reject.
-                await message.ack()
-                new_headers = dict(message.headers or {})
-                new_headers["x-retry-count"] = retry_count + 1
-                if self._exchange is not None:
+                # can be tracked. Republish first, then ack original. If republish
+                # fails, reject the original so it goes to DLQ instead of being lost.
+                try:
+                    new_headers = dict(message.headers or {})
+                    new_headers["x-retry-count"] = retry_count + 1
                     await self._exchange.publish(
                         aio_pika.Message(
                             body=message.body,
                             headers=new_headers,
                             content_type=message.content_type,
                             delivery_mode=message.delivery_mode,
+                            correlation_id=message.correlation_id,
+                            message_id=message.message_id,
                         ),
                         routing_key=message.routing_key,
                     )
-                logger.warning(
-                    "consumer.requeued",
-                    routing_key=message.routing_key,
-                    retry_count=retry_count + 1,
-                    max_retries=self.MAX_RETRIES,
-                )
+                    await message.ack()
+                    logger.warning(
+                        "consumer.requeued",
+                        routing_key=message.routing_key,
+                        retry_count=retry_count + 1,
+                        max_retries=self.MAX_RETRIES,
+                    )
+                except Exception as repub_ex:
+                    logger.error(
+                        "consumer.republish_failed",
+                        routing_key=message.routing_key,
+                        error=str(repub_ex),
+                        retry_count=retry_count,
+                    )
+                    await message.reject(requeue=False)
             else:
                 # Max retries exceeded — dead-letter to avoid poison loop
                 await message.reject(requeue=False)
