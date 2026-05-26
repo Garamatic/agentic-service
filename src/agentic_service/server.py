@@ -10,7 +10,7 @@ from typing import Any
 import structlog
 from fastmcp import Context, FastMCP
 
-from .clients import OdooBridgeClient, TicketClient
+from .clients import AgenticService, OdooBridgeClient, TicketClient
 from .config import get_settings
 from .service import (
     GaramaticService,
@@ -19,6 +19,7 @@ from .service import (
     ValidationError,
     _format_date,
     _validate_email,
+    create_facade_service,
     create_service,
 )
 
@@ -31,19 +32,31 @@ logger = structlog.get_logger()
 
 @asynccontextmanager
 async def app_lifespan(server: "FastMCP"):
-    """Initialize and cleanup service on server startup/shutdown."""
-    service = await create_service()
+    """Initialize and cleanup service on server startup/shutdown.
+
+    Uses create_facade_service() to wire the unified AgenticService facade
+    with the GaramaticService business layer.
+    """
+    facade, service = await create_facade_service()
 
     logger.info("service.started")
 
     try:
-        yield {"service": service}
+        yield {"facade": facade, "service": service}
     finally:
-        await service.close()
+        await facade.close()
         logger.info("service.stopped")
 
 
 mcp = FastMCP("garamatic", lifespan=app_lifespan)
+
+
+def _get_facade(ctx: Context) -> AgenticService:
+    """Extract facade from MCP lifespan context."""
+    facade = ctx.request_context.lifespan_context.get("facade")
+    if facade is None:
+        raise ServiceUnavailableError("Service facade not initialized")
+    return facade
 
 
 def _get_service(ctx: Context) -> GaramaticService:

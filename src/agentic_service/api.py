@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
 from .config import get_settings
+from .clients import AgenticService
 from .service import (
     GaramaticService,
     NotFoundError,
@@ -16,6 +17,7 @@ from .service import (
     UpstreamError,
     ValidationError,
     _generate_request_id,
+    create_facade_service,
     create_service,
 )
 
@@ -73,19 +75,19 @@ class SendEmailRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize and cleanup service."""
-    app.state.service = await create_service()
+    """Initialize and cleanup service.
+
+    Uses create_facade_service() to wire the unified AgenticService facade
+    with the GaramaticService business layer.
+    """
+    facade, service = await create_facade_service()
+    app.state.facade = facade
+    app.state.service = service
 
     logger.info("api.started")
     yield
 
-    await app.state.service.close()
-    logger.info("api.stopped")
-
-    logger.info("api.started")
-    yield
-
-    await app.state.service.close()
+    await facade.close()
     logger.info("api.stopped")
 
 
@@ -140,8 +142,16 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+def _get_facade() -> AgenticService:
+    """Get the unified service facade from app state."""
+    facade = getattr(app.state, "facade", None)
+    if facade is None:
+        raise ServiceUnavailableError("Service facade not initialized")
+    return facade
+
+
 def _get_service() -> GaramaticService:
-    """Get service from app state."""
+    """Get the business-layer service from app state."""
     service = getattr(app.state, "service", None)
     if service is None:
         raise ServiceUnavailableError("Service not initialized")
