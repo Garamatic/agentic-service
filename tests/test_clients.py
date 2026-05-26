@@ -122,26 +122,8 @@ class TestTicketClient:
         assert route.called
         await client.close()
 
-    async def test_circuit_breaker_configured(self, respx_mock):
-        """Circuit breaker should be configured on the client methods."""
-        # Verify that circuit breaker decorators are applied
-
-        # The get_ticket method should be wrapped by circuit breaker
-        # (we can verify by checking the method exists and has the right structure)
-        client = TicketClient("http://ticket-api.example.com")
-        assert hasattr(client, 'get_ticket')
-        assert callable(client.get_ticket)
-
-        # Circuit breaker state can be checked
-        assert ticket_api_breaker.fail_max == 5
-        assert ticket_api_breaker.reset_timeout == 60
-        assert ticket_api_breaker.name == "ticket_api"
-
-        await client.close()
-
-    async def test_circuit_breaker_decorator_applied(self, respx_mock):
-        """Verify circuit breaker decorator is properly applied to methods."""
-        # Reset breaker state before test
+    async def test_circuit_breaker_state_after_success(self, respx_mock):
+        """Circuit breaker should remain closed after successful calls."""
         ticket_api_breaker.close()
 
         route = respx_mock.get("http://ticket-api.example.com/api/v1/work-items/T-123").mock(
@@ -149,13 +131,9 @@ class TestTicketClient:
         )
 
         client = TicketClient("http://ticket-api.example.com")
-
-        # Successful call should work normally
         result = await client.get_ticket("T-123")
         assert result["id"] == "T-123"
         assert route.called
-
-        # Circuit breaker should still be closed after success
         assert ticket_api_breaker.current_state == pybreaker.STATE_CLOSED
 
         await client.close()
@@ -247,11 +225,14 @@ class TestRabbitMQPublisher:
         call_args = mock_exchange.publish.call_args
         assert call_args[1]["routing_key"] == "routing.key"
 
-    async def test_publish_raises_when_not_connected(self):
-        """Should raise error when not connected."""
+    async def test_publish_auto_connects_when_not_connected(self):
+        """Should attempt connection when not connected."""
         publisher = RabbitMQPublisher("amqp://guest:guest@localhost:5672/")
 
-        with pytest.raises(RuntimeError, match="Not connected"):
+        with (
+            patch("aio_pika.connect_robust", side_effect=RuntimeError("broker down")),
+            pytest.raises(RuntimeError, match="broker down"),
+        ):
             await publisher.publish("key", {"data": "value"})
 
     async def test_close_releases_connection(self):

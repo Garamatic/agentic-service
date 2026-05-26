@@ -28,7 +28,7 @@ class EmailMessage:
     to_email: str
     subject: str
     body_html: str
-    sender: "SenderIdentity"
+    sender: SenderIdentity
     routing_key: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -102,7 +102,7 @@ class EventView:
     _DEFAULT_ALIASES: dict[str, tuple[str, ...]] = {
         "ticket_id": ("ticket_id", "TicketId", "ticketId"),
         "invoice_id": ("invoice_id", "InvoiceId", "invoiceId", "OdooInvoiceId"),
-        "customer_email": ("customer_email", "CustomerEmail", "customerId", "customer_id", "customerId"),
+        "customer_email": ("customer_email", "CustomerEmail", "customerId", "customer_id"),
         "customer_name": ("customer_name", "CustomerName", "customerName"),
         "amount": ("amount", "Amount"),
         "days_overdue": ("days_overdue", "DaysOverdue", "daysOverdue"),
@@ -269,7 +269,7 @@ def _ticket_created_template(e: EventView) -> tuple[str, str]:
 def _ticket_escalated_template(e: EventView) -> tuple[str, str]:
     tid = e.str("ticket_id", "N/A")
     reason = e.str("reason", "Unknown")
-    cid = e.str("customerId", e.str("customer_id", "N/A"))
+    cid = e.str("customer_id") or e.str("customerId", "N/A")
     title = e.str("title", "Untitled")
     subject = f"URGENT: Ticket #{tid} Escalated"
     body = (
@@ -353,6 +353,15 @@ def _default_templates() -> list[NotificationTemplate]:
 class StaticSenderDirectory:
     """Maps sender keys to configured identities."""
 
+    _KEY_MAP: dict[str, str] = {
+        "payment.received": "billing",
+        "invoice.created": "billing",
+        "invoice.overdue": "billing",
+        "ticket.resolved": "support",
+        "ticket.created": "support",
+        "ticket.escalated": "system",
+    }
+
     def __init__(self, identities: dict[str, SenderIdentity] | None = None) -> None:
         self._identities = identities or {
             "billing": SenderIdentity("billing@garamatic.com", "Garamatic Billing"),
@@ -362,22 +371,12 @@ class StaticSenderDirectory:
         }
 
     def for_routing_key(self, routing_key: str) -> SenderIdentity:
-        # Map old routing keys to sender keys
-        key_map = {
-            "payment.received": "billing",
-            "invoice.created": "billing",
-            "invoice.overdue": "billing",
-            "ticket.resolved": "support",
-            "ticket.created": "support",
-            "ticket.escalated": "system",
-        }
-        sender_key = key_map.get(routing_key, "default")
-        if sender_key in self._identities:
-            return self._identities[sender_key]
-        if "default" in self._identities:
-            return self._identities["default"]
-        # Fallback: return the first available identity
-        return next(iter(self._identities.values()))
+        sender_key = self._KEY_MAP.get(routing_key, "default")
+        return (
+            self._identities.get(sender_key)
+            or self._identities.get("default")
+            or next(iter(self._identities.values()))
+        )
 
 
 # ------------------------------------------------------------------
@@ -472,6 +471,8 @@ class NotificationComposer:
         )
 
         # Delivery
+        send_result: EmailSendResult | None = None
+        failed_message = ""
         try:
             send_result = await self._email_sender.send_email(email)
         except Exception as exc:
@@ -481,22 +482,16 @@ class NotificationComposer:
                 recipient=recipient,
                 error=str(exc),
             )
-            return NotificationResult(
-                status="failed",
-                routing_key=routing_key,
-                reason="delivery_unavailable",
-                email=email,
-                message=f"Email delivery failed: {exc}",
-            )
+            failed_message = f"Email delivery failed: {exc}"
 
-        if send_result.status == "failed":
+        if send_result is None or send_result.status == "failed":
             return NotificationResult(
                 status="failed",
                 routing_key=routing_key,
                 reason="delivery_unavailable",
                 email=email,
                 send_result=send_result,
-                message=send_result.message,
+                message=failed_message or (send_result.message if send_result else "Email delivery failed"),
             )
 
         logger.info(

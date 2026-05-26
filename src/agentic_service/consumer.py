@@ -14,7 +14,6 @@ import structlog
 
 from .clients import RabbitMQPublisher
 from .notification_adapters import (
-    HttpTicketLookup,
     MessageQueueEmailSender,
     ServiceEmailSender,
     ServiceTicketLookup,
@@ -39,7 +38,6 @@ class EventConsumer:
     ):
         self._service = service
         self.amqp_url = amqp_url
-        self._mq_publisher = mq_publisher
 
         # Build notification composer with narrow ports
         email_sender = (
@@ -139,41 +137,7 @@ class EventConsumer:
             await message.ack()  # Bad JSON won't get better with retries
         except Exception as e:
             logger.error("consumer.message_failed", error=str(e), retry_count=retry_count)
-            if retry_count < self.MAX_RETRIES:
-                # Republish with incremented retry count so the next delivery
-                # can be tracked. Republish first, then ack original. If republish
-                # fails, reject the original so it goes to DLQ instead of being lost.
-                try:
-                    new_headers = dict(message.headers or {})
-                    new_headers["x-retry-count"] = retry_count + 1
-                    await self._exchange.publish(
-                        aio_pika.Message(
-                            body=message.body,
-                            headers=new_headers,
-                            content_type=message.content_type,
-                            delivery_mode=message.delivery_mode,
-                            correlation_id=message.correlation_id,
-                            message_id=message.message_id,
-                        ),
-                        routing_key=message.routing_key,
-                    )
-                    await message.ack()
-                    logger.warning(
-                        "consumer.requeued",
-                        routing_key=message.routing_key,
-                        retry_count=retry_count + 1,
-                        max_retries=self.MAX_RETRIES,
-                    )
-                except Exception as repub_ex:
-                    logger.error(
-                        "consumer.republish_failed",
-                        routing_key=message.routing_key,
-                        error=str(repub_ex),
-                        retry_count=retry_count,
-                    )
-                    await message.reject(requeue=False)
-            else:
-                # Max retries exceeded — dead-letter to avoid poison loop
+            if retry_count >= self.MAX_RETRIES:
                 await message.reject(requeue=False)
                 logger.error(
                     "consumer.dead_lettered",
@@ -181,6 +145,40 @@ class EventConsumer:
                     retry_count=retry_count,
                     max_retries=self.MAX_RETRIES,
                 )
+                return
+
+            # Republish with incremented retry count so the next delivery
+            # can be tracked. Republish first, then ack original. If republish
+            # fails, reject the original so it goes to DLQ instead of being lost.
+            new_headers = dict(message.headers or {})
+            new_headers["x-retry-count"] = retry_count + 1
+            try:
+                await self._exchange.publish(
+                    aio_pika.Message(
+                        body=message.body,
+                        headers=new_headers,
+                        content_type=message.content_type,
+                        delivery_mode=message.delivery_mode,
+                        correlation_id=message.correlation_id,
+                        message_id=message.message_id,
+                    ),
+                    routing_key=message.routing_key,
+                )
+                await message.ack()
+                logger.warning(
+                    "consumer.requeued",
+                    routing_key=message.routing_key,
+                    retry_count=retry_count + 1,
+                    max_retries=self.MAX_RETRIES,
+                )
+            except Exception as repub_ex:
+                logger.error(
+                    "consumer.republish_failed",
+                    routing_key=message.routing_key,
+                    error=str(repub_ex),
+                    retry_count=retry_count,
+                )
+                await message.reject(requeue=False)
 
     async def run(self):
         """Main consumer loop."""

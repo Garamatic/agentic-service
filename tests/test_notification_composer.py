@@ -6,8 +6,6 @@ No HTTP mocking, no RabbitMQ, no GaramaticService construction.
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from agentic_service.notification_adapters import (
@@ -17,19 +15,14 @@ from agentic_service.notification_adapters import (
 from agentic_service.notifications import (
     EmailMessage,
     EmailSendResult,
-    EmailSender,
     EventView,
     NotificationComposer,
     NotificationRegistry,
-    NotificationResult,
     NotificationTemplate,
-    SenderDirectory,
     SenderIdentity,
     StaticSenderDirectory,
-    TicketLookup,
     TicketSnapshot,
 )
-
 
 # ------------------------------------------------------------------
 # Helpers
@@ -235,7 +228,9 @@ class TestTicketCreated:
 
 @pytest.mark.asyncio
 class TestTicketEscalated:
-    async def test_enriches_and_sends_to_manager(self, composer_with_lookup, email_sender, ticket_lookup):
+    async def test_enriches_and_sends_to_manager(
+        self, composer_with_lookup, email_sender, ticket_lookup
+    ):
         result = await composer_with_lookup.notify("ticket.escalated", {
             "ticket_id": "T-5",
             "reason": "VIP complaint",
@@ -256,7 +251,7 @@ class TestTicketEscalated:
         })
         assert result.status == "queued"
         # Should still send with original event data
-        assert "manager@garamatic.com" == email_sender.sent[0].to_email
+        assert email_sender.sent[0].to_email == "manager@garamatic.com"
         assert "Unknown" in email_sender.sent[0].body_html
 
     async def test_degrades_when_no_lookup_configured(self, composer, email_sender):
@@ -387,7 +382,7 @@ class TestNotificationRegistry:
 
 @pytest.mark.asyncio
 class TestFullFlow:
-    async def test_all_default_workflows_send_correct_sender(self):
+    async def test_all_default_workflows_are_queued(self):
         sender = InMemoryEmailSender()
         composer = NotificationComposer(email_sender=sender)
 
@@ -402,13 +397,7 @@ class TestFullFlow:
 
         for routing_key, event in events.items():
             result = await composer.notify(routing_key, event)
-            assert result.status in ("queued", "skipped")
+            assert result.status == "queued"
 
-        # All common events should have been queued
-        sent_events = [msg.routing_key for msg in sender.sent]
-        assert "payment.received" in sent_events
-        assert "invoice.created" in sent_events
-        assert "invoice.overdue" in sent_events
-        assert "ticket.resolved" in sent_events
-        assert "ticket.created" in sent_events
-        assert "ticket.escalated" in sent_events
+        sent_events = {msg.routing_key: msg for msg in sender.sent}
+        assert set(sent_events.keys()) == set(events.keys())

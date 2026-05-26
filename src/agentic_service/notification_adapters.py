@@ -14,12 +14,9 @@ import structlog
 from .notifications import (
     EmailMessage,
     EmailSendResult,
-    EmailSender,
-    SenderIdentity,
-    TicketLookup,
     TicketSnapshot,
 )
-from .ports import MessageQueuePort, TicketClientPort
+from .ports import MessageQueuePort
 
 logger = structlog.get_logger()
 
@@ -72,30 +69,6 @@ class MessageQueueEmailSender:
                 subject=message.subject,
                 message=f"Failed to queue email: {exc}",
             )
-
-
-class HttpTicketLookup:
-    """Wraps the ticket client port to provide TicketSnapshot."""
-
-    def __init__(self, client: TicketClientPort) -> None:
-        self._client = client
-
-    async def get_ticket(self, ticket_id: str) -> TicketSnapshot | None:
-        try:
-            data = await self._client.get_ticket(ticket_id)
-            return TicketSnapshot(
-                id=data.get("id") or "N/A",
-                customer_email=data.get("customerId") or data.get("customer_id"),
-                customer_name=data.get("customerName") or data.get("customer_name"),
-                title=data.get("title") or "Untitled",
-            )
-        except Exception as exc:
-            logger.warning(
-                "http_ticket_lookup.failed",
-                ticket_id=ticket_id,
-                error=str(exc),
-            )
-            return None
 
 
 # ------------------------------------------------------------------

@@ -26,24 +26,6 @@ def mock_ticket_data():
 
 
 @pytest.fixture
-def mock_resolved_ticket():
-    """Sample resolved ticket data."""
-    return {
-        "id": "T-456",
-        "title": "Email Setup",
-        "description": "Configure email client",
-        "status": "resolved",
-        "customerEmail": "jane@example.com",
-        "customerName": "Jane Smith",
-        "priority": "medium",
-        "createdAt": "2024-01-10T09:00:00Z",
-        "resolvedAt": "2024-01-10T14:30:00Z",
-        "resolutionNotes": "Configured Outlook with IMAP settings",
-        "billableAmount": 150.00
-    }
-
-
-@pytest.fixture
 def mock_invoice_data():
     """Sample invoice data."""
     return {

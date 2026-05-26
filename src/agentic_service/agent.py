@@ -81,7 +81,6 @@ async def get_ticket_details(ticket_id: str) -> str:
 - Title: {ticket.title}
 - Status: {ticket.status}
 - Customer: {ticket.customer_name or 'Unknown'} ({ticket.customer_email or 'Unknown'})
-- Priority: {ticket.customer_name or 'N/A'}
 - Created: {ticket.created_at or 'N/A'}
 - Description: {ticket.description or 'No description'}
 - Resolution Notes: {ticket.resolution_notes or 'Not resolved'}
@@ -121,7 +120,7 @@ async def get_customer_summary(customer_email: str) -> str:
 
 
 async def resolve_ticket_with_invoice(
-    ticket_id: str, resolution_notes: str, billable_amount: float
+    ticket_id: str, resolution_notes: str, billable_amount: float | None = None
 ) -> str:
     """
     Resolve a ticket AND create an invoice in one action.
@@ -133,7 +132,7 @@ async def resolve_ticket_with_invoice(
         return "Error: Service not available"
     if not resolution_notes or not resolution_notes.strip():
         return "Error: Resolution notes are required"
-    if billable_amount < 0:
+    if billable_amount is not None and billable_amount < 0:
         return "Error: Billable amount cannot be negative"
 
     try:
@@ -167,9 +166,7 @@ async def request_human_approval(
     """
     approval_id = _generate_request_id()
 
-    needs_approval = estimated_amount is not None and estimated_amount > 500
-
-    if needs_approval:
+    if estimated_amount is not None and estimated_amount > 500:
         return f"""⚠️ APPROVAL REQUIRED
 
 Action: {action}
@@ -418,11 +415,9 @@ class GaramaticAgent:
         if self._agent is not None:
             self._agent = None
 
-        # Only close the checkpointer if we created it internally.
-        # Callers that pass an external checkpointer are responsible for its lifecycle.
         if self._owns_checkpointer and self._checkpointer is not None:
-            if hasattr(self._checkpointer, 'conn') and self._checkpointer.conn:
-                with contextlib.suppress(Exception):
+            with contextlib.suppress(Exception):
+                if getattr(self._checkpointer, "conn", None):
                     await self._checkpointer.conn.close()
             self._checkpointer = None
 

@@ -9,7 +9,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
 from .config import get_settings
-from .clients import AgenticService
 from .service import (
     GaramaticService,
     NotFoundError,
@@ -18,7 +17,6 @@ from .service import (
     ValidationError,
     _generate_request_id,
     create_facade_service,
-    create_service,
 )
 
 logger = structlog.get_logger()
@@ -81,7 +79,6 @@ async def lifespan(app: FastAPI):
     with the GaramaticService business layer.
     """
     facade, service = await create_facade_service()
-    app.state.facade = facade
     app.state.service = service
 
     logger.info("api.started")
@@ -142,14 +139,6 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
-def _get_facade() -> AgenticService:
-    """Get the unified service facade from app state."""
-    facade = getattr(app.state, "facade", None)
-    if facade is None:
-        raise ServiceUnavailableError("Service facade not initialized")
-    return facade
-
-
 def _get_service() -> GaramaticService:
     """Get the business-layer service from app state."""
     service = getattr(app.state, "service", None)
@@ -177,8 +166,6 @@ async def api_get_ticket(ticket_id: str):
     logger.info("api.get_ticket", ticket_id=ticket_id, request_id=rid)
     try:
         ticket = await service.get_ticket(ticket_id)
-    except pybreaker.CircuitBreakerError:
-        raise
     except NotFoundError:
         raise HTTPException(
             status_code=404,
@@ -191,6 +178,8 @@ async def api_get_ticket(ticket_id: str):
             detail=create_error_response(rid, "Failed to retrieve ticket")
         ) from None
     except Exception as e:
+        if isinstance(e, pybreaker.CircuitBreakerError):
+            raise
         logger.error("api.get_ticket_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
         raise HTTPException(
             status_code=500,
@@ -227,9 +216,9 @@ async def api_list_tickets(
             status=status,  # type: ignore[arg-type]
             limit=limit,
         )
-    except pybreaker.CircuitBreakerError:
-        raise
     except Exception as e:
+        if isinstance(e, pybreaker.CircuitBreakerError):
+            raise
         logger.error("api.list_tickets_failed", error=str(e), request_id=rid)
         raise HTTPException(
             status_code=500, detail=create_error_response(rid, "Failed to list tickets")
@@ -263,9 +252,9 @@ async def api_create_ticket(request: CreateTicketRequest):
             customer_name=request.customer_name,
             priority=request.priority,  # type: ignore[arg-type]
         )
-    except pybreaker.CircuitBreakerError:
-        raise
     except Exception as e:
+        if isinstance(e, pybreaker.CircuitBreakerError):
+            raise
         logger.error("api.create_ticket_failed", error=str(e), request_id=rid)
         raise HTTPException(
             status_code=500, detail=create_error_response(rid, "Failed to create ticket")
@@ -302,14 +291,14 @@ async def api_resolve_ticket(ticket_id: str, request: ResolveTicketRequest):
             resolution_notes=request.resolution_notes,
             billable_amount=request.billable_amount,
         )
-    except pybreaker.CircuitBreakerError:
-        raise
     except NotFoundError:
         raise HTTPException(
             status_code=404,
             detail=create_error_response(rid, "Ticket not found")
         ) from None
     except Exception as e:
+        if isinstance(e, pybreaker.CircuitBreakerError):
+            raise
         logger.error("api.resolve_ticket_failed", error=str(e), request_id=rid)
         raise HTTPException(
             status_code=500, detail=create_error_response(rid, "Failed to resolve ticket")
@@ -336,9 +325,9 @@ async def api_get_invoice(ticket_id: str):
     logger.info("api.get_invoice", ticket_id=ticket_id, request_id=rid)
     try:
         invoice = await service.get_invoice_status(ticket_id)
-    except pybreaker.CircuitBreakerError:
-        raise
     except Exception as e:
+        if isinstance(e, pybreaker.CircuitBreakerError):
+            raise
         logger.error("api.get_invoice_failed", error=str(e), request_id=rid)
         raise HTTPException(
             status_code=500, detail=create_error_response(rid, "Failed to retrieve invoice")
@@ -371,13 +360,13 @@ async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
             amount=request.amount,
             description=request.description,
         )
-    except pybreaker.CircuitBreakerError:
-        raise
     except NotFoundError:
         raise HTTPException(
             status_code=404, detail=create_error_response(rid, "Ticket not found")
         ) from None
     except Exception as e:
+        if isinstance(e, pybreaker.CircuitBreakerError):
+            raise
         logger.error("api.create_invoice_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
         raise HTTPException(
             status_code=503, detail=create_error_response(rid, "Failed to queue invoice creation")
@@ -406,9 +395,9 @@ async def api_send_email(request: SendEmailRequest):
             body=request.body,
             from_name=request.from_name,
         )
-    except pybreaker.CircuitBreakerError:
-        raise
     except Exception as e:
+        if isinstance(e, pybreaker.CircuitBreakerError):
+            raise
         logger.error("api.send_email_failed", to=request.to_email, error=str(e), request_id=rid)
         raise HTTPException(
             status_code=503, detail=create_error_response(rid, "Failed to queue email")
@@ -430,13 +419,13 @@ async def api_get_customer_context(email: str):
     logger.info("api.get_customer_context", email=email, request_id=rid)
     try:
         context = await service.get_customer_context(email)
-    except pybreaker.CircuitBreakerError:
-        raise
     except ValidationError as e:
         raise HTTPException(
             status_code=400, detail=create_error_response(rid, "Invalid email format")
         ) from e
     except Exception as e:
+        if isinstance(e, pybreaker.CircuitBreakerError):
+            raise
         logger.error("api.get_customer_context_failed", error=str(e), request_id=rid)
         raise HTTPException(
             status_code=500,

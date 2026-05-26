@@ -5,7 +5,8 @@ degradation. Callers (MCP, FastAPI, LangGraph) only adapt results to their
 native response formats.
 """
 
-import asyncio
+from __future__ import annotations
+
 import contextlib
 import typing
 import uuid
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+import httpx
 import structlog
 
 from .ports import MessageQueuePort, OdooClientPort, TicketClientPort
@@ -160,13 +162,9 @@ def _validate_email(email: str) -> None:
     if "@" not in email:
         raise ValidationError(f"Invalid email format: {email}")
     local, _, domain = email.rpartition("@")
-    if not local or not domain:
+    if not local or not domain or "." not in domain:
         raise ValidationError(f"Invalid email format: {email}")
-    if "." not in domain:
-        raise ValidationError(f"Invalid email format: {email}")
-    if domain.startswith(".") or domain.endswith("."):
-        raise ValidationError(f"Invalid email format: {email}")
-    if ".." in local:
+    if domain.startswith(".") or domain.endswith(".") or ".." in local:
         raise ValidationError(f"Invalid email format: {email}")
 
 
@@ -180,14 +178,22 @@ def _ticket_from_dict(data: dict[str, Any]) -> Ticket:
     return Ticket(
         id=data.get("id") or "N/A",
         status=data.get("status") or "unknown",
-        customer_email=data.get("customerId") or data.get("customer_id"),
+        customer_email=(
+            data.get("customerId")
+            or data.get("customer_id")
+            or data.get("customerEmail")
+        ),
         customer_name=data.get("customerName") or data.get("customer_name"),
         title=data.get("title") or "Untitled",
         description=data.get("description"),
         created_at=data.get("createdAt"),
         resolved_at=data.get("resolvedAt") or data.get("completedAt"),
         resolution_notes=data.get("resolutionNotes") or data.get("resolution_notes"),
-        billable_amount=data.get("billableAmount") or data.get("billable_amount"),
+        billable_amount=(
+            data.get("billableAmount")
+            if data.get("billableAmount") is not None
+            else data.get("billable_amount")
+        ),
     )
 
 
@@ -243,7 +249,7 @@ class GaramaticService:
     def __init__(
         self,
         ticket_client: TicketClientPort,
-        odoo_client: OdooClientPort,
+        odoo_client: OdooClientPort | None,
         mq_publisher: MessageQueuePort | None,
     ) -> None:
         self._ticket = ticket_client
@@ -260,7 +266,7 @@ class GaramaticService:
                 with contextlib.suppress(Exception):
                     await client.close()
 
-    async def __aenter__(self) -> "GaramaticService":
+    async def __aenter__(self) -> GaramaticService:
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -294,6 +300,11 @@ class GaramaticService:
         status: Literal["open", "resolved", "closed"] | None = None,
         limit: int = 10,
     ) -> list[TicketSummary]:
+        if status is not None and status not in {"open", "resolved", "closed"}:
+            raise ValidationError(
+                f"Invalid status filter: {status!r}. "
+                "Must be one of: open, resolved, closed."
+            )
         rid = _generate_request_id()
         logger.info(
             "service.list_tickets",
@@ -325,6 +336,11 @@ class GaramaticService:
         _validate_email(customer_email)
         if not title or not title.strip():
             raise ValidationError("Title is required")
+        if priority not in {"low", "medium", "high", "urgent"}:
+            raise ValidationError(
+                f"Invalid priority: {priority!r}. "
+                "Must be one of: low, medium, high, urgent."
+            )
         rid = _generate_request_id()
         logger.info("service.create_ticket", title=title, customer=customer_email, request_id=rid)
         try:
@@ -377,7 +393,7 @@ class GaramaticService:
             raise _map_client_error(e, rid) from e
 
         invoice_result: InvoiceQueueResult | None = None
-        if billable_amount is not None:
+        if billable_amount is not None and billable_amount > 0:
             invoice_result = await self._queue_invoice(
                 ticket_id=ticket_id,
                 customer_email=ticket_data.get("customerId"),
@@ -401,6 +417,8 @@ class GaramaticService:
     async def get_invoice_status(self, ticket_id: str) -> InvoiceStatus:
         if not ticket_id or not ticket_id.strip():
             raise ValidationError("Ticket ID is required")
+        if self._odoo is None:
+            raise ServiceUnavailableError("Odoo bridge not configured")
         rid = _generate_request_id()
         logger.info("service.get_invoice_status", ticket_id=ticket_id, request_id=rid)
         try:
@@ -564,11 +582,13 @@ class GaramaticService:
         rid = _generate_request_id()
         logger.info("service.get_customer_context", email=customer_email, request_id=rid)
 
-        tickets_task = self._ticket.list_tickets(customer_id=customer_email, limit=50)
-        invoices_task = self._odoo.list_customer_invoices(customer_email)
-
         try:
-            tickets_data, invoices_data = await asyncio.gather(tickets_task, invoices_task)
+            tickets_data = await self._ticket.list_tickets(customer_id=customer_email, limit=50)
+            invoices_data = (
+                await self._odoo.list_customer_invoices(customer_email)
+                if self._odoo is not None
+                else []
+            )
         except Exception as e:
             logger.error(
                 "service.get_customer_context.failed",
@@ -615,14 +635,17 @@ class GaramaticService:
         except Exception as e:
             services["ticket_api"] = f"error: {str(e)[:50]}"
 
-        try:
-            await self._odoo.list_customer_invoices("test@example.com")
-            services["odoo_bridge"] = "connected"
-        except Exception as e:
-            if hasattr(e, "response") and getattr(e.response, "status_code", None) == 404:
+        if self._odoo is None:
+            services["odoo_bridge"] = "not_configured"
+        else:
+            try:
+                await self._odoo.list_customer_invoices("test@example.com")
                 services["odoo_bridge"] = "connected"
-            else:
-                services["odoo_bridge"] = f"error: {str(e)[:50]}"
+            except Exception as e:
+                if hasattr(e, "response") and getattr(e.response, "status_code", None) == 404:
+                    services["odoo_bridge"] = "connected"
+                else:
+                    services["odoo_bridge"] = f"error: {str(e)[:50]}"
 
         services["rabbitmq"] = "connected" if self._mq is not None else "not_initialized"
 
@@ -635,13 +658,13 @@ class GaramaticService:
     # Optimized default: customer session
     # ------------------------------------------------------------------
 
-    def for_customer(self, email: str) -> "CustomerSession":
+    def for_customer(self, email: str) -> CustomerSession:
         """Return a session scoped to a single customer.
 
         Usage:
-            async with service.for_customer("alice@example.com") as session:
-                tickets = await session.list_tickets()
-                result = await session.resolve_ticket("T-123", "Fixed", 150.0)
+            session = service.for_customer("alice@example.com")
+            tickets = await session.list_tickets()
+            result = await session.resolve_ticket("T-123", "Fixed", 150.0)
         """
         _validate_email(email)
         return CustomerSession(service=self, email=email)
@@ -716,10 +739,8 @@ class CustomerSession:
 
 def _map_client_error(e: Exception, rid: str) -> ServiceError:
     """Map client-level exceptions to service-level exceptions."""
-    import httpx
-
     # Pass through circuit breaker errors so FastAPI's global handler can catch them
-    if hasattr(e, "__module__") and "pybreaker" in str(e.__module__):
+    if "pybreaker" in getattr(type(e), "__module__", ""):
         raise e
 
     if isinstance(e, httpx.HTTPStatusError):
@@ -786,6 +807,14 @@ async def create_facade_service() -> tuple[AgenticService, GaramaticService]:
             odoo_base_url=config.odoo_bridge_url,
         )
     )
+
+    # Eager-connect MQ so GaramaticService can publish directly
+    try:
+        await facade.messages.connect()
+        facade._mq_connected = True
+        logger.info("service_factory.mq.connected")
+    except Exception as e:
+        logger.warning("service_factory.mq.unavailable", error=str(e))
 
     service = GaramaticService(
         ticket_client=facade.tickets,

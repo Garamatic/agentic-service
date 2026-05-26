@@ -1,6 +1,8 @@
 """HTTP clients for external service communication."""
 
+import asyncio
 import json
+from dataclasses import dataclass
 from typing import Any
 
 import aio_pika
@@ -212,10 +214,12 @@ class TicketClient:
 class OdooBridgeClient:
     """HTTP client for odoo-bridge API."""
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, timeout: float = 30.0):
+        if not base_url or not isinstance(base_url, str):
+            raise ValueError("OdooBridgeClient requires a valid base_url string")
         self.client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
-            timeout=30.0,
+            timeout=timeout,
             headers={"Accept": "application/json"},
         )
 
@@ -271,6 +275,8 @@ class RabbitMQPublisher:
         self._exchange_name = "event_exchange"
 
     async def connect(self) -> None:
+        if self.connection is not None:
+            return
         self.connection = await aio_pika.connect_robust(self.amqp_url)
         self.channel = await self.connection.channel()
         self.exchange = await self.channel.declare_exchange(
@@ -286,8 +292,8 @@ class RabbitMQPublisher:
         message: dict[str, Any],
         headers: dict[str, Any] | None = None,
     ) -> None:
-        if not self.exchange:
-            raise RuntimeError("Not connected to RabbitMQ")
+        if self.exchange is None:
+            await self.connect()
         body = json.dumps(message, default=str).encode()
         await self.exchange.publish(
             aio_pika.Message(
@@ -319,8 +325,6 @@ class RabbitMQPublisher:
 # ═════════════════════════════════════════════════════════════════════════════
 # Unified Service Facade — hides all transport detail behind a single entry point
 # ═════════════════════════════════════════════════════════════════════════════
-
-from dataclasses import dataclass
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,7 +382,7 @@ class AgenticService:
         rabbitmq_publisher: RabbitMQPublisher | None = None,
     ) -> None:
         """Initialize from config (production) or pre-built clients (tests)."""
-        if config is not None and any([ticket_client, odoo_client, rabbitmq_publisher]):
+        if config is not None and any((ticket_client, odoo_client, rabbitmq_publisher)):
             raise ValueError(
                 "Pass either 'config' OR pre-built clients, not both."
             )
@@ -390,7 +394,7 @@ class AgenticService:
                 timeout=config.ticket_timeout,
             )
             self._odoo = (
-                OdooBridgeClient(config.odoo_base_url)
+                OdooBridgeClient(config.odoo_base_url, timeout=config.odoo_timeout)
                 if config.odoo_base_url
                 else None
             )
@@ -408,6 +412,7 @@ class AgenticService:
             self._owns_clients = False
 
         self._odoo_ns = _OdooNamespace(self._odoo) if self._odoo else None
+        self._mq_lock = asyncio.Lock()
         self._mq_connected = False
 
     # ------------------------------------------------------------------
@@ -495,12 +500,14 @@ class AgenticService:
         Auto-connects on first publish if not already connected.
         """
         if not self._mq_connected:
-            try:
-                await self._mq.connect()
-                self._mq_connected = True
-            except Exception as e:
-                logger.warning("agentic_service.mq_connect_failed", error=str(e))
-                raise RuntimeError("RabbitMQ not connected and connection failed") from e
+            async with self._mq_lock:
+                if not self._mq_connected:
+                    try:
+                        await self._mq.connect()
+                        self._mq_connected = True
+                    except Exception as e:
+                        logger.warning("agentic_service.mq_connect_failed", error=str(e))
+                        raise RuntimeError("RabbitMQ not connected and connection failed") from e
 
         await self._mq.publish(routing_key=routing_key, message=message, headers=headers)
 
@@ -524,6 +531,8 @@ class AgenticService:
             except Exception as e:
                 logger.warning("agentic_service.close_failed", client=name, error=str(e))
                 errors.append(e)
+
+        self._mq_connected = False
 
         if errors:
             raise RuntimeError(f"Failed to close {len(errors)} transport(s)")

@@ -10,7 +10,7 @@ from typing import Any
 import structlog
 from fastmcp import Context, FastMCP
 
-from .clients import AgenticService, OdooBridgeClient, TicketClient
+from .clients import OdooBridgeClient, TicketClient
 from .config import get_settings
 from .service import (
     GaramaticService,
@@ -20,7 +20,6 @@ from .service import (
     _format_date,
     _validate_email,
     create_facade_service,
-    create_service,
 )
 
 logger = structlog.get_logger()
@@ -42,21 +41,13 @@ async def app_lifespan(server: "FastMCP"):
     logger.info("service.started")
 
     try:
-        yield {"facade": facade, "service": service}
+        yield {"service": service}
     finally:
         await facade.close()
         logger.info("service.stopped")
 
 
 mcp = FastMCP("garamatic", lifespan=app_lifespan)
-
-
-def _get_facade(ctx: Context) -> AgenticService:
-    """Extract facade from MCP lifespan context."""
-    facade = ctx.request_context.lifespan_context.get("facade")
-    if facade is None:
-        raise ServiceUnavailableError("Service facade not initialized")
-    return facade
 
 
 def _get_service(ctx: Context) -> GaramaticService:
@@ -466,6 +457,20 @@ async def get_customer_context(
 
 
 # ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
+
+async def _with_temp_service():
+    """Create a temporary GaramaticService for resources (no lifespan context)."""
+    config = get_settings()
+    return GaramaticService(
+        ticket_client=TicketClient(config.ticket_api_url),
+        odoo_client=OdooBridgeClient(config.odoo_bridge_url),
+        mq_publisher=None,
+    )
+
+
+# ------------------------------------------------------------------
 # MCP Resources
 # ------------------------------------------------------------------
 
@@ -475,38 +480,27 @@ async def get_ticket_resource(ticket_id: str) -> str:
     if not ticket_id or not ticket_id.strip():
         return "Error: Ticket ID is required"
 
-    # Resources don't have lifespan context; we can't reach the service here.
-    # Keep raw client access for resources as a transitional measure,
-    # or initialize a temporary service from config.
-    config = get_settings()
-    service = GaramaticService(
-        ticket_client=TicketClient(config.ticket_api_url),
-        odoo_client=OdooBridgeClient(config.odoo_bridge_url),
-        mq_publisher=None,
-    )
-    try:
-        ticket = await service.get_ticket(ticket_id)
-    except Exception as e:
-        return f"Error: Could not retrieve ticket {ticket_id}: {e}"
-    finally:
-        await service.close()
+    async with _with_temp_service() as service:
+        try:
+            ticket = await service.get_ticket(ticket_id)
+        except Exception as e:
+            return f"Error: Could not retrieve ticket {ticket_id}: {e}"
 
-    try:
-        invoice = await service.get_invoice_status(ticket_id)
-    except Exception:
-        invoice = None
+        try:
+            invoice = await service.get_invoice_status(ticket_id)
+        except Exception:
+            invoice = None
 
     invoice_info = ""
     if invoice and invoice.status != "not_found":
         amount = invoice.amount or 0
-        invoice_info = f"""
-
-## Invoice
-- ID: {invoice.invoice_id or 'N/A'}
-- Status: {invoice.status.upper()}
-- Amount: €{amount:.2f}
-- Paid At: {_format_date(invoice.paid_at)}
-"""
+        invoice_info = (
+            f"\n\n## Invoice\n"
+            f"- ID: {invoice.invoice_id or 'N/A'}\n"
+            f"- Status: {invoice.status.upper()}\n"
+            f"- Amount: €{amount:.2f}\n"
+            f"- Paid At: {_format_date(invoice.paid_at)}"
+        )
 
     return f"""
 # Ticket {ticket_id}
@@ -514,8 +508,7 @@ async def get_ticket_resource(ticket_id: str) -> str:
 ## Details
 - Status: {ticket.status.upper()}
 - Title: {ticket.title}
-- Customer ID: {ticket.customer_email or 'Unknown'}
-- Priority Score: {ticket.customer_name or 'N/A'}
+- Customer: {ticket.customer_name or 'Unknown'} ({ticket.customer_email or 'Unknown'})
 - Created: {_format_date(ticket.created_at)}
 - Resolved: {_format_date(ticket.resolved_at)}
 
@@ -530,20 +523,12 @@ async def get_ticket_resource(ticket_id: str) -> str:
 @mcp.resource("system://health")
 async def get_health() -> str:
     """MCP Resource: System health status."""
-    config = get_settings()
-    service = GaramaticService(
-        ticket_client=TicketClient(config.ticket_api_url),
-        odoo_client=OdooBridgeClient(config.odoo_bridge_url),
-        mq_publisher=None,
-    )
-    try:
-        health = await service.health_check()
-    except Exception as e:
-        health_json = {"status": "degraded", "services": {"error": str(e)}}
-    else:
-        health_json = {"status": health.status, "services": health.services}
-    finally:
-        await service.close()
+    async with _with_temp_service() as service:
+        try:
+            health = await service.health_check()
+            health_json = {"status": health.status, "services": health.services}
+        except Exception as e:
+            health_json = {"status": "degraded", "services": {"error": str(e)}}
 
     return json.dumps(health_json, indent=2)
 
@@ -554,20 +539,13 @@ async def get_customer_resource(email: str) -> str:
     try:
         _validate_email(email)
     except ValidationError as e:
-        return f"Error: Invalid email: {e}"
+        return f"Error: {e}"
 
-    config = get_settings()
-    service = GaramaticService(
-        ticket_client=TicketClient(config.ticket_api_url),
-        odoo_client=OdooBridgeClient(config.odoo_bridge_url),
-        mq_publisher=None,
-    )
-    try:
-        context = await service.get_customer_context(email)
-    except Exception as e:
-        return f"Error: Could not retrieve customer context: {e}"
-    finally:
-        await service.close()
+    async with _with_temp_service() as service:
+        try:
+            context = await service.get_customer_context(email)
+        except Exception as e:
+            return f"Error: Could not retrieve customer context: {e}"
 
     tickets_section = "\n".join(
         f"- [{t.status.upper()}] {t.title} ({_format_date(t.created_at)})"
