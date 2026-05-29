@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import pybreaker
 import structlog
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
@@ -93,6 +94,15 @@ app = FastAPI(
     description="REST API for ticket, invoice, and email operations",
     version="0.2.0",
     lifespan=lifespan
+)
+
+# Allow cross-origin requests from the Ticket Masala web UI
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
