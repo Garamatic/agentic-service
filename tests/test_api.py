@@ -185,14 +185,15 @@ class TestInvoicesEndpoints:
         assert data["amount"] == 150.00
 
     async def test_get_invoice_not_found(self, api_client, mock_odoo_client):
-        """Should return not_found when no invoice exists."""
+        """Should return 404 when no invoice exists."""
         mock_odoo_client.get_invoice_status.return_value = None
 
         response = await api_client.get("/invoices/by-ticket/T-NOINVOICE")
 
-        assert response.status_code == 200
+        assert response.status_code == 404
         data = response.json()
-        assert data["status"] == "not_found"
+        assert "detail" in data
+        assert data["detail"]["error"] == "Invoice not found for this ticket"
 
     async def test_create_invoice_success(
         self, api_client, mock_ticket_client, mock_mq_publisher, mock_ticket_data

@@ -10,6 +10,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
+import html
+
 import structlog
 
 logger = structlog.get_logger()
@@ -121,7 +123,7 @@ class EventView:
         aliases: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         self._event = dict(event)
-        self._aliases = {**(aliases or {}), **self._DEFAULT_ALIASES}
+        self._aliases = {**self._DEFAULT_ALIASES, **(aliases or {})}
 
     def get(self, name: str, default: Any = None) -> Any:
         """Resolve a canonical field name via registered aliases."""
@@ -193,9 +195,9 @@ class NotificationRegistry:
 # ------------------------------------------------------------------
 
 def _payment_received_template(e: EventView) -> tuple[str, str]:
-    inv = e.str("invoice_id", "N/A")
+    inv = html.escape(e.str("invoice_id", "N/A") or "")
     amt = e.money("amount")
-    tid = e.str("ticket_id", "N/A")
+    tid = html.escape(e.str("ticket_id", "N/A") or "")
     subject = f"Payment Received - Invoice #{inv}"
     body = (
         f"<h2>Thank you for your payment!</h2>\n"
@@ -207,9 +209,9 @@ def _payment_received_template(e: EventView) -> tuple[str, str]:
 
 
 def _invoice_created_template(e: EventView) -> tuple[str, str]:
-    inv = e.str("invoice_id", "N/A")
+    inv = html.escape(e.str("invoice_id", "N/A") or "")
     amt = e.money("amount")
-    tid = e.str("ticket_id", "N/A")
+    tid = html.escape(e.str("ticket_id", "N/A") or "")
     subject = f"New Invoice #{inv} - €{amt:.2f}"
     body = (
         f"<h2>New Invoice Available</h2>\n"
@@ -222,7 +224,7 @@ def _invoice_created_template(e: EventView) -> tuple[str, str]:
 
 
 def _invoice_overdue_template(e: EventView) -> tuple[str, str]:
-    inv = e.str("invoice_id", "N/A")
+    inv = html.escape(e.str("invoice_id", "N/A") or "")
     amt = e.money("amount")
     days = int(e.get("days_overdue", 0))
     day_word = "day" if days == 1 else "days"
@@ -236,9 +238,9 @@ def _invoice_overdue_template(e: EventView) -> tuple[str, str]:
 
 
 def _ticket_resolved_template(e: EventView) -> tuple[str, str]:
-    tid = e.str("ticket_id", "N/A")
-    name = e.str("customer_name", "there")
-    notes = e.str("resolution_notes", "Your issue has been resolved.")
+    tid = html.escape(e.str("ticket_id", "N/A") or "")
+    name = html.escape(e.str("customer_name", "there") or "")
+    notes = html.escape(e.str("resolution_notes", "Your issue has been resolved.") or "")
     subject = f"Ticket #{tid} Resolved"
     body = (
         f"<h2>Your ticket has been resolved</h2>\n"
@@ -251,9 +253,9 @@ def _ticket_resolved_template(e: EventView) -> tuple[str, str]:
 
 
 def _ticket_created_template(e: EventView) -> tuple[str, str]:
-    tid = e.str("ticket_id", "N/A")
-    title = e.str("title", "Untitled")
-    name = e.str("customer_name", "Customer")
+    tid = html.escape(e.str("ticket_id", "N/A") or "")
+    title = html.escape(e.str("title", "Untitled") or "")
+    name = html.escape(e.str("customer_name", "Customer") or "")
     subject = f"Ticket #{tid} Created - {title}"
     body = (
         f"<h2>Your Support Ticket</h2>\n"
@@ -267,10 +269,10 @@ def _ticket_created_template(e: EventView) -> tuple[str, str]:
 
 
 def _ticket_escalated_template(e: EventView) -> tuple[str, str]:
-    tid = e.str("ticket_id", "N/A")
-    reason = e.str("reason", "Unknown")
-    cid = e.str("customer_id") or e.str("customerId", "N/A")
-    title = e.str("title", "Untitled")
+    tid = html.escape(e.str("ticket_id", "N/A") or "")
+    reason = html.escape(e.str("reason", "Unknown") or "")
+    cid = html.escape(e.str("customer_id") or e.str("customerId", "N/A") or "")
+    title = html.escape(e.str("title", "Untitled") or "")
     subject = f"URGENT: Ticket #{tid} Escalated"
     body = (
         f"<h2>Ticket Escalation Alert</h2>\n"

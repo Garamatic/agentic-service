@@ -184,31 +184,31 @@ Please confirm: "approve {approval_id}" or "reject {approval_id}"
 
 # Wrap async functions as LangChain tools
 search_tickets_tool = StructuredTool.from_function(
-    func=search_tickets_by_customer,
+    coroutine=search_tickets_by_customer,
     name="search_tickets_by_customer",
     description="Search for tickets by customer email address."
 )
 
 get_ticket_details_tool = StructuredTool.from_function(
-    func=get_ticket_details,
+    coroutine=get_ticket_details,
     name="get_ticket_details",
     description="Get detailed information about a specific ticket."
 )
 
 get_customer_summary_tool = StructuredTool.from_function(
-    func=get_customer_summary,
+    coroutine=get_customer_summary,
     name="get_customer_summary",
     description="Get comprehensive customer context including tickets and invoices."
 )
 
 resolve_ticket_tool = StructuredTool.from_function(
-    func=resolve_ticket_with_invoice,
+    coroutine=resolve_ticket_with_invoice,
     name="resolve_ticket_with_invoice",
     description="Resolve a ticket AND create an invoice in one action."
 )
 
 request_approval_tool = StructuredTool.from_function(
-    func=request_human_approval,
+    coroutine=request_human_approval,
     name="request_human_approval",
     description="Request human approval for sensitive actions."
 )
@@ -417,7 +417,9 @@ class GaramaticAgent:
 
         if self._owns_checkpointer and self._checkpointer is not None:
             with contextlib.suppress(Exception):
-                if getattr(self._checkpointer, "conn", None):
+                if hasattr(self._checkpointer, "close"):
+                    await self._checkpointer.close()
+                elif getattr(self._checkpointer, "conn", None):
                     await self._checkpointer.conn.close()
             self._checkpointer = None
 

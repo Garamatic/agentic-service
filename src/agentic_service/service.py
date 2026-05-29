@@ -11,7 +11,7 @@ import contextlib
 import typing
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 import httpx
@@ -494,7 +494,7 @@ class GaramaticService:
             "customer_name": customer_name or "Customer",
             "amount": amount,
             "description": description,
-            "requested_at": datetime.now().isoformat(),
+            "requested_at": datetime.now(timezone.utc).isoformat(),
         }
 
         try:
@@ -738,7 +738,11 @@ class CustomerSession:
 
 
 def _map_client_error(e: Exception, rid: str) -> ServiceError:
-    """Map client-level exceptions to service-level exceptions."""
+    """Map client-level exceptions to service-level exceptions.
+
+    Raises pybreaker errors directly so FastAPI's global handler can catch them.
+    Returns ServiceError subclasses for everything else.
+    """
     # Pass through circuit breaker errors so FastAPI's global handler can catch them
     if "pybreaker" in getattr(type(e), "__module__", ""):
         raise e

@@ -463,9 +463,14 @@ async def get_customer_context(
 async def _with_temp_service():
     """Create a temporary GaramaticService for resources (no lifespan context)."""
     config = get_settings()
+    odoo_client = (
+        OdooBridgeClient(config.odoo_bridge_url)
+        if config.odoo_bridge_url
+        else None
+    )
     return GaramaticService(
         ticket_client=TicketClient(config.ticket_api_url),
-        odoo_client=OdooBridgeClient(config.odoo_bridge_url),
+        odoo_client=odoo_client,
         mq_publisher=None,
     )
 

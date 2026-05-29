@@ -68,13 +68,13 @@ class TicketClient:
             timeout=timeout,
         )
 
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception(_is_retryable_error),
         reraise=True,
     )
-    @ticket_api_breaker
     async def get_ticket(self, ticket_id: str) -> dict[str, Any]:
         """Fetch a ticket by ID.
 
@@ -88,13 +88,13 @@ class TicketClient:
         response.raise_for_status()
         return response.json()
 
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception(_is_retryable_error),
         reraise=True,
     )
-    @ticket_api_breaker
     async def list_tickets(
         self,
         customer_id: str | None = None,
@@ -126,13 +126,13 @@ class TicketClient:
         response.raise_for_status()
         return response.json()
 
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception(_is_retryable_error),
         reraise=True,
     )
-    @ticket_api_breaker
     async def create_ticket(
         self,
         title: str,
@@ -162,13 +162,13 @@ class TicketClient:
         response.raise_for_status()
         return response.json()
 
+    @ticket_api_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception(_is_retryable_error),
         reraise=True,
     )
-    @ticket_api_breaker
     async def resolve_ticket(
         self,
         ticket_id: str,
@@ -223,13 +223,13 @@ class OdooBridgeClient:
             headers={"Accept": "application/json"},
         )
 
+    @odoo_bridge_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception(_is_retryable_error),
         reraise=True,
     )
-    @odoo_bridge_breaker
     async def get_invoice_status(self, ticket_id: str) -> dict[str, Any] | None:
         response = await self.client.get(f"/api/invoices/by-ticket/{ticket_id}")
         if response.status_code == 404:
@@ -237,13 +237,13 @@ class OdooBridgeClient:
         response.raise_for_status()
         return response.json()
 
+    @odoo_bridge_breaker
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=1, max=10),
         retry=retry_if_exception(_is_retryable_error),
         reraise=True,
     )
-    @odoo_bridge_breaker
     async def list_customer_invoices(self, customer_email: str) -> list[dict[str, Any]]:
         response = await self.client.get(
             "/api/invoices",

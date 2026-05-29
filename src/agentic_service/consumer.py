@@ -35,8 +35,10 @@ class EventConsumer:
         service: GaramaticService,
         amqp_url: str,
         mq_publisher: RabbitMQPublisher | None = None,
+        owns_service: bool = False,
     ):
         self._service = service
+        self._owns_service = owns_service
         self.amqp_url = amqp_url
 
         # Build notification composer with narrow ports
@@ -52,6 +54,7 @@ class EventConsumer:
 
         self.connection: aio_pika.RobustConnection | None = None
         self.channel: aio_pika.Channel | None = None
+        self._exchange: aio_pika.Exchange | None = None
         self.queue: aio_pika.Queue | None = None
 
     async def connect(self) -> aio_pika.Queue:
@@ -124,7 +127,9 @@ class EventConsumer:
 
             logger.info("consumer.received", routing_key=routing_key, retry_count=retry_count)
 
-            result = await self._composer.notify(routing_key, event_data)
+            # Strip 'event.' prefix so templates match (e.g., event.payment.received -> payment.received)
+            normalized_key = routing_key.removeprefix("event.")
+            result = await self._composer.notify(normalized_key, event_data)
             logger.info(
                 "notification.result",
                 routing_key=result.routing_key,
@@ -195,7 +200,10 @@ class EventConsumer:
 
     async def close(self):
         """Cleanup resources."""
-        for resource in (self._service, self.connection):
+        resources = [self.connection]
+        if self._owns_service:
+            resources.append(self._service)
+        for resource in resources:
             if resource:
                 with contextlib.suppress(Exception):
                     await resource.close()
@@ -218,6 +226,7 @@ async def main_async():
     consumer = EventConsumer(
         service=service,
         amqp_url=config.rabbitmq_url,
+        owns_service=True,
     )
 
     # Set up signal handlers for graceful shutdown

@@ -38,7 +38,7 @@ def create_error_response(
         "request_id": request_id
     }
     if is_development and internal_error:
-        response["detail"] = internal_error
+        response["debug"] = internal_error
     return response
 
 
@@ -334,7 +334,10 @@ async def api_get_invoice(ticket_id: str):
         ) from None
 
     if invoice.status == "not_found":
-        return {"ticket_id": ticket_id, "status": "not_found"}
+        raise HTTPException(
+            status_code=404,
+            detail=create_error_response(rid, "Invoice not found for this ticket")
+        )
 
     return {
         "ticket_id": ticket_id,
