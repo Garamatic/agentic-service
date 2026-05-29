@@ -70,7 +70,7 @@ class EventConsumer:
         )
 
         dlx_exchange = await self.channel.declare_exchange(
-            "garamatic.events.dlx",
+            "event_exchange.dlx",
             aio_pika.ExchangeType.TOPIC,
             durable=True
         )
@@ -85,7 +85,7 @@ class EventConsumer:
             "agentic_consumer",
             durable=True,
             arguments={
-                "x-dead-letter-exchange": "garamatic.events.dlx",
+                "x-dead-letter-exchange": "event_exchange.dlx",
                 "x-dead-letter-routing-key": "agentic_consumer.dlq"
             }
         )
@@ -114,20 +114,16 @@ class EventConsumer:
         Processing failures are requeued with a retry counter; after MAX_RETRIES
         the message is dead-lettered to prevent infinite poison-pill loops.
         """
-        retry_count = 0
-        if message.headers and "x-retry-count" in message.headers:
-            retry_count = int(message.headers["x-retry-count"])
+        retry_count = self._get_retry_count(message)
 
         try:
             body = json.loads(message.body)
             routing_key = message.routing_key
 
-            # Check for integration-contract envelope, fallback to flat object
             event_data = body.get("data") if "data" in body else body
 
             logger.info("consumer.received", routing_key=routing_key, retry_count=retry_count)
 
-            # Strip 'event.' prefix so templates match (e.g., event.payment.received -> payment.received)
             normalized_key = routing_key.removeprefix("event.")
             result = await self._composer.notify(normalized_key, event_data)
             logger.info(
@@ -139,51 +135,57 @@ class EventConsumer:
             await message.ack()
         except json.JSONDecodeError as e:
             logger.error("consumer.invalid_json", error=str(e))
-            await message.ack()  # Bad JSON won't get better with retries
+            await message.ack()
         except Exception as e:
             logger.error("consumer.message_failed", error=str(e), retry_count=retry_count)
-            if retry_count >= self.MAX_RETRIES:
-                await message.reject(requeue=False)
-                logger.error(
-                    "consumer.dead_lettered",
-                    routing_key=message.routing_key,
-                    retry_count=retry_count,
-                    max_retries=self.MAX_RETRIES,
-                )
-                return
+            await self._handle_retry(message, retry_count)
 
-            # Republish with incremented retry count so the next delivery
-            # can be tracked. Republish first, then ack original. If republish
-            # fails, reject the original so it goes to DLQ instead of being lost.
-            new_headers = dict(message.headers or {})
-            new_headers["x-retry-count"] = retry_count + 1
-            try:
-                await self._exchange.publish(
-                    aio_pika.Message(
-                        body=message.body,
-                        headers=new_headers,
-                        content_type=message.content_type,
-                        delivery_mode=message.delivery_mode,
-                        correlation_id=message.correlation_id,
-                        message_id=message.message_id,
-                    ),
-                    routing_key=message.routing_key,
-                )
-                await message.ack()
-                logger.warning(
-                    "consumer.requeued",
-                    routing_key=message.routing_key,
-                    retry_count=retry_count + 1,
-                    max_retries=self.MAX_RETRIES,
-                )
-            except Exception as repub_ex:
-                logger.error(
-                    "consumer.republish_failed",
-                    routing_key=message.routing_key,
-                    error=str(repub_ex),
-                    retry_count=retry_count,
-                )
-                await message.reject(requeue=False)
+    def _get_retry_count(self, message: aio_pika.IncomingMessage) -> int:
+        if message.headers and "x-retry-count" in message.headers:
+            return int(message.headers["x-retry-count"])
+        return 0
+
+    async def _handle_retry(self, message: aio_pika.IncomingMessage, retry_count: int):
+        if retry_count >= self.MAX_RETRIES:
+            await message.reject(requeue=False)
+            logger.error(
+                "consumer.dead_lettered",
+                routing_key=message.routing_key,
+                retry_count=retry_count,
+                max_retries=self.MAX_RETRIES,
+            )
+            return
+
+        new_headers = dict(message.headers or {})
+        new_headers["x-retry-count"] = retry_count + 1
+
+        try:
+            await self._exchange.publish(
+                aio_pika.Message(
+                    body=message.body,
+                    headers=new_headers,
+                    content_type=message.content_type,
+                    delivery_mode=message.delivery_mode,
+                    correlation_id=message.correlation_id,
+                    message_id=message.message_id,
+                ),
+                routing_key=message.routing_key,
+            )
+            await message.ack()
+            logger.warning(
+                "consumer.requeued",
+                routing_key=message.routing_key,
+                retry_count=retry_count + 1,
+                max_retries=self.MAX_RETRIES,
+            )
+        except Exception as repub_ex:
+            logger.error(
+                "consumer.republish_failed",
+                routing_key=message.routing_key,
+                error=str(repub_ex),
+                retry_count=retry_count,
+            )
+            await message.reject(requeue=False)
 
     async def run(self):
         """Main consumer loop."""
