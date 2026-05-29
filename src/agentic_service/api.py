@@ -460,6 +460,54 @@ async def api_get_customer_context(email: str):
     }
 
 
+# ------------------------------------------------------------------
+# Agent chat endpoint
+# ------------------------------------------------------------------
+
+class ChatRequest(BaseModel):
+    """Request to chat with the AI agent."""
+    message: str = Field(..., min_length=1, max_length=2000)
+    thread_id: str = Field(default="web-session")
+
+
+@app.post("/agent/chat")
+async def api_agent_chat(request: ChatRequest):
+    """Chat with the Garamatic AI agent.
+
+    The agent can answer questions about tickets, customers, and invoices,
+    and can perform actions like resolving tickets or creating invoices.
+    """
+    import os
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(
+            status_code=503,
+            detail={"error": "Agent unavailable", "message": "OPENAI_API_KEY not configured"}
+        )
+
+    from .agent import GaramaticAgent
+
+    rid = _generate_request_id()
+    logger.info("api.agent_chat", thread_id=request.thread_id, request_id=rid)
+
+    try:
+        agent = GaramaticAgent(thread_id=request.thread_id)
+        response = await agent.process(request.message)
+    except Exception as e:
+        logger.error("api.agent_chat_failed", error=str(e), request_id=rid)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "Agent failed", "message": str(e)}
+        ) from None
+    finally:
+        await agent.close()
+
+    return {
+        "thread_id": request.thread_id,
+        "response": response,
+        "request_id": rid,
+    }
+
+
 def main():
     """Run the REST API server."""
     import uvicorn
