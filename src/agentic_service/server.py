@@ -581,7 +581,13 @@ async def get_customer_resource(email: str) -> str:
 
 def main():
     """Run the MCP server."""
-    mcp.run()
+    # Use SSE transport for Docker; stdio for local CLI usage
+    import os
+    transport = os.environ.get("MCP_TRANSPORT", "sse")
+    if transport == "sse":
+        mcp.run(transport="sse", host="0.0.0.0", port=3001)
+    else:
+        mcp.run(transport=transport)
 
 
 if __name__ == "__main__":
