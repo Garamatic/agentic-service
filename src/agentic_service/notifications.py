@@ -195,9 +195,9 @@ class NotificationRegistry:
 # ------------------------------------------------------------------
 
 def _payment_received_template(e: EventView) -> tuple[str, str]:
-    inv = html.escape(e.str("invoice_id", "N/A") or "")
+    inv = html.escape(e.str("invoice_id", "N/A"))
     amt = e.money("amount")
-    tid = html.escape(e.str("ticket_id", "N/A") or "")
+    tid = html.escape(e.str("ticket_id", "N/A"))
     subject = f"Payment Received - Invoice #{inv}"
     body = (
         f"<h2>Thank you for your payment!</h2>\n"
@@ -209,9 +209,9 @@ def _payment_received_template(e: EventView) -> tuple[str, str]:
 
 
 def _invoice_created_template(e: EventView) -> tuple[str, str]:
-    inv = html.escape(e.str("invoice_id", "N/A") or "")
+    inv = html.escape(e.str("invoice_id", "N/A"))
     amt = e.money("amount")
-    tid = html.escape(e.str("ticket_id", "N/A") or "")
+    tid = html.escape(e.str("ticket_id", "N/A"))
     subject = f"New Invoice #{inv} - €{amt:.2f}"
     body = (
         f"<h2>New Invoice Available</h2>\n"
@@ -224,7 +224,7 @@ def _invoice_created_template(e: EventView) -> tuple[str, str]:
 
 
 def _invoice_overdue_template(e: EventView) -> tuple[str, str]:
-    inv = html.escape(e.str("invoice_id", "N/A") or "")
+    inv = html.escape(e.str("invoice_id", "N/A"))
     amt = e.money("amount")
     days = int(e.get("days_overdue", 0))
     day_word = "day" if days == 1 else "days"
@@ -238,9 +238,9 @@ def _invoice_overdue_template(e: EventView) -> tuple[str, str]:
 
 
 def _ticket_resolved_template(e: EventView) -> tuple[str, str]:
-    tid = html.escape(e.str("ticket_id", "N/A") or "")
-    name = html.escape(e.str("customer_name", "there") or "")
-    notes = html.escape(e.str("resolution_notes", "Your issue has been resolved.") or "")
+    tid = html.escape(e.str("ticket_id", "N/A"))
+    name = html.escape(e.str("customer_name", "there"))
+    notes = html.escape(e.str("resolution_notes", "Your issue has been resolved."))
     subject = f"Ticket #{tid} Resolved"
     body = (
         f"<h2>Your ticket has been resolved</h2>\n"
@@ -253,9 +253,9 @@ def _ticket_resolved_template(e: EventView) -> tuple[str, str]:
 
 
 def _ticket_created_template(e: EventView) -> tuple[str, str]:
-    tid = html.escape(e.str("ticket_id", "N/A") or "")
-    title = html.escape(e.str("title", "Untitled") or "")
-    name = html.escape(e.str("customer_name", "Customer") or "")
+    tid = html.escape(e.str("ticket_id", "N/A"))
+    title = html.escape(e.str("title", "Untitled"))
+    name = html.escape(e.str("customer_name", "Customer"))
     subject = f"Ticket #{tid} Created - {title}"
     body = (
         f"<h2>Your Support Ticket</h2>\n"
@@ -269,10 +269,10 @@ def _ticket_created_template(e: EventView) -> tuple[str, str]:
 
 
 def _ticket_escalated_template(e: EventView) -> tuple[str, str]:
-    tid = html.escape(e.str("ticket_id", "N/A") or "")
-    reason = html.escape(e.str("reason", "Unknown") or "")
-    cid = html.escape(e.str("customer_id") or e.str("customerId", "N/A") or "")
-    title = html.escape(e.str("title", "Untitled") or "")
+    tid = html.escape(e.str("ticket_id", "N/A"))
+    reason = html.escape(e.str("reason", "Unknown"))
+    cid = html.escape(e.str("customer_id") or e.str("customerId", "N/A"))
+    title = html.escape(e.str("title", "Untitled"))
     subject = f"URGENT: Ticket #{tid} Escalated"
     body = (
         f"<h2>Ticket Escalation Alert</h2>\n"
@@ -281,6 +281,21 @@ def _ticket_escalated_template(e: EventView) -> tuple[str, str]:
         f"<p><strong>Customer ID:</strong> {cid}</p>\n"
         f"<p><strong>Title:</strong> {title}</p>\n"
         f"<p>Please review immediately.</p>"
+    )
+    return subject, body
+
+
+def _ticket_assigned_template(e: EventView) -> tuple[str, str]:
+    tid = html.escape(e.str("ticket_id", "N/A"))
+    name = html.escape(e.str("customer_name", "there"))
+    assigned_to = html.escape(e.str("assigned_to", "an agent"))
+    subject = f"Ticket #{tid} Assigned"
+    body = (
+        f"<h2>Your ticket has been assigned</h2>\n"
+        f"<p>Hi {name},</p>\n"
+        f"<p>Ticket #{tid} has been assigned to {assigned_to}.</p>\n"
+        f"<p>They will review your request and respond within 24 hours.</p>\n"
+        f"<p>Best regards,<br>Garamatic Support Team</p>"
     )
     return subject, body
 
@@ -339,6 +354,12 @@ def _default_templates() -> list[NotificationTemplate]:
             render=_ticket_created_template,
         ),
         NotificationTemplate(
+            routing_key="ticket.assigned",
+            recipient=lambda e: e.str("customer_email"),
+            sender_key="support",
+            render=_ticket_assigned_template,
+        ),
+        NotificationTemplate(
             routing_key="ticket.escalated",
             recipient=lambda _e: "manager@garamatic.com",
             sender_key="system",
@@ -361,6 +382,7 @@ class StaticSenderDirectory:
         "invoice.overdue": "billing",
         "ticket.resolved": "support",
         "ticket.created": "support",
+        "ticket.assigned": "support",
         "ticket.escalated": "system",
     }
 
@@ -374,11 +396,7 @@ class StaticSenderDirectory:
 
     def for_routing_key(self, routing_key: str) -> SenderIdentity:
         sender_key = self._KEY_MAP.get(routing_key, "default")
-        return (
-            self._identities.get(sender_key)
-            or self._identities.get("default")
-            or next(iter(self._identities.values()))
-        )
+        return self._identities.get(sender_key) or self._identities["default"]
 
 
 # ------------------------------------------------------------------
@@ -472,9 +490,6 @@ class NotificationComposer:
             routing_key=routing_key,
         )
 
-        # Delivery
-        send_result: EmailSendResult | None = None
-        failed_message = ""
         try:
             send_result = await self._email_sender.send_email(email)
         except Exception as exc:
@@ -484,16 +499,22 @@ class NotificationComposer:
                 recipient=recipient,
                 error=str(exc),
             )
-            failed_message = f"Email delivery failed: {exc}"
+            return NotificationResult(
+                status="failed",
+                routing_key=routing_key,
+                reason="delivery_unavailable",
+                email=email,
+                message=f"Email delivery failed: {exc}",
+            )
 
-        if send_result is None or send_result.status == "failed":
+        if send_result.status == "failed":
             return NotificationResult(
                 status="failed",
                 routing_key=routing_key,
                 reason="delivery_unavailable",
                 email=email,
                 send_result=send_result,
-                message=failed_message or (send_result.message if send_result else "Email delivery failed"),
+                message=send_result.message,
             )
 
         logger.info(

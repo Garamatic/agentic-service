@@ -41,7 +41,6 @@ class EventConsumer:
         self._owns_service = owns_service
         self.amqp_url = amqp_url
 
-        # Build notification composer with narrow ports
         email_sender = (
             MessageQueueEmailSender(mq_publisher)
             if mq_publisher is not None
@@ -97,6 +96,7 @@ class EventConsumer:
             "event.ticket.resolved",
             "event.ticket.escalated",
             "event.ticket.created",
+            "event.ticket.assigned",
         ]
 
         for routing_key in bindings:
@@ -112,14 +112,13 @@ class EventConsumer:
 
         Bad JSON is acked (won't get better with retries).
         Processing failures are requeued with a retry counter; after MAX_RETRIES
-        the message is dead-lettered to prevent infinite poison-pill loops.
+        the message is dead-lettered.
         """
         retry_count = self._get_retry_count(message)
 
         try:
             body = json.loads(message.body)
             routing_key = message.routing_key
-
             event_data = body.get("data") if "data" in body else body
 
             logger.info("consumer.received", routing_key=routing_key, retry_count=retry_count)
@@ -201,14 +200,16 @@ class EventConsumer:
                 await self.handle_message(message)
 
     async def close(self):
-        """Cleanup resources."""
-        resources = [self.connection]
-        if self._owns_service:
-            resources.append(self._service)
-        for resource in resources:
-            if resource:
-                with contextlib.suppress(Exception):
-                    await resource.close()
+        if self.connection:
+            try:
+                await self.connection.close()
+            except Exception:
+                pass
+        if self._owns_service and self._service:
+            try:
+                await self._service.close()
+            except Exception:
+                pass
 
 
 def signal_handler(signum, frame):
