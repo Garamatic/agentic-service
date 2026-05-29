@@ -489,6 +489,7 @@ async def api_agent_chat(request: ChatRequest):
     rid = _generate_request_id()
     logger.info("api.agent_chat", thread_id=request.thread_id, request_id=rid)
 
+    agent = None
     try:
         agent = GaramaticAgent(thread_id=request.thread_id)
         response = await agent.process(request.message)
@@ -499,7 +500,8 @@ async def api_agent_chat(request: ChatRequest):
             detail={"error": "Agent failed", "message": str(e)}
         ) from None
     finally:
-        await agent.close()
+        if agent is not None:
+            await agent.close()
 
     return {
         "thread_id": request.thread_id,
