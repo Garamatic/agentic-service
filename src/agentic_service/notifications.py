@@ -6,11 +6,10 @@ sender identity selection, and graceful degradation behind a single boundary.
 
 from __future__ import annotations
 
+import html
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
-
-import html
 
 import structlog
 
@@ -75,6 +74,7 @@ class TicketSnapshot:
 # Ports
 # ------------------------------------------------------------------
 
+
 @runtime_checkable
 class EmailSender(Protocol):
     async def send_email(self, message: EmailMessage) -> EmailSendResult: ...
@@ -93,6 +93,7 @@ class SenderDirectory(Protocol):
 # ------------------------------------------------------------------
 # EventView — normalized read facade over raw events
 # ------------------------------------------------------------------
+
 
 class EventView:
     """Read-normalized view over raw event payloads.
@@ -132,7 +133,7 @@ class EventView:
                 return self._event[key]
         return default
 
-    def str(self, name: str, default: str | None = None) -> str | None:
+    def text(self, name: str, default: str | None = None) -> str | None:
         val = self.get(name, default)
         return str(val) if val is not None else default
 
@@ -174,6 +175,7 @@ class NotificationTemplate:
 # Registry
 # ------------------------------------------------------------------
 
+
 class NotificationRegistry:
     """Template registry and lookup boundary."""
 
@@ -194,10 +196,11 @@ class NotificationRegistry:
 # Default templates (converted from old workflow renderers)
 # ------------------------------------------------------------------
 
+
 def _payment_received_template(e: EventView) -> tuple[str, str]:
-    inv = html.escape(e.str("invoice_id", "N/A"))
+    inv = html.escape(e.text("invoice_id", "N/A") or "N/A")
     amt = e.money("amount")
-    tid = html.escape(e.str("ticket_id", "N/A"))
+    tid = html.escape(e.text("ticket_id", "N/A") or "N/A")
     subject = f"Payment Received - Invoice #{inv}"
     body = (
         f"<h2>Thank you for your payment!</h2>\n"
@@ -209,9 +212,9 @@ def _payment_received_template(e: EventView) -> tuple[str, str]:
 
 
 def _invoice_created_template(e: EventView) -> tuple[str, str]:
-    inv = html.escape(e.str("invoice_id", "N/A"))
+    inv = html.escape(e.text("invoice_id", "N/A") or "N/A")
     amt = e.money("amount")
-    tid = html.escape(e.str("ticket_id", "N/A"))
+    tid = html.escape(e.text("ticket_id", "N/A") or "N/A")
     subject = f"New Invoice #{inv} - €{amt:.2f}"
     body = (
         f"<h2>New Invoice Available</h2>\n"
@@ -224,7 +227,7 @@ def _invoice_created_template(e: EventView) -> tuple[str, str]:
 
 
 def _invoice_overdue_template(e: EventView) -> tuple[str, str]:
-    inv = html.escape(e.str("invoice_id", "N/A"))
+    inv = html.escape(e.text("invoice_id", "N/A") or "N/A")
     amt = e.money("amount")
     days = int(e.get("days_overdue", 0))
     day_word = "day" if days == 1 else "days"
@@ -238,9 +241,12 @@ def _invoice_overdue_template(e: EventView) -> tuple[str, str]:
 
 
 def _ticket_resolved_template(e: EventView) -> tuple[str, str]:
-    tid = html.escape(e.str("ticket_id", "N/A"))
-    name = html.escape(e.str("customer_name", "there"))
-    notes = html.escape(e.str("resolution_notes", "Your issue has been resolved."))
+    tid = html.escape(e.text("ticket_id", "N/A") or "N/A")
+    name = html.escape(e.text("customer_name", "there") or "there")
+    notes = html.escape(
+        e.text("resolution_notes", "Your issue has been resolved.")
+        or "Your issue has been resolved."
+    )
     subject = f"Ticket #{tid} Resolved"
     body = (
         f"<h2>Your ticket has been resolved</h2>\n"
@@ -253,9 +259,9 @@ def _ticket_resolved_template(e: EventView) -> tuple[str, str]:
 
 
 def _ticket_created_template(e: EventView) -> tuple[str, str]:
-    tid = html.escape(e.str("ticket_id", "N/A"))
-    title = html.escape(e.str("title", "Untitled"))
-    name = html.escape(e.str("customer_name", "Customer"))
+    tid = html.escape(e.text("ticket_id", "N/A") or "N/A")
+    title = html.escape(e.text("title", "Untitled") or "Untitled")
+    name = html.escape(e.text("customer_name", "Customer") or "Customer")
     subject = f"Ticket #{tid} Created - {title}"
     body = (
         f"<h2>Your Support Ticket</h2>\n"
@@ -269,10 +275,10 @@ def _ticket_created_template(e: EventView) -> tuple[str, str]:
 
 
 def _ticket_escalated_template(e: EventView) -> tuple[str, str]:
-    tid = html.escape(e.str("ticket_id", "N/A"))
-    reason = html.escape(e.str("reason", "Unknown"))
-    cid = html.escape(e.str("customer_id") or e.str("customerId", "N/A"))
-    title = html.escape(e.str("title", "Untitled"))
+    tid = html.escape(e.text("ticket_id", "N/A") or "N/A")
+    reason = html.escape(e.text("reason", "Unknown") or "Unknown")
+    cid = html.escape(e.text("customer_id") or e.text("customerId", "N/A") or "N/A")
+    title = html.escape(e.text("title", "Untitled") or "Untitled")
     subject = f"URGENT: Ticket #{tid} Escalated"
     body = (
         f"<h2>Ticket Escalation Alert</h2>\n"
@@ -286,9 +292,9 @@ def _ticket_escalated_template(e: EventView) -> tuple[str, str]:
 
 
 def _ticket_assigned_template(e: EventView) -> tuple[str, str]:
-    tid = html.escape(e.str("ticket_id", "N/A"))
-    name = html.escape(e.str("customer_name", "there"))
-    assigned_to = html.escape(e.str("assigned_to", "an agent"))
+    tid = html.escape(e.text("ticket_id", "N/A") or "N/A")
+    name = html.escape(e.text("customer_name", "there") or "there")
+    assigned_to = html.escape(e.text("assigned_to", "an agent") or "an agent")
     subject = f"Ticket #{tid} Assigned"
     body = (
         f"<h2>Your ticket has been assigned</h2>\n"
@@ -305,17 +311,19 @@ async def _enrich_ticket_escalation(
     lookup: TicketLookup,
 ) -> EventView:
     """Enrich escalation event with ticket details from ticket-masala."""
-    ticket_id = event.str("ticket_id")
+    ticket_id = event.text("ticket_id")
     if not ticket_id or ticket_id == "N/A":
         return event
     try:
         ticket = await lookup.get_ticket(ticket_id)
         if ticket is not None:
-            return event.merged({
-                "customerId": ticket.customer_email,
-                "customer_name": ticket.customer_name,
-                "title": ticket.title,
-            })
+            return event.merged(
+                {
+                    "customerId": ticket.customer_email,
+                    "customer_name": ticket.customer_name,
+                    "title": ticket.title,
+                }
+            )
     except Exception as exc:
         logger.warning("notification.enrich_failed", ticket_id=ticket_id, error=str(exc))
     return event
@@ -325,37 +333,37 @@ def _default_templates() -> list[NotificationTemplate]:
     return [
         NotificationTemplate(
             routing_key="payment.received",
-            recipient=lambda e: e.str("customer_email"),
+            recipient=lambda e: e.text("customer_email"),
             sender_key="billing",
             render=_payment_received_template,
         ),
         NotificationTemplate(
             routing_key="invoice.created",
-            recipient=lambda e: e.str("customer_email"),
+            recipient=lambda e: e.text("customer_email"),
             sender_key="billing",
             render=_invoice_created_template,
         ),
         NotificationTemplate(
             routing_key="invoice.overdue",
-            recipient=lambda e: e.str("customer_email"),
+            recipient=lambda e: e.text("customer_email"),
             sender_key="billing",
             render=_invoice_overdue_template,
         ),
         NotificationTemplate(
             routing_key="ticket.resolved",
-            recipient=lambda e: e.str("customer_email"),
+            recipient=lambda e: e.text("customer_email"),
             sender_key="support",
             render=_ticket_resolved_template,
         ),
         NotificationTemplate(
             routing_key="ticket.created",
-            recipient=lambda e: e.str("customer_email"),
+            recipient=lambda e: e.text("customer_email"),
             sender_key="support",
             render=_ticket_created_template,
         ),
         NotificationTemplate(
             routing_key="ticket.assigned",
-            recipient=lambda e: e.str("customer_email"),
+            recipient=lambda e: e.text("customer_email"),
             sender_key="support",
             render=_ticket_assigned_template,
         ),
@@ -372,6 +380,7 @@ def _default_templates() -> list[NotificationTemplate]:
 # ------------------------------------------------------------------
 # Static sender directory
 # ------------------------------------------------------------------
+
 
 class StaticSenderDirectory:
     """Maps sender keys to configured identities."""
@@ -402,6 +411,7 @@ class StaticSenderDirectory:
 # ------------------------------------------------------------------
 # Composer
 # ------------------------------------------------------------------
+
 
 class NotificationComposer:
     """Single entry point for event-to-email notifications.

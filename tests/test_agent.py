@@ -7,7 +7,7 @@ mocked LLM and checkpointer.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -28,6 +28,7 @@ class FakeTicketClient:
     async def get_ticket(self, ticket_id: str):
         if ticket_id not in self.tickets:
             import httpx
+
             resp = AsyncMock()
             resp.status_code = 404
             raise httpx.HTTPStatusError("Not found", request=AsyncMock(), response=resp)
@@ -35,14 +36,22 @@ class FakeTicketClient:
 
     async def list_tickets(self, customer_id=None, status=None, limit=50, offset=0):
         return [
-            t for t in self.tickets.values()
+            t
+            for t in self.tickets.values()
             if (customer_id is None or t.get("customerId") == customer_id)
             and (status is None or t.get("status") == status)
         ][:limit]
 
     async def create_ticket(self, title, description, customer_id, **kwargs):
         new_id = f"T-{len(self.tickets) + 1}"
-        ticket = {"id": new_id, "title": title, "description": description, "customerId": customer_id, **kwargs, "status": "open"}
+        ticket = {
+            "id": new_id,
+            "title": title,
+            "description": description,
+            "customerId": customer_id,
+            **kwargs,
+            "status": "open",
+        }
         self.tickets[new_id] = ticket
         return ticket
 
@@ -66,7 +75,9 @@ class FakeOdooClient:
         return self.invoices.get(ticket_id)
 
     async def list_customer_invoices(self, customer_email: str):
-        return [inv for inv in self.invoices.values() if inv.get("customer_email") == customer_email]
+        return [
+            inv for inv in self.invoices.values() if inv.get("customer_email") == customer_email
+        ]
 
     async def close(self):
         self.closed = True
@@ -130,63 +141,75 @@ class TestCreateTools:
         tools = create_tools(fake_service)
         tool = next(t for t in tools if t.name == "search_tickets_by_customer")
         result = await tool.ainvoke({"customer_email": "john@example.com", "limit": 10})
-        assert "T-123" in result
-        assert "Network Issue" in result
+        assert result["status"] == "success"
+        assert len(result["tickets"]) == 1
+        assert result["tickets"][0]["id"] == "T-123"
+        assert result["tickets"][0]["title"] == "Network Issue"
 
     @pytest.mark.asyncio
     async def test_get_ticket_details(self, fake_service):
         tools = create_tools(fake_service)
         tool = next(t for t in tools if t.name == "get_ticket_details")
         result = await tool.ainvoke({"ticket_id": "T-123"})
-        assert "Network Issue" in result
-        assert "open" in result
+        assert result["status"] == "success"
+        assert result["ticket"]["title"] == "Network Issue"
+        assert result["ticket"]["status"] == "open"
 
     @pytest.mark.asyncio
     async def test_get_ticket_details_not_found(self, fake_service):
         tools = create_tools(fake_service)
         tool = next(t for t in tools if t.name == "get_ticket_details")
         result = await tool.ainvoke({"ticket_id": "T-999"})
-        assert "Error" in result
+        assert result["status"] == "error"
 
     @pytest.mark.asyncio
     async def test_get_customer_summary(self, fake_service):
         tools = create_tools(fake_service)
         tool = next(t for t in tools if t.name == "get_customer_summary")
         result = await tool.ainvoke({"customer_email": "john@example.com"})
-        assert "john@example.com" in result
+        assert result["status"] == "success"
+        assert result["customer_email"] == "john@example.com"
 
     @pytest.mark.asyncio
     async def test_resolve_ticket_with_invoice(self, fake_service):
         tools = create_tools(fake_service)
         tool = next(t for t in tools if t.name == "resolve_ticket_with_invoice")
-        result = await tool.ainvoke({
-            "ticket_id": "T-123",
-            "resolution_notes": "Fixed the VPN",
-            "billable_amount": 200.0,
-        })
-        assert "resolved" in result.lower()
+        result = await tool.ainvoke(
+            {
+                "ticket_id": "T-123",
+                "resolution_notes": "Fixed the VPN",
+                "billable_amount": 200.0,
+            }
+        )
+        assert result["status"] == "success"
+        assert result["resolution"] == "resolved"
 
     @pytest.mark.asyncio
     async def test_request_human_approval_high_amount(self, fake_service):
         tools = create_tools(fake_service)
         tool = next(t for t in tools if t.name == "request_human_approval")
-        result = await tool.ainvoke({
-            "action": "create invoice",
-            "details": "Large invoice",
-            "estimated_amount": 600.0,
-        })
-        assert "APPROVAL REQUIRED" in result
+        result = await tool.ainvoke(
+            {
+                "action": "create invoice",
+                "details": "Large invoice",
+                "estimated_amount": 600.0,
+            }
+        )
+        assert result["status"] == "approval_required"
+        assert "approval_id" in result
 
     @pytest.mark.asyncio
     async def test_request_human_approval_low_amount(self, fake_service):
         tools = create_tools(fake_service)
         tool = next(t for t in tools if t.name == "request_human_approval")
-        result = await tool.ainvoke({
-            "action": "create invoice",
-            "details": "Small invoice",
-            "estimated_amount": 100.0,
-        })
-        assert "approved automatically" in result
+        result = await tool.ainvoke(
+            {
+                "action": "create invoice",
+                "details": "Small invoice",
+                "estimated_amount": 100.0,
+            }
+        )
+        assert result["status"] == "approved"
 
 
 # ------------------------------------------------------------------
@@ -237,14 +260,21 @@ class TestGaramaticAgent:
         with patch("langchain_openai.ChatOpenAI", return_value=mock_model):
             # First invocation: model responds with a tool call
             # Second invocation: model responds with final text
-            mock_model.invoke = MagicMock(side_effect=[
-                AIMessage(content="", tool_calls=[{
-                    "id": "call_1",
-                    "name": "search_tickets_by_customer",
-                    "args": {"customer_email": "john@example.com", "limit": 10}
-                }]),
-                AIMessage(content="Found 1 ticket for john@example.com."),
-            ])
+            mock_model.invoke = MagicMock(
+                side_effect=[
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "id": "call_1",
+                                "name": "search_tickets_by_customer",
+                                "args": {"customer_email": "john@example.com", "limit": 10},
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Found 1 ticket for john@example.com."),
+                ]
+            )
 
             checkpointer = MemorySaver()
             agent = GaramaticAgent(

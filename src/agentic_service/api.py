@@ -1,20 +1,19 @@
 """REST API Gateway for Garamatic Agentic Service."""
 
-from contextlib import asynccontextmanager
-
 import functools
-from typing import Any, Callable
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import Any
 
 import pybreaker
 import structlog
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, EmailStr, Field
 
-import os
-
 from .agent import GaramaticAgent
+from .approval import ApprovalRequiredError
 from .config import get_settings
 from .service import (
     GaramaticService,
@@ -22,8 +21,8 @@ from .service import (
     ServiceUnavailableError,
     UpstreamError,
     ValidationError,
-    generate_request_id,
     create_service,
+    generate_request_id,
 )
 
 # Agent cache bound to prevent unbounded memory growth
@@ -43,10 +42,7 @@ def create_error_response(
     In production: Only show generic message + request_id for tracing
     In development: Include internal details
     """
-    response = {
-        "error": message,
-        "request_id": request_id
-    }
+    response = {"error": message, "request_id": request_id}
     if is_development and internal_error:
         response["debug"] = internal_error
     return response
@@ -63,6 +59,7 @@ def api_error_handler(
     NotFoundError → 404, ValidationError → 400, UpstreamError → 500.
     Passes through HTTPException, ServiceUnavailableError, CircuitBreakerError.
     """
+
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         op_name = operation or func.__name__.removeprefix("api_")
 
@@ -78,34 +75,42 @@ def api_error_handler(
                 raise
             except NotFoundError:
                 raise HTTPException(
-                    status_code=404,
-                    detail=create_error_response(rid, not_found_message)
+                    status_code=404, detail=create_error_response(rid, not_found_message)
                 ) from None
             except ValidationError:
                 raise HTTPException(
-                    status_code=400,
-                    detail=create_error_response(rid, validation_message)
+                    status_code=400, detail=create_error_response(rid, validation_message)
+                ) from None
+            except ApprovalRequiredError as e:
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "error": str(e),
+                        "approval_id": e.approval_id,
+                        "request_id": rid,
+                    },
                 ) from None
             except UpstreamError as e:
                 logger.error(f"api.{op_name}_failed", error=str(e), request_id=rid)
                 raise HTTPException(
-                    status_code=500,
-                    detail=create_error_response(rid, "Failed to process request")
+                    status_code=500, detail=create_error_response(rid, "Failed to process request")
                 ) from None
             except pybreaker.CircuitBreakerError:
                 raise
             except Exception as e:
                 logger.error(f"api.{op_name}_failed", error=str(e), request_id=rid)
                 raise HTTPException(
-                    status_code=500,
-                    detail=create_error_response(rid, "Failed to process request")
+                    status_code=500, detail=create_error_response(rid, "Failed to process request")
                 ) from None
+
         return wrapper
+
     return decorator
 
 
 class CreateTicketRequest(BaseModel):
     """Request to create a new ticket."""
+
     title: str = Field(..., min_length=1, max_length=200)
     description: str = Field(..., min_length=1)
     customer_email: EmailStr
@@ -115,18 +120,22 @@ class CreateTicketRequest(BaseModel):
 
 class ResolveTicketRequest(BaseModel):
     """Request to resolve a ticket."""
+
     resolution_notes: str = Field(..., min_length=1)
     billable_amount: float | None = Field(default=None, ge=0)
+    approval_id: str | None = Field(default=None)
 
 
 class CreateInvoiceRequest(BaseModel):
     """Request to create an invoice."""
+
     amount: float = Field(..., gt=0)
     description: str | None = None
 
 
 class SendEmailRequest(BaseModel):
     """Request to send an email."""
+
     to_email: EmailStr
     subject: str = Field(..., min_length=1, max_length=500)
     body: str = Field(..., min_length=1)
@@ -160,17 +169,63 @@ app = FastAPI(
     title="Garamatic Agentic API",
     description="REST API for ticket, invoice, and email operations",
     version="0.2.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
-# Allow cross-origin requests from the Ticket Masala web UI
+# Allow cross-origin requests based on configuration
+settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origin_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def add_request_id_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Ensure every response has an X-Request-ID header."""
+    rid = request.headers.get("X-Request-ID", generate_request_id())
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
+# ------------------------------------------------------------------
+# Auth middleware — protects all routes except /docs, /openapi.json, /health
+# ------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def auth_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Check API key on protected endpoints."""
+    # Public paths — no auth needed
+    public_paths = {"/docs", "/openapi.json", "/redoc", "/health"}
+    if request.url.path in public_paths or request.url.path.startswith("/openapi.json"):
+        return await call_next(request)
+
+    settings = get_settings()
+    expected = settings.api_key.get_secret_value()
+    if not expected:
+        # No API key configured — allow all requests
+        return await call_next(request)
+
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.removeprefix("Bearer ").strip()
+    if token != expected:
+        rid = generate_request_id()
+        return JSONResponse(
+            status_code=401,
+            content={"error": "Invalid or missing API key", "request_id": rid},
+            headers={"X-Request-ID": rid},
+        )
+
+    return await call_next(request)
 
 
 @app.exception_handler(pybreaker.CircuitBreakerError)
@@ -183,7 +238,7 @@ async def circuit_breaker_handler(request: Request, exc: pybreaker.CircuitBreake
         status_code=503,
         content=create_error_response(
             rid, "Service temporarily unavailable. Please try again later."
-        )
+        ),
     )
 
 
@@ -197,7 +252,7 @@ async def service_unavailable_handler(request: Request, exc: ServiceUnavailableE
         status_code=503,
         content=create_error_response(
             rid, "Service temporarily unavailable. Please try again later."
-        )
+        ),
     )
 
 
@@ -212,7 +267,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
     return JSONResponse(
         status_code=500,
-        content=create_error_response(rid, "Internal server error", str(exc), is_dev)
+        content=create_error_response(rid, "Internal server error", str(exc), is_dev),
     )
 
 
@@ -261,7 +316,7 @@ async def api_get_ticket(ticket_id: str):
 async def api_list_tickets(
     customer_email: EmailStr | None = None,
     status: str | None = Query(None, pattern="^(open|resolved|closed)$"),
-    limit: int = Query(10, ge=1, le=100)
+    limit: int = Query(10, ge=1, le=100),
 ):
     """List tickets with optional filters."""
     service = _get_service()
@@ -299,7 +354,9 @@ async def api_create_ticket(request: CreateTicketRequest):
     if not ticket_id or ticket_id == "N/A":
         raise HTTPException(
             status_code=500,
-            detail=create_error_response(generate_request_id(), "Ticket created but no ID returned")
+            detail=create_error_response(
+                generate_request_id(), "Ticket created but no ID returned"
+            ),
         )
 
     return {
@@ -307,7 +364,7 @@ async def api_create_ticket(request: CreateTicketRequest):
         "status": "created",
         "customer_email": request.customer_email,
         "priority": request.priority,
-        "message": f"Ticket {ticket_id} created successfully"
+        "message": f"Ticket {ticket_id} created successfully",
     }
 
 
@@ -320,9 +377,10 @@ async def api_resolve_ticket(ticket_id: str, request: ResolveTicketRequest):
         ticket_id=ticket_id,
         resolution_notes=request.resolution_notes,
         billable_amount=request.billable_amount,
+        approval_id=request.approval_id,
     )
 
-    response = {
+    response: dict[str, Any] = {
         "ticket_id": ticket_id,
         "status": "resolved",
         "resolution_notes": request.resolution_notes,
@@ -345,7 +403,9 @@ async def api_get_invoice(ticket_id: str):
     if invoice.status == "not_found":
         raise HTTPException(
             status_code=404,
-            detail=create_error_response(generate_request_id(), "Invoice not found for this ticket")
+            detail=create_error_response(
+                generate_request_id(), "Invoice not found for this ticket"
+            ),
         )
 
     return {
@@ -433,8 +493,10 @@ async def api_get_customer_context(email: str):
 # Agent chat endpoint
 # ------------------------------------------------------------------
 
+
 class ChatRequest(BaseModel):
     """Request to chat with the AI agent."""
+
     message: str = Field(..., min_length=1, max_length=2000)
     thread_id: str = Field(default="web-session")
 
@@ -443,10 +505,12 @@ class ChatRequest(BaseModel):
 async def api_agent_chat(request: ChatRequest):
     """Chat with the Garamatic AI agent."""
     rid = generate_request_id()
-    if not os.getenv("OPENAI_API_KEY"):
+    config = get_settings()
+    api_key = config.openai_api_key.get_secret_value()
+    if not api_key:
         raise HTTPException(
             status_code=503,
-            detail=create_error_response(rid, "Agent unavailable", "OPENAI_API_KEY not configured")
+            detail=create_error_response(rid, "Agent unavailable", "OPENAI_API_KEY not configured"),
         )
 
     service = _get_service()
@@ -470,14 +534,18 @@ async def api_agent_chat(request: ChatRequest):
         response = await agent.process(request.message)
     except ServiceUnavailableError:
         raise HTTPException(
-            status_code=503,
-            detail=create_error_response(rid, "Service temporarily unavailable")
+            status_code=503, detail=create_error_response(rid, "Service temporarily unavailable")
         ) from None
     except Exception as e:
         logger.error("api.agent_chat_failed", error=str(e), request_id=rid)
         raise HTTPException(
             status_code=500,
-            detail=create_error_response(rid, "Agent failed", str(e), get_settings().log_level.upper() == "DEBUG")
+            detail=create_error_response(
+                rid,
+                "Agent failed",
+                str(e),
+                get_settings().log_level.upper() == "DEBUG",
+            ),
         ) from None
 
     return {
@@ -490,7 +558,9 @@ async def api_agent_chat(request: ChatRequest):
 def main():
     """Run the REST API server."""
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=3001)
+
+    config = get_settings()
+    uvicorn.run(app, host=config.api_host, port=config.api_port)
 
 
 if __name__ == "__main__":

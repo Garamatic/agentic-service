@@ -30,9 +30,7 @@ def _is_retryable_error(exception: BaseException) -> bool:
 ticket_api_breaker = pybreaker.CircuitBreaker(
     fail_max=5,
     reset_timeout=60,
-    exclude=[
-        lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500
-    ],
+    exclude=[lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500],
     name="ticket_api",
 )
 
@@ -40,9 +38,7 @@ ticket_api_breaker = pybreaker.CircuitBreaker(
 odoo_bridge_breaker = pybreaker.CircuitBreaker(
     fail_max=5,
     reset_timeout=60,
-    exclude=[
-        lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500
-    ],
+    exclude=[lambda e: isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500],
     name="odoo_bridge",
 )
 
@@ -256,9 +252,9 @@ class RabbitMQPublisher:
 
     def __init__(self, amqp_url: str):
         self.amqp_url = amqp_url
-        self.connection: aio_pika.RobustConnection | None = None
-        self.channel: aio_pika.Channel | None = None
-        self.exchange: aio_pika.Exchange | None = None
+        self.connection: aio_pika.abc.AbstractRobustConnection | None = None
+        self.channel: aio_pika.abc.AbstractChannel | None = None
+        self.exchange: aio_pika.abc.AbstractExchange | None = None
         self._exchange_name = "event_exchange"
 
     async def connect(self) -> None:
@@ -281,10 +277,11 @@ class RabbitMQPublisher:
     ) -> None:
         if self.exchange is None:
             await self.connect()
-        body = json.dumps(message, default=str).encode()
+        if self.exchange is None:
+            raise RuntimeError("Exchange not initialized")
         await self.exchange.publish(
             aio_pika.Message(
-                body=body,
+                body=json.dumps(message, default=str).encode(),
                 content_type="application/json",
                 delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
                 headers=headers,
@@ -299,6 +296,3 @@ class RabbitMQPublisher:
             self.connection = None
             self.channel = None
             self.exchange = None
-
-
-

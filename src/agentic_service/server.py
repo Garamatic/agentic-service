@@ -15,9 +15,9 @@ from .service import (
     NotFoundError,
     ServiceUnavailableError,
     ValidationError,
+    create_service,
     format_date,
     validate_email,
-    create_service,
 )
 
 logger = structlog.get_logger()
@@ -56,7 +56,13 @@ mcp = FastMCP("garamatic", lifespan=app_lifespan)
 
 def _get_service(ctx: Context) -> GaramaticService:
     """Extract service from MCP lifespan context."""
-    service = ctx.request_context.lifespan_context.get("service")
+    rc = ctx.request_context
+    if rc is None:
+        raise ServiceUnavailableError("Service not initialized")
+    lc = rc.lifespan_context
+    if lc is None:
+        raise ServiceUnavailableError("Service not initialized")
+    service = lc.get("service")
     if service is None:
         raise ServiceUnavailableError("Service not initialized")
     return service
@@ -66,12 +72,9 @@ def _get_service(ctx: Context) -> GaramaticService:
 # MCP Tools — thin wrappers over GaramaticService
 # ------------------------------------------------------------------
 
+
 @mcp.tool()
-async def get_ticket_status(
-    ticket_id: str,
-    *,
-    ctx: Context
-) -> dict[str, Any]:
+async def get_ticket_status(ticket_id: str, *, ctx: Context) -> dict[str, Any]:
     """
     Get the current status of a support ticket.
 
@@ -112,11 +115,7 @@ async def get_ticket_status(
 
 @mcp.tool()
 async def list_customer_tickets(
-    customer_email: str,
-    status: str | None = None,
-    limit: int = 10,
-    *,
-    ctx: Context
+    customer_email: str, status: str | None = None, limit: int = 10, *, ctx: Context
 ) -> dict[str, Any]:
     """
     List all tickets for a specific customer.
@@ -168,7 +167,7 @@ async def create_ticket(
     customer_name: str,
     priority: str = "medium",
     *,
-    ctx: Context
+    ctx: Context,
 ) -> dict[str, Any]:
     """
     Create a new support ticket.
@@ -212,19 +211,14 @@ async def create_ticket(
         "customer_email": customer_email,
         "priority": priority,
         "message": (
-            f"Ticket {ticket_id} created successfully. "
-            "Customer will receive confirmation email."
+            f"Ticket {ticket_id} created successfully. Customer will receive confirmation email."
         ),
     }
 
 
 @mcp.tool()
 async def resolve_ticket(
-    ticket_id: str,
-    resolution_notes: str,
-    billable_amount: float | None = None,
-    *,
-    ctx: Context
+    ticket_id: str, resolution_notes: str, billable_amount: float | None = None, *, ctx: Context
 ) -> dict[str, Any]:
     """
     Resolve a ticket and optionally create a billable invoice.
@@ -275,11 +269,7 @@ async def resolve_ticket(
 
 @mcp.tool()
 async def create_invoice(
-    ticket_id: str,
-    amount: float,
-    description: str | None = None,
-    *,
-    ctx: Context
+    ticket_id: str, amount: float, description: str | None = None, *, ctx: Context
 ) -> dict[str, Any]:
     """
     Create an invoice for a ticket via the Odoo integration.
@@ -319,11 +309,7 @@ async def create_invoice(
 
 
 @mcp.tool()
-async def get_invoice_status(
-    ticket_id: str,
-    *,
-    ctx: Context
-) -> dict[str, Any]:
+async def get_invoice_status(ticket_id: str, *, ctx: Context) -> dict[str, Any]:
     """
     Check invoice status for a ticket.
 
@@ -364,12 +350,7 @@ async def get_invoice_status(
 
 @mcp.tool()
 async def send_email(
-    to_email: str,
-    subject: str,
-    body: str,
-    from_name: str = "Garamatic Support",
-    *,
-    ctx: Context
+    to_email: str, subject: str, body: str, from_name: str = "Garamatic Support", *, ctx: Context
 ) -> dict[str, Any]:
     """
     Send an email to a customer via the mailing service.
@@ -407,11 +388,7 @@ async def send_email(
 
 
 @mcp.tool()
-async def get_customer_context(
-    customer_email: str,
-    *,
-    ctx: Context
-) -> dict[str, Any]:
+async def get_customer_context(customer_email: str, *, ctx: Context) -> dict[str, Any]:
     """
     Get full customer context across all services.
 
@@ -464,6 +441,7 @@ async def get_customer_context(
 # Helpers
 # ------------------------------------------------------------------
 
+
 async def _get_resource_service() -> GaramaticService:
     """Return the lifespan-managed service for resources.
 
@@ -477,6 +455,7 @@ async def _get_resource_service() -> GaramaticService:
 # ------------------------------------------------------------------
 # MCP Resources
 # ------------------------------------------------------------------
+
 
 @mcp.resource("ticket://{ticket_id}")
 async def get_ticket_resource(ticket_id: str) -> str:
@@ -515,15 +494,15 @@ async def get_ticket_resource(ticket_id: str) -> str:
 ## Details
 - Status: {ticket.status.upper()}
 - Title: {ticket.title}
-- Customer: {ticket.customer_name or 'Unknown'} ({ticket.customer_email or 'Unknown'})
+- Customer: {ticket.customer_name or "Unknown"} ({ticket.customer_email or "Unknown"})
 - Created: {format_date(ticket.created_at)}
 - Resolved: {format_date(ticket.resolved_at)}
 
 ## Description
-{ticket.description or 'No description'}
+{ticket.description or "No description"}
 
 ## Resolution Notes
-{ticket.resolution_notes or 'Not resolved'}{invoice_info}
+{ticket.resolution_notes or "Not resolved"}{invoice_info}
 """
 
 
@@ -560,15 +539,20 @@ async def get_customer_resource(email: str) -> str:
     except Exception as e:
         return f"Error: Could not retrieve customer context: {e}"
 
-    tickets_section = "\n".join(
-        f"- [{t.status.upper()}] {t.title} ({format_date(t.created_at)})"
-        for t in context.recent_tickets
-    ) if context.recent_tickets else "No recent tickets"
+    tickets_section = (
+        "\n".join(
+            f"- [{t.status.upper()}] {t.title} ({format_date(t.created_at)})"
+            for t in context.recent_tickets
+        )
+        if context.recent_tickets
+        else "No recent tickets"
+    )
 
-    invoices_section = "\n".join(
-        f"- [{i.status.upper()}] €{i.amount:.2f}"
-        for i in context.recent_invoices
-    ) if context.recent_invoices else "No recent invoices"
+    invoices_section = (
+        "\n".join(f"- [{i.status.upper()}] €{i.amount:.2f}" for i in context.recent_invoices)
+        if context.recent_invoices
+        else "No recent invoices"
+    )
 
     return f"""
 # Customer Profile: {email}
@@ -591,7 +575,11 @@ def main():
     """Run the MCP server."""
     # Use SSE transport for Docker; stdio for local CLI usage
     import os
-    transport = os.environ.get("MCP_TRANSPORT", "sse")
+
+    from agentic_service.config import get_settings
+
+    config = get_settings()
+    transport = os.environ.get("MCP_TRANSPORT", config.mcp_transport)
     if transport == "sse":
         mcp.run(transport="sse", host="0.0.0.0", port=3001)
     else:

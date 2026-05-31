@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import contextlib
 import uuid
+from collections.abc import Awaitable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Literal, TypeVar
+from datetime import UTC, datetime
+from typing import Any, Literal, TypeVar
 
 import httpx
 import pybreaker
 import structlog
 
+from .approval import ApprovalRequiredError, ApprovalStore
+from .config import get_settings
+from .idempotency import idempotency_key_for_email, idempotency_key_for_invoice
 from .ports import MessageQueuePort, OdooClientPort, TicketClientPort
 
 _T = TypeVar("_T")
@@ -177,9 +181,7 @@ def _ticket_from_dict(data: dict[str, Any]) -> Ticket:
         id=data.get("id") or "N/A",
         status=data.get("status") or "unknown",
         customer_email=(
-            data.get("customerId")
-            or data.get("customer_id")
-            or data.get("customerEmail")
+            data.get("customerId") or data.get("customer_id") or data.get("customerEmail")
         ),
         customer_name=data.get("customerName") or data.get("customer_name"),
         title=data.get("title") or "Untitled",
@@ -249,10 +251,12 @@ class GaramaticService:
         ticket_client: TicketClientPort,
         odoo_client: OdooClientPort | None,
         mq_publisher: MessageQueuePort | None,
+        approval_store: ApprovalStore | None = None,
     ) -> None:
         self._ticket = ticket_client
         self._odoo = odoo_client
         self._mq = mq_publisher
+        self._approval_store = approval_store
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -321,8 +325,7 @@ class GaramaticService:
     ) -> list[TicketSummary]:
         if status is not None and status not in {"open", "resolved", "closed"}:
             raise ValidationError(
-                f"Invalid status filter: {status!r}. "
-                "Must be one of: open, resolved, closed."
+                f"Invalid status filter: {status!r}. Must be one of: open, resolved, closed."
             )
         data = await self._call_port(
             "list_tickets",
@@ -349,8 +352,7 @@ class GaramaticService:
             raise ValidationError("Title is required")
         if priority not in {"low", "medium", "high", "urgent"}:
             raise ValidationError(
-                f"Invalid priority: {priority!r}. "
-                "Must be one of: low, medium, high, urgent."
+                f"Invalid priority: {priority!r}. Must be one of: low, medium, high, urgent."
             )
         data = await self._call_port(
             "create_ticket",
@@ -371,6 +373,8 @@ class GaramaticService:
         ticket_id: str,
         resolution_notes: str,
         billable_amount: float | None = None,
+        approval_id: str | None = None,
+        approval_store: ApprovalStore | None = None,
     ) -> ResolutionResult:
         if not ticket_id or not ticket_id.strip():
             raise ValidationError("Ticket ID is required")
@@ -378,6 +382,29 @@ class GaramaticService:
             raise ValidationError("Resolution notes are required")
         if billable_amount is not None and billable_amount < 0:
             raise ValidationError("Billable amount cannot be negative")
+
+        # Approval check: high-value invoices need explicit approval
+        if billable_amount is not None and billable_amount > 0:
+            threshold = get_settings().approval_threshold
+            if billable_amount > threshold:
+                if approval_id is None:
+                    from .approval import generate_approval_id
+
+                    new_approval_id = generate_approval_id()
+                    raise ApprovalRequiredError(
+                        f"Amount €{billable_amount:.2f} exceeds approval threshold "
+                        f"of €{threshold:.2f}. Create an approval request and retry "
+                        f"with approval_id='{new_approval_id}'.",
+                        approval_id=new_approval_id,
+                        amount=billable_amount,
+                    )
+                if approval_store is None or not await approval_store.is_approved(approval_id):
+                    raise ApprovalRequiredError(
+                        f"Approval ID '{approval_id}' is not valid or has expired. "
+                        "Request a new approval and try again.",
+                        amount=billable_amount,
+                    )
+
         ticket_data = await self._call_port(
             "resolve_ticket",
             {"ticket_id": ticket_id, "billable": billable_amount},
@@ -465,8 +492,7 @@ class GaramaticService:
                 status="unavailable",
                 estimated_amount=amount,
                 message=(
-                    "Invoice service unavailable. "
-                    "Ticket resolved but invoice was not created."
+                    "Invoice service unavailable. Ticket resolved but invoice was not created."
                 ),
             )
 
@@ -477,7 +503,8 @@ class GaramaticService:
             "customer_name": customer_name or "Customer",
             "amount": amount,
             "description": description,
-            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "requested_at": datetime.now(UTC).isoformat(),
+            "idempotency_key": idempotency_key_for_invoice(ticket_id, amount),
         }
 
         try:
@@ -498,8 +525,7 @@ class GaramaticService:
                 status="unavailable",
                 estimated_amount=amount,
                 message=(
-                    "Invoice service unavailable. "
-                    "Ticket resolved but invoice was not created."
+                    "Invoice service unavailable. Ticket resolved but invoice was not created."
                 ),
             )
 
@@ -537,6 +563,7 @@ class GaramaticService:
             "from_name": from_name,
             "subject": subject,
             "body_html": body,
+            "idempotency_key": idempotency_key_for_email(to_email, subject),
         }
 
         try:
@@ -584,13 +611,9 @@ class GaramaticService:
                 return val
             return ticket.get("billable_amount") or 0
 
-        total_ticket_value = sum(
-            _amount(t) for t in tickets_data if t.get("status") == "resolved"
-        )
+        total_ticket_value = sum(_amount(t) for t in tickets_data if t.get("status") == "resolved")
         outstanding = sum(
-            (inv.get("amount") or 0)
-            for inv in invoices_data
-            if inv.get("status") != "paid"
+            (inv.get("amount") or 0) for inv in invoices_data if inv.get("status") != "paid"
         )
 
         return CustomerContext(
@@ -646,6 +669,11 @@ class GaramaticService:
     def mq(self) -> MessageQueuePort | None:
         """Expose the message queue port for narrow adapters."""
         return self._mq
+
+    @property
+    def approval_store(self) -> ApprovalStore | None:
+        """Expose the approval store for agent tools."""
+        return self._approval_store
 
     def for_customer(self, email: str) -> CustomerSession:
         """Return a session scoped to a single customer.
@@ -729,11 +757,15 @@ class CustomerSession:
 def _map_client_error(e: Exception, rid: str) -> ServiceError:
     """Map client-level exceptions to service-level exceptions.
 
-    Raises pybreaker errors directly so FastAPI's global handler can catch them.
+    Raises pybreaker and ApprovalRequiredError directly so FastAPI's
+    global handler can catch them.
     Returns ServiceError subclasses for everything else.
     """
     # Pass through circuit breaker errors so FastAPI's global handler can catch them
     if isinstance(e, pybreaker.CircuitBreakerError):
+        raise e
+
+    if isinstance(e, ApprovalRequiredError):
         raise e
 
     if isinstance(e, httpx.HTTPStatusError):
@@ -746,6 +778,7 @@ def _map_client_error(e: Exception, rid: str) -> ServiceError:
 # ------------------------------------------------------------------
 # Factory
 # ------------------------------------------------------------------
+
 
 async def create_service() -> GaramaticService:
     """Factory: create a fully wired GaramaticService from config.
@@ -760,11 +793,7 @@ async def create_service() -> GaramaticService:
     config = get_settings()
 
     ticket_client = TicketClient(config.ticket_api_url)
-    odoo_client = (
-        OdooBridgeClient(config.odoo_bridge_url)
-        if config.odoo_bridge_url
-        else None
-    )
+    odoo_client = OdooBridgeClient(config.odoo_bridge_url) if config.odoo_bridge_url else None
 
     mq_publisher: RabbitMQPublisher | None = None
     try:
@@ -774,11 +803,12 @@ async def create_service() -> GaramaticService:
     except Exception as e:
         logger.warning("service_factory.mq.unavailable", error=str(e))
 
+    approval_store = ApprovalStore(db_path=config.agent_db_path or None)
+    await approval_store.initialize()
+
     return GaramaticService(
         ticket_client=ticket_client,
         odoo_client=odoo_client,
         mq_publisher=mq_publisher,
+        approval_store=approval_store,
     )
-
-
-

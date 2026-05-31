@@ -15,7 +15,7 @@ Usage:
 import asyncio
 import contextlib
 import os
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import structlog
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -29,6 +29,7 @@ from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
 from .agent_toolkit import AgentToolkit
+from .config import get_settings
 from .service import GaramaticService, create_service
 
 logger = structlog.get_logger()
@@ -38,14 +39,17 @@ logger = structlog.get_logger()
 # Agent state
 # ------------------------------------------------------------------
 
+
 class AgentState(TypedDict):
     """State maintained across agent invocations."""
+
     messages: Annotated[list, add_messages]
 
 
 # ------------------------------------------------------------------
 # Tool factory — now delegates to AgentToolkit
 # ------------------------------------------------------------------
+
 
 def create_tools(service: GaramaticService) -> list:
     """Create LangGraph tools bound to a service instance."""
@@ -89,6 +93,7 @@ When resolving tickets:
 # Checkpointer
 # ------------------------------------------------------------------
 
+
 async def _get_checkpointer() -> BaseCheckpointSaver:
     """Get appropriate checkpoint saver based on configuration.
 
@@ -101,6 +106,7 @@ async def _get_checkpointer() -> BaseCheckpointSaver:
 
     if db_path:
         from pathlib import Path
+
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         logger.info("agent.using_persistent_storage", db_path=db_path)
         conn = await aiosqlite.connect(db_path)
@@ -113,6 +119,7 @@ async def _get_checkpointer() -> BaseCheckpointSaver:
 # ------------------------------------------------------------------
 # Agent graph factory
 # ------------------------------------------------------------------
+
 
 def create_agent(
     service: GaramaticService,
@@ -127,20 +134,22 @@ def create_agent(
     tools = create_tools(service)
     tool_node = ToolNode(tools)
 
-    def should_continue(state: AgentState) -> Literal["tools", END]:
+    def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
         """Determine if we should continue to tools or end."""
         messages = state["messages"]
         last_message = messages[-1]
 
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
             return "tools"
-        return END
+        return "__end__"
 
     from langchain_openai import ChatOpenAI
-    model = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
+
+    config = get_settings()
+    model = ChatOpenAI(model=config.openai_model, temperature=0.1)
     model_with_tools = model.bind_tools(tools)
 
-    def call_model(state: AgentState):
+    def call_model(state: AgentState) -> dict[str, Any]:
         """Call the LLM with current state."""
         messages = state["messages"]
         response = model_with_tools.invoke(messages)
@@ -163,6 +172,7 @@ def create_agent(
 # ------------------------------------------------------------------
 # High-level agent class
 # ------------------------------------------------------------------
+
 
 class GaramaticAgent:
     """High-level interface to the Garamatic AI Agent.
@@ -210,7 +220,11 @@ class GaramaticAgent:
         state = await agent.aget_state(self.config)
         existing = state.values.get("messages", []) if state.values else []
         if existing:
-            messages = [HumanMessage(content=message)]
+            messages = [
+                SystemMessage(content=_system_prompt),
+                *existing,
+                HumanMessage(content=message),
+            ]
         else:
             messages = [
                 SystemMessage(content=_system_prompt),
@@ -224,7 +238,10 @@ class GaramaticAgent:
 
         for msg in reversed(result["messages"]):
             if isinstance(msg, AIMessage):
-                return msg.content or ""
+                content = msg.content
+                if isinstance(content, list):
+                    return str(content)
+                return content or ""
 
         return "No response generated"
 
@@ -286,6 +303,7 @@ class GaramaticAgent:
 # CLI entry point
 # ------------------------------------------------------------------
 
+
 async def main_async():
     """Async main entry point."""
     service = await create_service()
@@ -301,7 +319,9 @@ async def main_async():
 
 def main():
     """Run the AI Agent."""
-    if not os.getenv("OPENAI_API_KEY"):
+    config = get_settings()
+    api_key = config.openai_api_key.get_secret_value()
+    if not api_key:
         print("⚠️  Warning: OPENAI_API_KEY not set. Agent will not function.")
         print("Set it with: export OPENAI_API_KEY='your-key-here'")
         return

@@ -5,12 +5,14 @@ NotificationComposer + narrow ports.
 """
 
 import asyncio
+import contextlib
 import json
 import signal
 
 import aio_pika
 import structlog
 
+from .idempotency import IdempotencyStore, idempotency_key_for_event
 from .notification_adapters import MessageQueueEmailSender
 from .notifications import NotificationComposer, TicketSnapshot
 from .service import GaramaticService, create_service
@@ -21,6 +23,7 @@ logger = structlog.get_logger()
 # ------------------------------------------------------------------
 # Inline ticket lookup adapter — narrows GaramaticService to TicketLookup port
 # ------------------------------------------------------------------
+
 
 class _TicketLookup:
     """Narrow adapter: GaramaticService.get_ticket() → TicketSnapshot."""
@@ -68,10 +71,11 @@ class EventConsumer:
             ticket_lookup=_TicketLookup(service),
         )
 
-        self.connection: aio_pika.RobustConnection | None = None
-        self.channel: aio_pika.Channel | None = None
-        self._exchange: aio_pika.Exchange | None = None
-        self.queue: aio_pika.Queue | None = None
+        self.connection: aio_pika.abc.AbstractRobustConnection | None = None
+        self.channel: aio_pika.abc.AbstractChannel | None = None
+        self._exchange: aio_pika.abc.AbstractExchange | None = None
+        self.queue: aio_pika.abc.AbstractQueue | None = None
+        self._idempotency_store = IdempotencyStore(db_path=":memory:")
 
     async def connect(self) -> aio_pika.Queue:
         """Establish RabbitMQ connection and declare topology."""
@@ -79,22 +83,17 @@ class EventConsumer:
         self.channel = await self.connection.channel()
         await self.channel.set_qos(prefetch_count=1)
 
+        await self._idempotency_store.initialize()
+
         self._exchange = await self.channel.declare_exchange(
-            "event_exchange",
-            aio_pika.ExchangeType.TOPIC,
-            durable=True
+            "event_exchange", aio_pika.ExchangeType.TOPIC, durable=True
         )
 
         dlx_exchange = await self.channel.declare_exchange(
-            "event_exchange.dlx",
-            aio_pika.ExchangeType.TOPIC,
-            durable=True
+            "event_exchange.dlx", aio_pika.ExchangeType.TOPIC, durable=True
         )
 
-        dlq_queue = await self.channel.declare_queue(
-            "agentic_consumer.dlq",
-            durable=True
-        )
+        dlq_queue = await self.channel.declare_queue("agentic_consumer.dlq", durable=True)
         await dlq_queue.bind(dlx_exchange, routing_key="agentic_consumer.dlq")
 
         self.queue = await self.channel.declare_queue(
@@ -102,8 +101,8 @@ class EventConsumer:
             durable=True,
             arguments={
                 "x-dead-letter-exchange": "event_exchange.dlx",
-                "x-dead-letter-routing-key": "agentic_consumer.dlq"
-            }
+                "x-dead-letter-routing-key": "agentic_consumer.dlq",
+            },
         )
 
         bindings = [
@@ -117,10 +116,14 @@ class EventConsumer:
         ]
 
         for routing_key in bindings:
+            assert self._exchange is not None
+            if self.queue is None:
+                raise RuntimeError("Consumer not connected")
             await self.queue.bind(self._exchange, routing_key=routing_key)
 
         logger.info("consumer.connected", queue=self.queue.name)
-        return self.queue
+        assert self.queue is not None
+        return self.queue  # type: ignore[return-value]
 
     MAX_RETRIES = 3
 
@@ -135,30 +138,14 @@ class EventConsumer:
 
         try:
             body = json.loads(message.body)
-            routing_key = message.routing_key
+            routing_key = message.routing_key or ""
 
             if not isinstance(body, dict):
                 logger.error("consumer.invalid_body", body_type=type(body).__name__)
                 await message.ack()
                 return
 
-            event_data = body["data"] if "data" in body and isinstance(body["data"], dict) else body
-            if not isinstance(event_data, dict):
-                logger.error("consumer.invalid_event_data", data_type=type(event_data).__name__)
-                await message.ack()
-                return
-
-            logger.info("consumer.received", routing_key=routing_key, retry_count=retry_count)
-
-            normalized_key = routing_key.removeprefix("event.")
-            result = await self._composer.notify(normalized_key, event_data)
-            logger.info(
-                "notification.result",
-                routing_key=result.routing_key,
-                status=result.status,
-                reason=result.reason,
-            )
-            await message.ack()
+            await self._process_message(body, routing_key, message, retry_count)
         except json.JSONDecodeError as e:
             logger.error("consumer.invalid_json", error=str(e))
             await message.ack()
@@ -166,9 +153,54 @@ class EventConsumer:
             logger.error("consumer.message_failed", error=str(e), retry_count=retry_count)
             await self._handle_retry(message, retry_count)
 
+    async def _process_message(
+        self, body: dict, routing_key: str, message: aio_pika.IncomingMessage, retry_count: int
+    ) -> None:
+        """Process a single event with idempotency check."""
+        event_data = body["data"] if "data" in body and isinstance(body["data"], dict) else body
+        if not isinstance(event_data, dict):
+            logger.error("consumer.invalid_event_data", data_type=type(event_data).__name__)
+            await message.ack()
+            return
+
+        event_type = routing_key.removeprefix("event.")
+
+        # Idempotency check
+        ikey = idempotency_key_for_event(event_type, event_data)
+        if ikey and await self._idempotency_store.is_processed(ikey):
+            logger.info(
+                "consumer.duplicate_skipped",
+                routing_key=routing_key,
+                idempotency_key=ikey,
+            )
+            await message.ack()
+            return
+
+        logger.info("consumer.received", routing_key=routing_key, retry_count=retry_count)
+
+        result = await self._composer.notify(event_type, event_data)
+        logger.info(
+            "notification.result",
+            routing_key=result.routing_key,
+            status=result.status,
+            reason=result.reason,
+        )
+
+        # Mark as processed on success or skipped — allow retry on failures
+        if result.status in ("queued", "skipped", "unhandled"):
+            if ikey:
+                await self._idempotency_store.mark_processed(ikey, result.status)
+            await message.ack()
+        else:
+            raise RuntimeError(f"Notification failed: {result.reason}")
+
     def _get_retry_count(self, message: aio_pika.IncomingMessage) -> int:
         if message.headers and "x-retry-count" in message.headers:
-            return int(message.headers["x-retry-count"])
+            raw = message.headers["x-retry-count"]
+            try:
+                return int(str(raw))
+            except (ValueError, TypeError):
+                return 0
         return 0
 
     async def _handle_retry(self, message: aio_pika.IncomingMessage, retry_count: int):
@@ -186,6 +218,7 @@ class EventConsumer:
         new_headers["x-retry-count"] = retry_count + 1
 
         try:
+            assert self._exchange is not None
             await self._exchange.publish(
                 aio_pika.Message(
                     body=message.body,
@@ -195,7 +228,7 @@ class EventConsumer:
                     correlation_id=message.correlation_id,
                     message_id=message.message_id,
                 ),
-                routing_key=message.routing_key,
+                routing_key=message.routing_key or "",
             )
             await message.ack()
             logger.warning(
@@ -227,16 +260,13 @@ class EventConsumer:
                 await self.handle_message(message)
 
     async def close(self):
-        if self.connection:
-            try:
-                await self.connection.close()
-            except Exception:
-                pass
+        with contextlib.suppress(Exception):
+            await self.connection.close()
         if self._owns_service and self._service:
-            try:
+            with contextlib.suppress(Exception):
                 await self._service.close()
-            except Exception:
-                pass
+        with contextlib.suppress(Exception):
+            await self._idempotency_store.close()
 
 
 def signal_handler(signum, frame):

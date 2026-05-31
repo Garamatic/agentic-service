@@ -30,7 +30,8 @@ class FakeTicketClient:
 
     async def list_tickets(self, customer_id=None, status=None, limit=50, offset=0):
         return [
-            t for t in self.tickets.values()
+            t
+            for t in self.tickets.values()
             if (customer_id is None or t.get("customerId") == customer_id)
             and (status is None or t.get("status") == status)
         ][:limit]
@@ -81,7 +82,11 @@ def fake_service():
 # ------------------------------------------------------------------
 
 
-def _make_mock_message(body: dict, routing_key: str = "event.payment.received", headers: dict | None = None):
+def _make_mock_message(
+    body: dict,
+    routing_key: str = "event.payment.received",
+    headers: dict | None = None,
+):
     """Create a mock aio_pika IncomingMessage."""
     msg = MagicMock(spec=IncomingMessage)
     msg.body = json.dumps(body).encode()
@@ -117,12 +122,14 @@ class TestEventConsumer:
         consumer._composer = composer
         consumer._exchange = AsyncMock()
 
-        msg = _make_mock_message({
-            "ticket_id": "T-1",
-            "invoice_id": "INV-1",
-            "customer_email": "customer@example.com",
-            "amount": 150.0,
-        })
+        msg = _make_mock_message(
+            {
+                "ticket_id": "T-1",
+                "invoice_id": "INV-1",
+                "customer_email": "customer@example.com",
+                "amount": 150.0,
+            }
+        )
 
         await consumer.handle_message(msg)
 
@@ -175,10 +182,12 @@ class TestEventConsumer:
         # Make composer fail
         composer.notify = AsyncMock(side_effect=RuntimeError("boom"))
 
-        msg = _make_mock_message({
-            "customer_email": "customer@example.com",
-            "amount": 100.0,
-        })
+        msg = _make_mock_message(
+            {
+                "customer_email": "customer@example.com",
+                "amount": 100.0,
+            }
+        )
 
         await consumer.handle_message(msg)
 
@@ -201,10 +210,13 @@ class TestEventConsumer:
         composer.notify = AsyncMock(side_effect=RuntimeError("boom"))
         consumer._composer = composer
 
-        msg = _make_mock_message({
-            "customer_email": "customer@example.com",
-            "amount": 100.0,
-        }, headers={"x-retry-count": 3})
+        msg = _make_mock_message(
+            {
+                "customer_email": "customer@example.com",
+                "amount": 100.0,
+            },
+            headers={"x-retry-count": 3},
+        )
 
         await consumer.handle_message(msg)
 
@@ -283,12 +295,15 @@ class TestConsumerWorkflows:
         consumer._composer = composer
         consumer._exchange = AsyncMock()
 
-        msg = _make_mock_message({
-            "ticket_id": "T-5",
-            "customer_email": "john@example.com",
-            "customer_name": "John",
-            "title": "Printer issue",
-        }, routing_key="event.ticket.created")
+        msg = _make_mock_message(
+            {
+                "ticket_id": "T-5",
+                "customer_email": "john@example.com",
+                "customer_name": "John",
+                "title": "Printer issue",
+            },
+            routing_key="event.ticket.created",
+        )
 
         await consumer.handle_message(msg)
 
@@ -309,10 +324,13 @@ class TestConsumerWorkflows:
         consumer._composer = composer
         consumer._exchange = AsyncMock()
 
-        msg = _make_mock_message({
-            "ticket_id": "T-5",
-            "reason": "VIP complaint",
-        }, routing_key="event.ticket.escalated")
+        msg = _make_mock_message(
+            {
+                "ticket_id": "T-5",
+                "reason": "VIP complaint",
+            },
+            routing_key="event.ticket.escalated",
+        )
 
         await consumer.handle_message(msg)
 
