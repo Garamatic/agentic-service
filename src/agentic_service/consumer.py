@@ -2,6 +2,8 @@
 
 Consumes events from RabbitMQ and triggers automated notifications via
 NotificationComposer + narrow ports.
+
+Uses TTL-based retry queues for delayed retry instead of immediate republish.
 """
 
 import asyncio
@@ -18,6 +20,12 @@ from .notifications import NotificationComposer, TicketSnapshot
 from .service import GaramaticService, create_service
 
 logger = structlog.get_logger()
+
+# Retry delay queues: [retry_count_before, exchange_name, queue_name, ttl_ms]
+RETRY_QUEUES = [
+    (1, "event_exchange.retry1m", "retry-1m", 60_000),  # 1st retry → 1 minute
+    (2, "event_exchange.retry5m", "retry-5m", 300_000),  # 2nd retry → 5 minutes
+]
 
 
 # ------------------------------------------------------------------
@@ -54,7 +62,7 @@ running = True
 
 
 class EventConsumer:
-    """RabbitMQ event consumer with workflow automation."""
+    """RabbitMQ event consumer with workflow automation and delayed retry."""
 
     def __init__(
         self,
@@ -76,8 +84,44 @@ class EventConsumer:
         self._exchange: aio_pika.abc.AbstractExchange | None = None
         self.queue: aio_pika.abc.AbstractQueue | None = None
         self._idempotency_store = IdempotencyStore(db_path=":memory:")
+        self._retry_queues: dict[int, str] = {}  # retry_count -> queue_name
 
-    async def connect(self) -> aio_pika.Queue:
+    async def _declare_retry_queue(
+        self,
+        exchange_name: str,
+        queue_name: str,
+        ttl_ms: int,
+        dlx_name: str,
+    ) -> tuple[aio_pika.abc.AbstractExchange, aio_pika.abc.AbstractQueue]:
+        """Declare a TTL-based delayed retry queue."""
+        assert self.channel is not None
+
+        retry_exchange = await self.channel.declare_exchange(
+            exchange_name,
+            aio_pika.ExchangeType.TOPIC,
+            durable=True,
+        )
+
+        retry_queue = await self.channel.declare_queue(
+            queue_name,
+            durable=True,
+            arguments={
+                "x-message-ttl": ttl_ms,
+                "x-dead-letter-exchange": dlx_name,
+            },
+        )
+        # Bind with # to accept all routing keys
+        await retry_queue.bind(retry_exchange, routing_key="#")
+
+        logger.info(
+            "consumer.retry_queue_declared",
+            queue=queue_name,
+            ttl_ms=ttl_ms,
+            dead_letter_exchange=dlx_name,
+        )
+        return retry_exchange, retry_queue
+
+    async def connect(self) -> aio_pika.abc.AbstractQueue:
         """Establish RabbitMQ connection and declare topology."""
         self.connection = await aio_pika.connect_robust(self.amqp_url)
         self.channel = await self.connection.channel()
@@ -85,8 +129,9 @@ class EventConsumer:
 
         await self._idempotency_store.initialize()
 
+        exchange_name = "event_exchange"
         self._exchange = await self.channel.declare_exchange(
-            "event_exchange", aio_pika.ExchangeType.TOPIC, durable=True
+            exchange_name, aio_pika.ExchangeType.TOPIC, durable=True
         )
 
         dlx_exchange = await self.channel.declare_exchange(
@@ -95,6 +140,16 @@ class EventConsumer:
 
         dlq_queue = await self.channel.declare_queue("agentic_consumer.dlq", durable=True)
         await dlq_queue.bind(dlx_exchange, routing_key="agentic_consumer.dlq")
+
+        # Declare TTL-based retry queues
+        for retry_count, retry_exchange_name, retry_queue_name, ttl_ms in RETRY_QUEUES:
+            await self._declare_retry_queue(
+                exchange_name=retry_exchange_name,
+                queue_name=retry_queue_name,
+                ttl_ms=ttl_ms,
+                dlx_name=exchange_name,
+            )
+            self._retry_queues[retry_count] = retry_exchange_name
 
         self.queue = await self.channel.declare_queue(
             "agentic_consumer",
@@ -131,8 +186,8 @@ class EventConsumer:
         """Process a single message with explicit ack/reject control.
 
         Bad JSON is acked (won't get better with retries).
-        Processing failures are requeued with a retry counter; after MAX_RETRIES
-        the message is dead-lettered.
+        Processing failures are routed through TTL-based retry queues.
+        After MAX_RETRIES the message is dead-lettered.
         """
         retry_count = self._get_retry_count(message)
 
@@ -204,7 +259,20 @@ class EventConsumer:
         return 0
 
     async def _handle_retry(self, message: aio_pika.IncomingMessage, retry_count: int):
-        if retry_count >= self.MAX_RETRIES:
+        """Route a failed message through TTL-based retry queues.
+
+        Each retry level has a dedicated queue with increasing TTL delays:
+          - 1st retry → retry-1m (60 second delay)
+          - 2nd retry → retry-5m (5 minute delay)
+          - 3rd retry → dead-letter queue
+
+        The TTL queues dead-letter back to the main exchange with the
+        preserved routing key, so the message lands in the main queue
+        after the delay.
+        """
+        next_retry = retry_count + 1
+
+        if next_retry > self.MAX_RETRIES:
             await message.reject(requeue=False)
             logger.error(
                 "consumer.dead_lettered",
@@ -214,15 +282,46 @@ class EventConsumer:
             )
             return
 
-        new_headers = dict(message.headers or {})
-        new_headers["x-retry-count"] = retry_count + 1
+        # Find the retry queue for this retry count
+        retry_exchange_name = self._retry_queues.get(next_retry)
+        if retry_exchange_name is None:
+            # Fallback: immediate republish (shouldn't happen with RETRY_QUEUES configured)
+            logger.warning(
+                "consumer.no_retry_queue_configured",
+                retry_count=next_retry,
+                fallback="immediate_republish",
+            )
+            try:
+                assert self._exchange is not None
+                await self._exchange.publish(
+                    aio_pika.Message(
+                        body=message.body,
+                        headers={**(message.headers or {}), "x-retry-count": next_retry},
+                        content_type=message.content_type,
+                        delivery_mode=message.delivery_mode,
+                        correlation_id=message.correlation_id,
+                        message_id=message.message_id,
+                    ),
+                    routing_key=message.routing_key or "",
+                )
+                await message.ack()
+            except Exception as e:
+                logger.error("consumer.republish_failed", error=str(e))
+                await message.reject(requeue=False)
+            return
 
         try:
-            assert self._exchange is not None
-            await self._exchange.publish(
+            assert self.channel is not None
+            retry_exchange = await self.channel.declare_exchange(
+                retry_exchange_name,
+                aio_pika.ExchangeType.TOPIC,
+                durable=True,
+            )
+
+            await retry_exchange.publish(
                 aio_pika.Message(
                     body=message.body,
-                    headers=new_headers,
+                    headers={**(message.headers or {}), "x-retry-count": next_retry},
                     content_type=message.content_type,
                     delivery_mode=message.delivery_mode,
                     correlation_id=message.correlation_id,
@@ -230,16 +329,17 @@ class EventConsumer:
                 ),
                 routing_key=message.routing_key or "",
             )
+
             await message.ack()
             logger.warning(
-                "consumer.requeued",
+                "consumer.queued_for_retry",
                 routing_key=message.routing_key,
-                retry_count=retry_count + 1,
-                max_retries=self.MAX_RETRIES,
+                retry_count=next_retry,
+                retry_queue=retry_exchange_name,
             )
         except Exception as repub_ex:
             logger.error(
-                "consumer.republish_failed",
+                "consumer.retry_publish_failed",
                 routing_key=message.routing_key,
                 error=str(repub_ex),
                 retry_count=retry_count,
