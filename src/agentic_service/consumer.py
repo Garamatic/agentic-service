@@ -5,23 +5,46 @@ NotificationComposer + narrow ports.
 """
 
 import asyncio
-import contextlib
 import json
 import signal
 
 import aio_pika
 import structlog
 
-from .clients import RabbitMQPublisher
-from .notification_adapters import (
-    MessageQueueEmailSender,
-    ServiceEmailSender,
-    ServiceTicketLookup,
-)
-from .notifications import NotificationComposer
+from .notification_adapters import MessageQueueEmailSender
+from .notifications import NotificationComposer, TicketSnapshot
 from .service import GaramaticService, create_service
 
 logger = structlog.get_logger()
+
+
+# ------------------------------------------------------------------
+# Inline ticket lookup adapter — narrows GaramaticService to TicketLookup port
+# ------------------------------------------------------------------
+
+class _TicketLookup:
+    """Narrow adapter: GaramaticService.get_ticket() → TicketSnapshot."""
+
+    def __init__(self, service: GaramaticService) -> None:
+        self._service = service
+
+    async def get_ticket(self, ticket_id: str) -> TicketSnapshot | None:
+        try:
+            ticket = await self._service.get_ticket(ticket_id)
+            return TicketSnapshot(
+                id=ticket.id,
+                customer_email=ticket.customer_email,
+                customer_name=ticket.customer_name,
+                title=ticket.title,
+            )
+        except Exception as exc:
+            logger.warning(
+                "ticket_lookup.failed",
+                ticket_id=ticket_id,
+                error=str(exc),
+            )
+            return None
+
 
 # Global flag for graceful shutdown
 running = True
@@ -34,21 +57,15 @@ class EventConsumer:
         self,
         service: GaramaticService,
         amqp_url: str,
-        mq_publisher: RabbitMQPublisher | None = None,
         owns_service: bool = False,
     ):
         self._service = service
         self._owns_service = owns_service
         self.amqp_url = amqp_url
 
-        email_sender = (
-            MessageQueueEmailSender(mq_publisher)
-            if mq_publisher is not None
-            else ServiceEmailSender(service)
-        )
         self._composer = NotificationComposer(
-            email_sender=email_sender,
-            ticket_lookup=ServiceTicketLookup(service),
+            email_sender=MessageQueueEmailSender(service.mq),
+            ticket_lookup=_TicketLookup(service),
         )
 
         self.connection: aio_pika.RobustConnection | None = None
@@ -119,7 +136,17 @@ class EventConsumer:
         try:
             body = json.loads(message.body)
             routing_key = message.routing_key
-            event_data = body.get("data") if "data" in body else body
+
+            if not isinstance(body, dict):
+                logger.error("consumer.invalid_body", body_type=type(body).__name__)
+                await message.ack()
+                return
+
+            event_data = body["data"] if "data" in body and isinstance(body["data"], dict) else body
+            if not isinstance(event_data, dict):
+                logger.error("consumer.invalid_event_data", data_type=type(event_data).__name__)
+                await message.ack()
+                return
 
             logger.info("consumer.received", routing_key=routing_key, retry_count=retry_count)
 

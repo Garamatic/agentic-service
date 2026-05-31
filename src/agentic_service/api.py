@@ -2,6 +2,9 @@
 
 from contextlib import asynccontextmanager
 
+import functools
+from typing import Any, Callable
+
 import pybreaker
 import structlog
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -9,6 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
+import os
+
+from .agent import GaramaticAgent
 from .config import get_settings
 from .service import (
     GaramaticService,
@@ -16,9 +22,12 @@ from .service import (
     ServiceUnavailableError,
     UpstreamError,
     ValidationError,
-    _generate_request_id,
-    create_facade_service,
+    generate_request_id,
+    create_service,
 )
+
+# Agent cache bound to prevent unbounded memory growth
+MAX_AGENT_CACHE = 100
 
 logger = structlog.get_logger()
 
@@ -41,6 +50,58 @@ def create_error_response(
     if is_development and internal_error:
         response["debug"] = internal_error
     return response
+
+
+def api_error_handler(
+    operation: str | None = None,
+    not_found_message: str = "Not found",
+    validation_message: str = "Invalid input",
+) -> Callable[..., Callable[..., Any]]:
+    """Decorator that wraps API endpoints with error handling.
+
+    Maps service-level exceptions to HTTPExceptions:
+    NotFoundError → 404, ValidationError → 400, UpstreamError → 500.
+    Passes through HTTPException, ServiceUnavailableError, CircuitBreakerError.
+    """
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        op_name = operation or func.__name__.removeprefix("api_")
+
+        @functools.wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            rid = generate_request_id()
+            logger.info(f"api.{op_name}", request_id=rid, **kwargs)
+            try:
+                return await func(*args, **kwargs)
+            except HTTPException:
+                raise
+            except ServiceUnavailableError:
+                raise
+            except NotFoundError:
+                raise HTTPException(
+                    status_code=404,
+                    detail=create_error_response(rid, not_found_message)
+                ) from None
+            except ValidationError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=create_error_response(rid, validation_message)
+                ) from None
+            except UpstreamError as e:
+                logger.error(f"api.{op_name}_failed", error=str(e), request_id=rid)
+                raise HTTPException(
+                    status_code=500,
+                    detail=create_error_response(rid, "Failed to process request")
+                ) from None
+            except pybreaker.CircuitBreakerError:
+                raise
+            except Exception as e:
+                logger.error(f"api.{op_name}_failed", error=str(e), request_id=rid)
+                raise HTTPException(
+                    status_code=500,
+                    detail=create_error_response(rid, "Failed to process request")
+                ) from None
+        return wrapper
+    return decorator
 
 
 class CreateTicketRequest(BaseModel):
@@ -76,16 +137,22 @@ class SendEmailRequest(BaseModel):
 async def lifespan(app: FastAPI):
     """Initialize and cleanup service.
 
-    Uses create_facade_service() to wire the unified AgenticService facade
-    with the GaramaticService business layer.
+    Uses create_service() as the single composition root.
     """
-    facade, service = await create_facade_service()
+    service = await create_service()
     app.state.service = service
+    app.state.agent_cache = {}
 
     logger.info("api.started")
     yield
 
-    await facade.close()
+    # Close all cached agent instances
+    agent_cache = getattr(app.state, "agent_cache", {})
+    for agent in agent_cache.values():
+        await agent.close()
+    app.state.agent_cache = {}
+
+    await service.close()
     logger.info("api.stopped")
 
 
@@ -109,7 +176,7 @@ app.add_middleware(
 @app.exception_handler(pybreaker.CircuitBreakerError)
 async def circuit_breaker_handler(request: Request, exc: pybreaker.CircuitBreakerError):
     """Handle circuit breaker open state."""
-    rid = _generate_request_id()
+    rid = generate_request_id()
     logger.warning("api.circuit_breaker_open", request_id=rid, path=request.url.path)
 
     return JSONResponse(
@@ -137,7 +204,7 @@ async def service_unavailable_handler(request: Request, exc: ServiceUnavailableE
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     """Handle all unhandled exceptions with sanitized responses."""
-    rid = _generate_request_id()
+    rid = generate_request_id()
     logger.error("api.unhandled_exception", request_id=rid, error=str(exc), path=request.url.path)
 
     config = get_settings()
@@ -158,6 +225,7 @@ def _get_service() -> GaramaticService:
 
 
 @app.get("/health")
+@api_error_handler("health_check")
 async def health_check():
     """Health check endpoint."""
     service = _get_service()
@@ -169,33 +237,11 @@ async def health_check():
 
 
 @app.get("/tickets/{ticket_id}")
+@api_error_handler("get_ticket", not_found_message="Ticket not found")
 async def api_get_ticket(ticket_id: str):
     """Get ticket details."""
     service = _get_service()
-    rid = _generate_request_id()
-    logger.info("api.get_ticket", ticket_id=ticket_id, request_id=rid)
-    try:
-        ticket = await service.get_ticket(ticket_id)
-    except NotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail=create_error_response(rid, "Ticket not found")
-        ) from None
-    except UpstreamError as e:
-        logger.error("api.get_ticket_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
-        raise HTTPException(
-            status_code=500,
-            detail=create_error_response(rid, "Failed to retrieve ticket")
-        ) from None
-    except Exception as e:
-        if isinstance(e, pybreaker.CircuitBreakerError):
-            raise
-        logger.error("api.get_ticket_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
-        raise HTTPException(
-            status_code=500,
-            detail=create_error_response(rid, "Failed to retrieve ticket")
-        ) from None
-
+    ticket = await service.get_ticket(ticket_id)
     return {
         "ticket_id": ticket_id,
         "status": ticket.status,
@@ -211,6 +257,7 @@ async def api_get_ticket(ticket_id: str):
 
 
 @app.get("/tickets")
+@api_error_handler("list_tickets")
 async def api_list_tickets(
     customer_email: EmailStr | None = None,
     status: str | None = Query(None, pattern="^(open|resolved|closed)$"),
@@ -218,22 +265,11 @@ async def api_list_tickets(
 ):
     """List tickets with optional filters."""
     service = _get_service()
-    rid = _generate_request_id()
-    logger.info("api.list_tickets", email=customer_email, status=status, request_id=rid)
-    try:
-        tickets = await service.list_tickets(
-            customer_email=customer_email,
-            status=status,  # type: ignore[arg-type]
-            limit=limit,
-        )
-    except Exception as e:
-        if isinstance(e, pybreaker.CircuitBreakerError):
-            raise
-        logger.error("api.list_tickets_failed", error=str(e), request_id=rid)
-        raise HTTPException(
-            status_code=500, detail=create_error_response(rid, "Failed to list tickets")
-        ) from None
-
+    tickets = await service.list_tickets(
+        customer_email=customer_email,
+        status=status,  # type: ignore[arg-type]
+        limit=limit,
+    )
     return [
         {
             "ticket_id": t.id,
@@ -247,35 +283,23 @@ async def api_list_tickets(
 
 
 @app.post("/tickets")
+@api_error_handler("create_ticket")
 async def api_create_ticket(request: CreateTicketRequest):
     """Create a new ticket."""
     service = _get_service()
-    rid = _generate_request_id()
-    logger.info(
-        "api.create_ticket", title=request.title, customer=request.customer_email, request_id=rid
+    ticket = await service.create_ticket(
+        title=request.title,
+        description=request.description,
+        customer_email=request.customer_email,
+        customer_name=request.customer_name,
+        priority=request.priority,  # type: ignore[arg-type]
     )
-    try:
-        ticket = await service.create_ticket(
-            title=request.title,
-            description=request.description,
-            customer_email=request.customer_email,
-            customer_name=request.customer_name,
-            priority=request.priority,  # type: ignore[arg-type]
-        )
-    except Exception as e:
-        if isinstance(e, pybreaker.CircuitBreakerError):
-            raise
-        logger.error("api.create_ticket_failed", error=str(e), request_id=rid)
-        raise HTTPException(
-            status_code=500, detail=create_error_response(rid, "Failed to create ticket")
-        ) from None
 
     ticket_id = ticket.id
     if not ticket_id or ticket_id == "N/A":
-        logger.error("api.create_ticket.no_id", request_id=rid)
         raise HTTPException(
             status_code=500,
-            detail=create_error_response(rid, "Ticket created but no ID returned")
+            detail=create_error_response(generate_request_id(), "Ticket created but no ID returned")
         )
 
     return {
@@ -288,31 +312,15 @@ async def api_create_ticket(request: CreateTicketRequest):
 
 
 @app.post("/tickets/{ticket_id}/resolve")
+@api_error_handler("resolve_ticket", not_found_message="Ticket not found")
 async def api_resolve_ticket(ticket_id: str, request: ResolveTicketRequest):
     """Resolve a ticket."""
     service = _get_service()
-    rid = _generate_request_id()
-    logger.info(
-        "api.resolve_ticket", ticket_id=ticket_id, billable=request.billable_amount, request_id=rid
+    result = await service.resolve_ticket(
+        ticket_id=ticket_id,
+        resolution_notes=request.resolution_notes,
+        billable_amount=request.billable_amount,
     )
-    try:
-        result = await service.resolve_ticket(
-            ticket_id=ticket_id,
-            resolution_notes=request.resolution_notes,
-            billable_amount=request.billable_amount,
-        )
-    except NotFoundError:
-        raise HTTPException(
-            status_code=404,
-            detail=create_error_response(rid, "Ticket not found")
-        ) from None
-    except Exception as e:
-        if isinstance(e, pybreaker.CircuitBreakerError):
-            raise
-        logger.error("api.resolve_ticket_failed", error=str(e), request_id=rid)
-        raise HTTPException(
-            status_code=500, detail=create_error_response(rid, "Failed to resolve ticket")
-        ) from None
 
     response = {
         "ticket_id": ticket_id,
@@ -328,25 +336,16 @@ async def api_resolve_ticket(ticket_id: str, request: ResolveTicketRequest):
 
 
 @app.get("/invoices/by-ticket/{ticket_id}")
+@api_error_handler("get_invoice", not_found_message="Invoice not found for this ticket")
 async def api_get_invoice(ticket_id: str):
     """Get invoice for a ticket."""
     service = _get_service()
-    rid = _generate_request_id()
-    logger.info("api.get_invoice", ticket_id=ticket_id, request_id=rid)
-    try:
-        invoice = await service.get_invoice_status(ticket_id)
-    except Exception as e:
-        if isinstance(e, pybreaker.CircuitBreakerError):
-            raise
-        logger.error("api.get_invoice_failed", error=str(e), request_id=rid)
-        raise HTTPException(
-            status_code=500, detail=create_error_response(rid, "Failed to retrieve invoice")
-        ) from None
+    invoice = await service.get_invoice_status(ticket_id)
 
     if invoice.status == "not_found":
         raise HTTPException(
             status_code=404,
-            detail=create_error_response(rid, "Invoice not found for this ticket")
+            detail=create_error_response(generate_request_id(), "Invoice not found for this ticket")
         )
 
     return {
@@ -360,30 +359,15 @@ async def api_get_invoice(ticket_id: str):
 
 
 @app.post("/invoices/{ticket_id}")
+@api_error_handler("create_invoice", not_found_message="Ticket not found")
 async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
     """Create an invoice for a ticket."""
     service = _get_service()
-    rid = _generate_request_id()
-    logger.info(
-        "api.create_invoice", ticket_id=ticket_id, amount=request.amount, request_id=rid
+    result = await service.queue_invoice(
+        ticket_id=ticket_id,
+        amount=request.amount,
+        description=request.description,
     )
-    try:
-        result = await service.queue_invoice(
-            ticket_id=ticket_id,
-            amount=request.amount,
-            description=request.description,
-        )
-    except NotFoundError:
-        raise HTTPException(
-            status_code=404, detail=create_error_response(rid, "Ticket not found")
-        ) from None
-    except Exception as e:
-        if isinstance(e, pybreaker.CircuitBreakerError):
-            raise
-        logger.error("api.create_invoice_failed", ticket_id=ticket_id, error=str(e), request_id=rid)
-        raise HTTPException(
-            status_code=503, detail=create_error_response(rid, "Failed to queue invoice creation")
-        ) from None
 
     return {
         "status": result.status,
@@ -394,27 +378,16 @@ async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
 
 
 @app.post("/emails")
+@api_error_handler("send_email")
 async def api_send_email(request: SendEmailRequest):
     """Send an email."""
     service = _get_service()
-    rid = _generate_request_id()
-    logger.info(
-        "api.send_email", to=request.to_email, subject=request.subject, request_id=rid
+    result = await service.send_email(
+        to_email=request.to_email,
+        subject=request.subject,
+        body=request.body,
+        from_name=request.from_name,
     )
-    try:
-        result = await service.send_email(
-            to_email=request.to_email,
-            subject=request.subject,
-            body=request.body,
-            from_name=request.from_name,
-        )
-    except Exception as e:
-        if isinstance(e, pybreaker.CircuitBreakerError):
-            raise
-        logger.error("api.send_email_failed", to=request.to_email, error=str(e), request_id=rid)
-        raise HTTPException(
-            status_code=503, detail=create_error_response(rid, "Failed to queue email")
-        ) from None
 
     return {
         "status": result.status,
@@ -425,25 +398,11 @@ async def api_send_email(request: SendEmailRequest):
 
 
 @app.get("/customers/{email}/context")
+@api_error_handler("get_customer_context", validation_message="Invalid email format")
 async def api_get_customer_context(email: str):
     """Get full customer context."""
     service = _get_service()
-    rid = _generate_request_id()
-    logger.info("api.get_customer_context", email=email, request_id=rid)
-    try:
-        context = await service.get_customer_context(email)
-    except ValidationError as e:
-        raise HTTPException(
-            status_code=400, detail=create_error_response(rid, "Invalid email format")
-        ) from e
-    except Exception as e:
-        if isinstance(e, pybreaker.CircuitBreakerError):
-            raise
-        logger.error("api.get_customer_context_failed", error=str(e), request_id=rid)
-        raise HTTPException(
-            status_code=500,
-            detail=create_error_response(rid, "Failed to retrieve customer context"),
-        ) from None
+    context = await service.get_customer_context(email)
 
     return {
         "customer_email": context.customer_email,
@@ -482,36 +441,44 @@ class ChatRequest(BaseModel):
 
 @app.post("/agent/chat")
 async def api_agent_chat(request: ChatRequest):
-    """Chat with the Garamatic AI agent.
-
-    The agent can answer questions about tickets, customers, and invoices,
-    and can perform actions like resolving tickets or creating invoices.
-    """
-    import os
+    """Chat with the Garamatic AI agent."""
+    rid = generate_request_id()
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(
             status_code=503,
-            detail={"error": "Agent unavailable", "message": "OPENAI_API_KEY not configured"}
+            detail=create_error_response(rid, "Agent unavailable", "OPENAI_API_KEY not configured")
         )
 
-    from .agent import GaramaticAgent
-
-    rid = _generate_request_id()
+    service = _get_service()
     logger.info("api.agent_chat", thread_id=request.thread_id, request_id=rid)
 
-    agent = None
+    agent_cache = getattr(app.state, "agent_cache", {})
+    agent = agent_cache.get(request.thread_id)
+    if agent is None:
+        agent = GaramaticAgent(service=service, thread_id=request.thread_id)
+        agent_cache[request.thread_id] = agent
+        while len(agent_cache) > MAX_AGENT_CACHE:
+            oldest_thread_id = next(iter(agent_cache))
+            oldest_agent = agent_cache.pop(oldest_thread_id)
+            try:
+                await oldest_agent.close()
+            except Exception:
+                logger.warning("api.agent_cache_evict_failed", thread_id=oldest_thread_id)
+        app.state.agent_cache = agent_cache
+
     try:
-        agent = GaramaticAgent(thread_id=request.thread_id)
         response = await agent.process(request.message)
+    except ServiceUnavailableError:
+        raise HTTPException(
+            status_code=503,
+            detail=create_error_response(rid, "Service temporarily unavailable")
+        ) from None
     except Exception as e:
         logger.error("api.agent_chat_failed", error=str(e), request_id=rid)
         raise HTTPException(
             status_code=500,
-            detail={"error": "Agent failed", "message": str(e)}
+            detail=create_error_response(rid, "Agent failed", str(e), get_settings().log_level.upper() == "DEBUG")
         ) from None
-    finally:
-        if agent is not None:
-            await agent.close()
 
     return {
         "thread_id": request.thread_id,

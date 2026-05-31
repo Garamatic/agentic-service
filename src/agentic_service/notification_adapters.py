@@ -7,8 +7,6 @@ fakes for testing.
 
 from __future__ import annotations
 
-from typing import Any
-
 import structlog
 
 from .notifications import (
@@ -69,68 +67,6 @@ class MessageQueueEmailSender:
                 subject=message.subject,
                 message=f"Failed to queue email: {exc}",
             )
-
-
-# ------------------------------------------------------------------
-# Compatibility adapters (for incremental migration)
-# ------------------------------------------------------------------
-
-class ServiceEmailSender:
-    """Temporary bridge from GaramaticService.send_email() to EmailSender port.
-
-    Use this during migration; prefer MessageQueueEmailSender once the
-    service layer no longer needs to own email sending.
-    """
-
-    def __init__(self, service: Any) -> None:
-        self._service = service
-
-    async def send_email(self, message: EmailMessage) -> EmailSendResult:
-        try:
-            result = await self._service.send_email(
-                to_email=message.to_email,
-                subject=message.subject,
-                body=message.body_html,
-                from_name=message.sender.name,
-                from_email=message.sender.email,
-            )
-            return EmailSendResult(
-                status=result.status,
-                to_email=result.to_email,
-                subject=result.subject,
-                message=result.message,
-            )
-        except Exception as exc:
-            return EmailSendResult(
-                status="failed",
-                to_email=message.to_email,
-                subject=message.subject,
-                message=f"Service send_email failed: {exc}",
-            )
-
-
-class ServiceTicketLookup:
-    """Temporary bridge from GaramaticService.get_ticket() to TicketLookup port."""
-
-    def __init__(self, service: Any) -> None:
-        self._service = service
-
-    async def get_ticket(self, ticket_id: str) -> TicketSnapshot | None:
-        try:
-            ticket = await self._service.get_ticket(ticket_id)
-            return TicketSnapshot(
-                id=ticket.id,
-                customer_email=ticket.customer_email,
-                customer_name=ticket.customer_name,
-                title=ticket.title,
-            )
-        except Exception as exc:
-            logger.warning(
-                "service_ticket_lookup.failed",
-                ticket_id=ticket_id,
-                error=str(exc),
-            )
-            return None
 
 
 # ------------------------------------------------------------------

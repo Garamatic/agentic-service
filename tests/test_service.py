@@ -19,7 +19,7 @@ from agentic_service.service import (
     Ticket,
     TicketSummary,
     ValidationError,
-    _validate_email,
+    validate_email,
 )
 
 # ------------------------------------------------------------------
@@ -156,7 +156,7 @@ class TestEmailValidation:
             "firstname+lastname@example.com",
             "user@subdomain.example.com",
         ]:
-            _validate_email(email)  # should not raise
+            validate_email(email)  # should not raise
 
     def test_invalid_emails(self):
         for email in [
@@ -170,7 +170,7 @@ class TestEmailValidation:
             "test@.example.com",
         ]:
             with pytest.raises(ValidationError):
-                _validate_email(email)
+                validate_email(email)
 
 
 # ------------------------------------------------------------------

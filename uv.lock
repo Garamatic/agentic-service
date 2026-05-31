@@ -533,7 +533,7 @@ wheels = [
 
 [[package]]
 name = "garamatic-agentic"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "aio-pika" },
@@ -563,6 +563,14 @@ dev = [
     { name = "ruff" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "pytest-httpx" },
+    { name = "respx" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "aio-pika", specifier = ">=9.4.0" },
@@ -588,6 +596,14 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.32.0" },
 ]
 provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.0.3" },
+    { name = "pytest-asyncio", specifier = ">=1.3.0" },
+    { name = "pytest-httpx", specifier = ">=0.36.2" },
+    { name = "respx", specifier = ">=0.23.1" },
+]
 
 [[package]]
 name = "griffelib"

@@ -10,16 +10,14 @@ from typing import Any
 import structlog
 from fastmcp import Context, FastMCP
 
-from .clients import OdooBridgeClient, TicketClient
-from .config import get_settings
 from .service import (
     GaramaticService,
     NotFoundError,
     ServiceUnavailableError,
     ValidationError,
-    _format_date,
-    _validate_email,
-    create_facade_service,
+    format_date,
+    validate_email,
+    create_service,
 )
 
 logger = structlog.get_logger()
@@ -29,21 +27,27 @@ logger = structlog.get_logger()
 # Lifespan: create service, inject into MCP context
 # ------------------------------------------------------------------
 
+# Module-level reference for lifespan-managed service (used by resources)
+_lifespan_service: GaramaticService | None = None
+
+
 @asynccontextmanager
 async def app_lifespan(server: "FastMCP"):
     """Initialize and cleanup service on server startup/shutdown.
 
-    Uses create_facade_service() to wire the unified AgenticService facade
-    with the GaramaticService business layer.
+    Uses create_service() as the single composition root.
     """
-    facade, service = await create_facade_service()
+    global _lifespan_service
+    service = await create_service()
+    _lifespan_service = service
 
     logger.info("service.started")
 
     try:
         yield {"service": service}
     finally:
-        await facade.close()
+        _lifespan_service = None
+        await service.close()
         logger.info("service.stopped")
 
 
@@ -127,7 +131,7 @@ async def list_customer_tickets(
     """
     service = _get_service(ctx)
     try:
-        _validate_email(customer_email)
+        validate_email(customer_email)
     except ValidationError as e:
         raise ValueError(str(e)) from e
 
@@ -460,19 +464,14 @@ async def get_customer_context(
 # Helpers
 # ------------------------------------------------------------------
 
-async def _with_temp_service():
-    """Create a temporary GaramaticService for resources (no lifespan context)."""
-    config = get_settings()
-    odoo_client = (
-        OdooBridgeClient(config.odoo_bridge_url)
-        if config.odoo_bridge_url
-        else None
-    )
-    return GaramaticService(
-        ticket_client=TicketClient(config.ticket_api_url),
-        odoo_client=odoo_client,
-        mq_publisher=None,
-    )
+async def _get_resource_service() -> GaramaticService:
+    """Return the lifespan-managed service for resources.
+
+    Raises ServiceUnavailableError if the lifespan service is not available.
+    """
+    if _lifespan_service is not None:
+        return _lifespan_service
+    raise ServiceUnavailableError("Lifespan service not available")
 
 
 # ------------------------------------------------------------------
@@ -485,16 +484,19 @@ async def get_ticket_resource(ticket_id: str) -> str:
     if not ticket_id or not ticket_id.strip():
         return "Error: Ticket ID is required"
 
-    async with _with_temp_service() as service:
-        try:
-            ticket = await service.get_ticket(ticket_id)
-        except Exception as e:
-            return f"Error: Could not retrieve ticket {ticket_id}: {e}"
+    try:
+        service = await _get_resource_service()
+    except ServiceUnavailableError as e:
+        return f"Error: Service unavailable: {e}"
+    try:
+        ticket = await service.get_ticket(ticket_id)
+    except Exception as e:
+        return f"Error: Could not retrieve ticket {ticket_id}: {e}"
 
-        try:
-            invoice = await service.get_invoice_status(ticket_id)
-        except Exception:
-            invoice = None
+    try:
+        invoice = await service.get_invoice_status(ticket_id)
+    except Exception:
+        invoice = None
 
     invoice_info = ""
     if invoice and invoice.status != "not_found":
@@ -504,7 +506,7 @@ async def get_ticket_resource(ticket_id: str) -> str:
             f"- ID: {invoice.invoice_id or 'N/A'}\n"
             f"- Status: {invoice.status.upper()}\n"
             f"- Amount: €{amount:.2f}\n"
-            f"- Paid At: {_format_date(invoice.paid_at)}"
+            f"- Paid At: {format_date(invoice.paid_at)}"
         )
 
     return f"""
@@ -514,8 +516,8 @@ async def get_ticket_resource(ticket_id: str) -> str:
 - Status: {ticket.status.upper()}
 - Title: {ticket.title}
 - Customer: {ticket.customer_name or 'Unknown'} ({ticket.customer_email or 'Unknown'})
-- Created: {_format_date(ticket.created_at)}
-- Resolved: {_format_date(ticket.resolved_at)}
+- Created: {format_date(ticket.created_at)}
+- Resolved: {format_date(ticket.resolved_at)}
 
 ## Description
 {ticket.description or 'No description'}
@@ -528,12 +530,15 @@ async def get_ticket_resource(ticket_id: str) -> str:
 @mcp.resource("system://health")
 async def get_health() -> str:
     """MCP Resource: System health status."""
-    async with _with_temp_service() as service:
-        try:
-            health = await service.health_check()
-            health_json = {"status": health.status, "services": health.services}
-        except Exception as e:
-            health_json = {"status": "degraded", "services": {"error": str(e)}}
+    try:
+        service = await _get_resource_service()
+    except ServiceUnavailableError as e:
+        return json.dumps({"status": "degraded", "services": {"error": str(e)}}, indent=2)
+    try:
+        health = await service.health_check()
+        health_json = {"status": health.status, "services": health.services}
+    except Exception as e:
+        health_json = {"status": "degraded", "services": {"error": str(e)}}
 
     return json.dumps(health_json, indent=2)
 
@@ -542,18 +547,21 @@ async def get_health() -> str:
 async def get_customer_resource(email: str) -> str:
     """MCP Resource: Full customer profile as formatted text."""
     try:
-        _validate_email(email)
+        validate_email(email)
     except ValidationError as e:
         return f"Error: {e}"
 
-    async with _with_temp_service() as service:
-        try:
-            context = await service.get_customer_context(email)
-        except Exception as e:
-            return f"Error: Could not retrieve customer context: {e}"
+    try:
+        service = await _get_resource_service()
+    except ServiceUnavailableError as e:
+        return f"Error: Service unavailable: {e}"
+    try:
+        context = await service.get_customer_context(email)
+    except Exception as e:
+        return f"Error: Could not retrieve customer context: {e}"
 
     tickets_section = "\n".join(
-        f"- [{t.status.upper()}] {t.title} ({_format_date(t.created_at)})"
+        f"- [{t.status.upper()}] {t.title} ({format_date(t.created_at)})"
         for t in context.recent_tickets
     ) if context.recent_tickets else "No recent tickets"
 

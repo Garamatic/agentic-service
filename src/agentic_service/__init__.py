@@ -1,7 +1,3 @@
-"""Garamatic Agentic Service - MCP Server for AI integration."""
+"""Garamatic Agentic Service — AI agent tools for tickets, invoices, and emails."""
 
-__version__ = "0.1.0"
-
-from .clients import AgenticService, ServiceConfig
-
-__all__ = ["AgenticService", "ServiceConfig"]
+__version__ = "0.2.0"

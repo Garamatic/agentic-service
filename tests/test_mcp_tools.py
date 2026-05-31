@@ -21,8 +21,8 @@ from agentic_service.server import (
 )
 from agentic_service.service import (
     ValidationError,
-    _generate_request_id,
-    _validate_email,
+    generate_request_id,
+    validate_email,
 )
 
 
@@ -37,7 +37,7 @@ class TestEmailValidation:
     ])
     def test_valid_emails(self, email):
         """Should not raise for valid emails."""
-        _validate_email(email)  # Should not raise
+        validate_email(email)  # Should not raise
 
     @pytest.mark.parametrize("email", [
         "invalid-email",
@@ -52,7 +52,7 @@ class TestEmailValidation:
     def test_invalid_emails(self, email):
         """Should raise ValidationError for invalid emails."""
         with pytest.raises(ValidationError, match="Invalid email"):
-            _validate_email(email)
+            validate_email(email)
 
 
 class TestRequestIdGeneration:
@@ -60,8 +60,8 @@ class TestRequestIdGeneration:
 
     def test_generates_unique_ids(self):
         """Should generate unique IDs."""
-        id1 = _generate_request_id()
-        id2 = _generate_request_id()
+        id1 = generate_request_id()
+        id2 = generate_request_id()
         assert id1 != id2
         assert len(id1) == 32  # hex uuid
         assert len(id2) == 32
