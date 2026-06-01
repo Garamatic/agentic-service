@@ -39,7 +39,13 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
 
-    # Agent / LLM
+    # LLM Provider (openai, openrouter, ollama, llamacpp)
+    llm_provider: str = "openai"
+    llm_model: str = ""
+    llm_base_url: str = ""
+    llm_temperature: float = 0.1
+
+    # Backward compatibility — used when llm_model / llm_base_url are empty
     openai_api_key: SecretStr = SecretStr("")
     openai_model: str = "gpt-4o-mini"
 

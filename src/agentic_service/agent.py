@@ -143,10 +143,10 @@ def create_agent(
             return "tools"
         return "__end__"
 
-    from langchain_openai import ChatOpenAI
+    from .llm_adapter import build_llm
 
     config = get_settings()
-    model = ChatOpenAI(model=config.openai_model, temperature=0.1)
+    model = build_llm(config)
     model_with_tools = model.bind_tools(tools)
 
     def call_model(state: AgentState) -> dict[str, Any]:
@@ -319,11 +319,14 @@ async def main_async():
 
 def main():
     """Run the AI Agent."""
+    from .llm_adapter import validate_llm_config
+
     config = get_settings()
-    api_key = config.openai_api_key.get_secret_value()
-    if not api_key:
-        print("⚠️  Warning: OPENAI_API_KEY not set. Agent will not function.")
-        print("Set it with: export OPENAI_API_KEY='your-key-here'")
+    try:
+        validate_llm_config(config)
+    except ValueError as e:
+        print(f"⚠️  Warning: {e}")
+        print("Set OPENAI_API_KEY or LLM_BASE_URL / LLM_PROVIDER.")
         return
 
     asyncio.run(main_async())

@@ -506,11 +506,15 @@ async def api_agent_chat(request: ChatRequest):
     """Chat with the Garamatic AI agent."""
     rid = generate_request_id()
     config = get_settings()
-    api_key = config.openai_api_key.get_secret_value()
-    if not api_key:
+
+    from .llm_adapter import validate_llm_config
+
+    try:
+        validate_llm_config(config)
+    except ValueError as e:
         raise HTTPException(
             status_code=503,
-            detail=create_error_response(rid, "Agent unavailable", "OPENAI_API_KEY not configured"),
+            detail=create_error_response(rid, "Agent unavailable", str(e)),
         )
 
     service = _get_service()

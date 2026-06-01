@@ -257,7 +257,7 @@ def mock_model():
 class TestGaramaticAgent:
     async def test_process_returns_response(self, fake_service, mock_model):
         """Should process a message and return the AI response."""
-        with patch("langchain_openai.ChatOpenAI", return_value=mock_model):
+        with patch("agentic_service.agent.build_llm", return_value=mock_model):
             # First invocation: model responds with a tool call
             # Second invocation: model responds with final text
             mock_model.invoke = MagicMock(
@@ -291,7 +291,7 @@ class TestGaramaticAgent:
 
     async def test_process_without_tools(self, fake_service, mock_model):
         """Should handle a simple response without tool calls."""
-        with patch("langchain_openai.ChatOpenAI", return_value=mock_model):
+        with patch("agentic_service.agent.build_llm", return_value=mock_model):
             mock_model.invoke = MagicMock(return_value=AIMessage(content="Hello!"))
 
             checkpointer = MemorySaver()
@@ -309,7 +309,7 @@ class TestGaramaticAgent:
 
     async def test_get_state(self, fake_service, mock_model):
         """Should return current conversation state."""
-        with patch("langchain_openai.ChatOpenAI", return_value=mock_model):
+        with patch("agentic_service.agent.build_llm", return_value=mock_model):
             mock_model.invoke = MagicMock(return_value=AIMessage(content="Hi!"))
 
             checkpointer = MemorySaver()
@@ -329,7 +329,7 @@ class TestGaramaticAgent:
 
     async def test_close_cleans_up(self, fake_service, mock_model):
         """Should close without errors."""
-        with patch("langchain_openai.ChatOpenAI", return_value=mock_model):
+        with patch("agentic_service.agent.build_llm", return_value=mock_model):
             mock_model.invoke = MagicMock(return_value=AIMessage(content="Hi!"))
 
             checkpointer = MemorySaver()
@@ -363,7 +363,7 @@ class TestGaramaticAgent:
 class TestCreateAgent:
     def test_compiles_graph(self, fake_service, mock_model):
         """Should create a compilable LangGraph."""
-        with patch("langchain_openai.ChatOpenAI", return_value=mock_model):
+        with patch("agentic_service.agent.build_llm", return_value=mock_model):
             checkpointer = MemorySaver()
             graph = create_agent(fake_service, checkpointer)
             assert graph is not None
