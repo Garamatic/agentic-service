@@ -12,6 +12,12 @@ from httpx import ASGITransport, AsyncClient
 
 from agentic_service.api import app as fastapi_app
 from agentic_service.service import GaramaticService
+import sys
+from pathlib import Path
+
+# Add project root to path so tests.fakes can be imported
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
 from tests.fakes import FakeMQ, FakeOdooClient, FakeTicketClient
 
 

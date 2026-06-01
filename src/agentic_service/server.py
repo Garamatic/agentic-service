@@ -20,6 +20,8 @@ from .service import (
     validate_email,
 )
 
+from .approval import ApprovalRequiredError
+
 logger = structlog.get_logger()
 
 
@@ -191,8 +193,8 @@ async def create_ticket(
             customer_name=customer_name,
             priority=priority,  # type: ignore[arg-type]
         )
-    except ValidationError as e:
-        raise ValueError(str(e)) from e
+    except (ValidationError, ValueError) as e:
+        return {"error": str(e), "status": "failed"}
     except Exception as e:
         return {"error": f"Failed to create ticket: {e}", "status": "failed"}
 
@@ -238,10 +240,17 @@ async def resolve_ticket(
             resolution_notes=resolution_notes,
             billable_amount=billable_amount,
         )
-    except ValidationError as e:
-        raise ValueError(str(e)) from e
+    except (ValidationError, ValueError) as e:
+        return {"ticket_id": ticket_id, "status": "error", "message": str(e)}
     except NotFoundError:
         return {"ticket_id": ticket_id, "status": "not_found", "message": "Ticket not found"}
+    except ApprovalRequiredError as e:
+        return {
+            "ticket_id": ticket_id,
+            "status": "approval_required",
+            "approval_id": e.approval_id,
+            "message": str(e),
+        }
     except Exception as e:
         return {
             "ticket_id": ticket_id,
@@ -289,8 +298,12 @@ async def create_invoice(
             amount=amount,
             description=description,
         )
-    except ValidationError as e:
-        raise ValueError(str(e)) from e
+    except (ValidationError, ValueError) as e:
+        return {
+            "error": str(e),
+            "status": "failed",
+            "ticket_id": ticket_id,
+        }
     except Exception as e:
         return {
             "error": f"Failed to queue invoice: {e}",
@@ -322,8 +335,12 @@ async def get_invoice_status(ticket_id: str, *, ctx: Context) -> dict[str, Any]:
     service = _get_service(ctx)
     try:
         invoice = await service.get_invoice_status(ticket_id)
-    except ValidationError as e:
-        raise ValueError(str(e)) from e
+    except (ValidationError, ValueError) as e:
+        return {
+            "ticket_id": ticket_id,
+            "status": "error",
+            "message": str(e),
+        }
     except Exception as e:
         return {
             "ticket_id": ticket_id,
@@ -372,8 +389,8 @@ async def send_email(
             body=body,
             from_name=from_name,
         )
-    except ValidationError as e:
-        raise ValueError(str(e)) from e
+    except (ValidationError, ValueError) as e:
+        return {"error": str(e), "status": "failed", "to_email": to_email}
     except Exception as e:
         return {"error": f"Failed to queue email: {e}", "status": "failed", "to_email": to_email}
 
@@ -413,6 +430,7 @@ async def get_customer_context(customer_email: str, *, ctx: Context) -> dict[str
     await ctx.info(f"Retrieved context for {customer_email}")
 
     return {
+        "status": "success",
         "customer_email": context.customer_email,
         "summary": {
             "total_tickets": context.summary.total_tickets,
