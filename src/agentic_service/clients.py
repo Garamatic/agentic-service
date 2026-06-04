@@ -150,19 +150,30 @@ class TicketClient:
         Returns:
             The created ticket data
         """
-        # WorkItemDto requires status and domainId at minimum
+        # Use the anonymous /api/tickets endpoint which is [AllowAnonymous]
+        # and creates customers on-the-fly with snake_case fields
+        tickets_url = str(self.client.base_url).replace("/api/v1", "/api/tickets")
         payload = {
-            "title": title,
+            "customer_email": customer_id,
+            "customer_name": kwargs.get("customer_name", "External User"),
             "description": description,
-            "customerId": customer_id,
-            "status": "open",
-            "domainId": "IT",
-            **kwargs,
+            "subject": title,
+            "source": "agentic-service",
         }
 
-        response = await self.client.post("/work-items", json=payload)
+        response = await self.client.post(
+            tickets_url,
+            json=payload,
+        )
         response.raise_for_status()
-        return response.json()
+        ticket = response.json()
+        return {
+            "ticket_id": ticket.get("ticket_id"),
+            "title": title,
+            "description": description,
+            "status": "open",
+            "customer_email": customer_id,
+        }
 
     @ticket_api_breaker
     @retry(
