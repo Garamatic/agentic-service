@@ -592,11 +592,16 @@ class GaramaticService:
 
         async def _fetch() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             tickets_data = await self._ticket.list_tickets(customer_id=customer_email, limit=50)
-            invoices_data = (
-                await self._odoo.list_customer_invoices(customer_email)
-                if self._odoo is not None
-                else []
-            )
+            invoices_data: list[dict[str, Any]] = []
+            if self._odoo is not None:
+                try:
+                    invoices_data = await self._odoo.list_customer_invoices(customer_email)
+                except Exception as exc:
+                    logger.warning(
+                        "service.get_customer_context.odoo_unavailable",
+                        error=str(exc),
+                        email=customer_email,
+                    )
             return tickets_data, invoices_data
 
         tickets_data, invoices_data = await self._call_port(

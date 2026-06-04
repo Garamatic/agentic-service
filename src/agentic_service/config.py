@@ -11,7 +11,7 @@ class Settings(BaseSettings):
 
     # API URLs
     ticket_api_url: str = "http://localhost:5000"
-    odoo_bridge_url: str = "http://localhost:5001"
+    odoo_bridge_url: str = ""
 
     # API Keys
     ticket_api_key: str = ""

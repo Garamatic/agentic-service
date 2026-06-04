@@ -150,10 +150,13 @@ class TicketClient:
         Returns:
             The created ticket data
         """
+        # WorkItemDto requires status and domainId at minimum
         payload = {
             "title": title,
             "description": description,
             "customerId": customer_id,
+            "status": "open",
+            "domainId": "IT",
             **kwargs,
         }
 
