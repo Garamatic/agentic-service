@@ -167,8 +167,10 @@ class TicketClient:
         )
         response.raise_for_status()
         ticket = response.json()
+        # .NET Web API returns camelCase by default: ticketId, success, message
+        ticket_id = ticket.get("ticketId") or ticket.get("ticket_id")
         return {
-            "ticket_id": ticket.get("ticket_id"),
+            "id": ticket_id,
             "title": title,
             "description": description,
             "status": "open",
