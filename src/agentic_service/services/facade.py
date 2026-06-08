@@ -365,7 +365,7 @@ async def create_service() -> GaramaticService:
     """
     config = get_settings()
 
-    ticket_client = TicketClient(config.ticket_api_url)
+    ticket_client = TicketClient(config.ticket_api_url, api_key=config.ticket_api_key or None)
     odoo_client = OdooBridgeClient(config.odoo_bridge_url) if config.odoo_bridge_url else None
 
     mq_publisher: RabbitMQPublisher | None = None
