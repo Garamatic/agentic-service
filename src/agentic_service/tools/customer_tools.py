@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from ..service import GaramaticService, ValidationError
@@ -83,6 +84,11 @@ def register_tools() -> None:
             handler=_get_customer_context,
             description="Get full customer context across all services.",
             group="customer",
+            annotations=ToolAnnotations(
+                title="Get customer context",
+                readOnlyHint=True,
+                idempotentHint=True,
+            ),
         )
     )
 

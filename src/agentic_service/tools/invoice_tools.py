@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from ..service import GaramaticService, ValidationError
@@ -109,6 +110,13 @@ def register_tools() -> None:
             handler=_create_invoice,
             description="Create an invoice for a ticket via the Odoo integration.",
             group="invoice",
+            annotations=ToolAnnotations(
+                title="Create invoice",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
         )
     )
     registry.register(
@@ -118,6 +126,11 @@ def register_tools() -> None:
             handler=_get_invoice_status,
             description="Check invoice status for a ticket.",
             group="invoice",
+            annotations=ToolAnnotations(
+                title="Get invoice status",
+                readOnlyHint=True,
+                idempotentHint=True,
+            ),
         )
     )
 

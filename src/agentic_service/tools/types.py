@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, NotRequired
 
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
@@ -55,5 +56,7 @@ class ToolDefinition:
     description: str
     group: str = "general"
     approval_threshold: float | None = None
+    # MCP tool annotations (readOnlyHint, destructiveHint, etc.)
+    annotations: ToolAnnotations | dict[str, Any] | None = None
     # Optional: extra metadata for future phases (telemetry, ACL, etc.)
     meta: dict[str, Any] = field(default_factory=dict)

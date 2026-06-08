@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from ..service import GaramaticService, ValidationError
@@ -74,6 +75,13 @@ def register_tools() -> None:
             handler=_send_email,
             description="Send an email to a customer via the mailing service.",
             group="email",
+            annotations=ToolAnnotations(
+                title="Send email",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
         )
     )
 

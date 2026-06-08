@@ -54,11 +54,28 @@ def _create_mcp_wrapper(
         # does not fail on an extra field.
         kwargs.pop("ctx", None)
         service = get_service(ctx)
+
+        # Report progress before starting (if client supports it)
+        if hasattr(ctx, "report_progress"):
+            try:
+                ctx.report_progress(0.0, 1.0)
+            except Exception:
+                pass
+
         try:
             validated = schema(**kwargs)
             validated_dict = validated.model_dump()
             handler = with_approval(tool)
-            return cast(dict[str, Any], await handler(service, **validated_dict))
+            result = cast(dict[str, Any], await handler(service, **validated_dict))
+
+            # Report progress after completion
+            if hasattr(ctx, "report_progress"):
+                try:
+                    ctx.report_progress(1.0, 1.0)
+                except Exception:
+                    pass
+
+            return result
         except pydantic.ValidationError as e:
             return {"status": "validation_error", "error": str(e)}
         except ValidationError as e:
@@ -121,7 +138,10 @@ class McpAdapter:
         """Register every tool in the registry with the MCP server."""
         for tool in self._registry.all_tools():
             wrapper = _create_mcp_wrapper(tool, get_service)
-            self._mcp.tool()(wrapper)
+            kwargs: dict[str, Any] = {}
+            if tool.annotations is not None:
+                kwargs["annotations"] = tool.annotations
+            self._mcp.tool(name=tool.name, description=tool.description, **kwargs)(wrapper)
 
 
 # ------------------------------------------------------------------

@@ -11,6 +11,7 @@ from typing import Any
 
 import structlog
 from fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 from starlette.responses import Response
 
 from .service import (
@@ -109,6 +110,57 @@ async def _favicon(request: Any) -> Response:
         with open(favicon_path, "rb") as f:
             return Response(content=f.read(), media_type="image/x-icon")
     return Response(status_code=404)
+
+
+# ------------------------------------------------------------------
+# Sampling-enabled tools
+# ------------------------------------------------------------------
+
+@mcp.tool(
+    name="draft_email",
+    description="Draft an email using the LLM. Returns a draft for review before sending.",
+    annotations=ToolAnnotations(
+        title="Draft email",
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+    ),
+)
+async def draft_email(
+    ctx: Context,
+    to_email: str = "",
+    subject: str = "",
+    key_points: str = "",
+    tone: str = "professional",
+) -> dict[str, Any]:
+    """Draft an email using the LLM. The draft is returned for review before sending."""
+    prompt = f"""Draft a {tone} email to {to_email} with the subject: "{subject}".
+
+Key points to include:
+{key_points}
+
+Write the full email body. Be concise but complete. Include appropriate greeting and closing."""
+
+    try:
+        result = await ctx.sample(
+            messages=prompt,
+            max_tokens=800,
+        )
+        draft = result.content if result.content else ""
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": f"Failed to draft email: {e}",
+        }
+
+    return {
+        "status": "success",
+        "draft": draft,
+        "subject": subject,
+        "to_email": to_email,
+        "tone": tone,
+        "message": "Email drafted. Review the draft before sending with send_email.",
+    }
 
 
 # ------------------------------------------------------------------

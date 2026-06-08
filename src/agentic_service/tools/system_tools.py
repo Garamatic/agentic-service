@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from ..config import get_settings
@@ -108,6 +109,12 @@ def register_tools() -> None:
             handler=_request_human_approval,
             description="Request human approval for sensitive actions like large invoices.",
             group="system",
+            annotations=ToolAnnotations(
+                title="Request human approval",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+            ),
         )
     )
     registry.register(
@@ -117,6 +124,12 @@ def register_tools() -> None:
             handler=_approve_request,
             description="Approve a pending approval request by ID.",
             group="system",
+            annotations=ToolAnnotations(
+                title="Approve request",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+            ),
         )
     )
 

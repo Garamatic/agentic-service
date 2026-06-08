@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from ..approval import ApprovalRequiredError
@@ -245,6 +246,11 @@ def register_tools() -> None:
             handler=_get_ticket_status,
             description="Get the current status of a support ticket.",
             group="ticket",
+            annotations=ToolAnnotations(
+                title="Get ticket status",
+                readOnlyHint=True,
+                idempotentHint=True,
+            ),
         )
     )
     registry.register(
@@ -254,6 +260,11 @@ def register_tools() -> None:
             handler=_list_customer_tickets,
             description="List all tickets for a specific customer.",
             group="ticket",
+            annotations=ToolAnnotations(
+                title="List customer tickets",
+                readOnlyHint=True,
+                idempotentHint=True,
+            ),
         )
     )
     registry.register(
@@ -263,6 +274,12 @@ def register_tools() -> None:
             handler=_create_ticket,
             description="Create a new support ticket.",
             group="ticket",
+            annotations=ToolAnnotations(
+                title="Create ticket",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+            ),
         )
     )
     registry.register(
@@ -274,6 +291,12 @@ def register_tools() -> None:
             group="ticket",
             approval_threshold=1.0,  # Flag: approval check is enabled.
             # Actual threshold from settings.
+            annotations=ToolAnnotations(
+                title="Resolve ticket",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+            ),
         )
     )
 
