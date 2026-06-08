@@ -1,5 +1,6 @@
 # Agentic Service Stack
-# Includes the REST API and connects to existing infrastructure
+# Includes the REST API + embedded LLM server (llama.cpp)
+# Works standalone or connects to the existing demo infrastructure.
 
 services:
   agentic-service:
@@ -22,6 +23,12 @@ services:
       RABBITMQ_PASS: guest
       RABBITMQ_VHOST: /
 
+      # LLM — embedded llama.cpp server
+      LLM_PROVIDER: llamacpp
+      LLM_MODEL: ${LLM_MODEL:-qwen3.5:2b-q4_K_M}
+      LLM_BASE_URL: http://llama:8080
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-llama}
+
       # Agent persistence — shared file so all processes see the same approvals
       AGENT_DB_PATH: /data/approvals.db
 
@@ -31,6 +38,9 @@ services:
       - agentic-data:/data
     networks:
       - garamatic-network
+    depends_on:
+      llama:
+        condition: service_started
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3001/health')"]
@@ -39,8 +49,29 @@ services:
       retries: 3
       start_period: 5s
 
-  # Optional: Add to your existing docker-compose
-  # This shows how to integrate with your stack
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    ports:
+      - "11434:8080"
+    environment:
+      - LLAMA_ARG_HOST=0.0.0.0
+      - LLAMA_ARG_PORT=8080
+      - LLAMA_ARG_CTX_SIZE=4096
+    command: >
+      -hf unsloth/Qwen3.5-2B-GGUF:UD-Q4_K_XL --alias qwen3.5:2b-q4_K_M
+      -hf LiquidAI/LFM2.5-1.2B-Thinking-GGUF:Q4_K_M --alias lfm2.5:1.2b-thinking-q4_K_M
+      --host 0.0.0.0
+      --port 8080
+      -c 4096
+      --tools all
+    networks:
+      - garamatic-network
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
 volumes:
   agentic-data:
