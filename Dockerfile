@@ -3,8 +3,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install uv via official copy (avoids curl|sh security risk)
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# Install uv via pip (ghcr.io auth not available)
+RUN pip install --no-cache uv
 
 # Copy dependency file and source
 COPY pyproject.toml .
@@ -14,9 +14,8 @@ COPY src/ src/
 # Install dependencies
 RUN uv pip install --system --no-cache -e "."
 
-# Create non-root user
-RUN useradd -m -u 1000 appuser && chown -R appuser /app
-USER appuser
+# Ensure data directory exists for the approvals database
+RUN mkdir -p /app/data && apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
 # Expose port for SSE transport
 EXPOSE 3001

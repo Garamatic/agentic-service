@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     mcp_transport: str = "sse"
 
     # Agent persistence — default to a shared file path for production
-    agent_db_path: str = "/data/approvals.db"
+    agent_db_path: str = "/app/data/approvals.db"
 
     # Mail defaults
     mail_from_email: str = "support@garamatic.com"
