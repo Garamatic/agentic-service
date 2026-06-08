@@ -320,3 +320,4 @@ docker run -p 3001:3001 --env-file .env garamatic-agentic
 ---
 
 Gebouwd met AI-compatibiliteit in het oog
+# test
