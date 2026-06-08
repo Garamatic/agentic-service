@@ -38,7 +38,10 @@ class CreateTicketSchema(BaseModel):
     title: str = Field(..., description="Short ticket title/summary")
     description: str = Field(..., description="Detailed description of the issue")
     customer_email: str = Field(..., description="Customer's email for notifications")
-    customer_name: str = Field(..., description="Customer's full name")
+    customer_name: str = Field(
+        default="",
+        description="Customer's full name (auto-derived from email if left blank)",
+    )
     priority: str = Field(
         default="medium",
         description="Ticket priority (low, medium, high, urgent)",
@@ -126,13 +129,33 @@ async def _list_customer_tickets(service: GaramaticService, **kwargs: Any) -> di
 
 
 async def _create_ticket(service: GaramaticService, **kwargs: Any) -> dict[str, Any]:
+    # Small models sometimes wrap arguments in a ``data`` dict.
+    # Unwrap it so the schema can still validate.
+    if "data" in kwargs and isinstance(kwargs.get("data"), dict):
+        kwargs.update(kwargs.pop("data"))
+
+    # Strip hallucinated fields the model may invent (ctx, category, etc.)
+    kwargs.pop("ctx", None)
+    kwargs.pop("category", None)
+
+    title = kwargs.get("title", "")
+    description = kwargs.get("description", "")
+    customer_email = kwargs.get("customer_email", "")
+    customer_name = kwargs.get("customer_name", "")
+    priority = kwargs.get("priority", "medium")
+
+    # Derive a name from the email local-part if none was supplied.
+    if not customer_name and customer_email:
+        local = customer_email.split("@")[0]
+        customer_name = local.replace(".", " ").replace("_", " ").replace("-", " ").title()
+
     try:
         ticket = await service.create_ticket(
-            title=kwargs["title"],
-            description=kwargs["description"],
-            customer_email=kwargs["customer_email"],
-            customer_name=kwargs["customer_name"],
-            priority=kwargs["priority"],
+            title=title,
+            description=description,
+            customer_email=customer_email,
+            customer_name=customer_name,
+            priority=priority,
         )
     except (ValidationError, ValueError) as e:
         return {"status": "validation_error", "error": str(e)}
@@ -149,10 +172,11 @@ async def _create_ticket(service: GaramaticService, **kwargs: Any) -> dict[str, 
     return {
         "status": "success",
         "ticket_id": ticket_id,
-        "customer_email": kwargs["customer_email"],
-        "priority": kwargs["priority"],
+        "customer_email": customer_email,
+        "customer_name": customer_name,
+        "priority": priority,
         "message": (
-            f"Ticket {ticket_id} created successfully. "
+            f"Ticket {ticket_id} created successfully for {customer_name}. "
             "Customer will receive confirmation email."
         ),
     }
