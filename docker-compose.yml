@@ -9,7 +9,7 @@ services:
       - "3001:3001"  # REST API
     environment:
       # Connect to existing services
-      TICKET_API_URL: http://ticket-masala:80
+      TICKET_API_URL: http://ticket-masala:8080
       ODOO_BRIDGE_URL: http://odoo-bridge:80
 
       # Authentication — set a strong secret in production
@@ -72,6 +72,59 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+
+  agentic-mcp:
+    build: .
+    ports:
+      - "3002:3001"  # MCP Server
+    environment:
+      # Connect to existing services
+      TICKET_API_URL: http://ticket-masala:8080
+      ODOO_BRIDGE_URL: http://odoo-bridge:8080
+
+      # Authentication
+      API_KEY: ${API_KEY:-change-me-in-production}
+      TICKET_API_KEY: ${API_KEY:-change-me-in-production}
+      CORS_ORIGINS: "*"
+
+      # RabbitMQ
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      RABBITMQ_VHOST: /
+
+      # LLM
+      LLM_PROVIDER: llamacpp
+      LLM_MODEL: ${LLM_MODEL:-qwen3.5:2b-q4_K_M}
+      LLM_BASE_URL: http://llama:8080
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-llama}
+
+      # MCP transport
+      MCP_TRANSPORT: streamable-http
+
+      # Agent persistence
+      AGENT_DB_PATH: /data/approvals.db
+
+      # Logging
+      LOG_LEVEL: INFO
+    volumes:
+      - agentic-data:/data
+    networks:
+      - garamatic-network
+    command: ["garamatic-mcp"]
+    depends_on:
+      llama:
+        condition: service_started
+      agentic-service:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
 
 volumes:
   agentic-data:

@@ -31,8 +31,8 @@ RUN mkdir -p /app/data
 # Expose port for SSE transport
 EXPOSE 3001
 
-# Default command runs the REST API server (includes /agent/chat, CORS, /health)
-CMD ["garamatic-api"]
+# Default command runs the MCP server for external AI clients
+CMD ["garamatic-mcp"]
 
-# Alternative: run the MCP server for external AI clients
-# CMD ["garamatic-mcp"]
+# Alternative: run the REST API server (includes /agent/chat, CORS, /health)
+# CMD ["garamatic-api"]

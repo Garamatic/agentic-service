@@ -21,7 +21,11 @@ from mcp.types import (
     ResourceTemplateReference,
     ToolAnnotations,
 )
-from starlette.responses import Response
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+
+from .config import get_settings
 
 from .service import (
     GaramaticService,
@@ -108,6 +112,47 @@ adapter.register_all(_get_service)
 
 
 # ------------------------------------------------------------------
+# API Key middleware
+# ------------------------------------------------------------------
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    """Require Bearer API key on all requests except /health and /favicon.ico."""
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        path = request.url.path
+        if path in ("/health", "/favicon.ico", "/"):
+            return await call_next(request)
+
+        settings = get_settings()
+        expected = settings.api_key.get_secret_value()
+        if not expected:
+            return await call_next(request)
+
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.removeprefix("Bearer ").strip()
+        if token != expected:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Invalid or missing API key"},
+            )
+
+        return await call_next(request)
+
+
+# ------------------------------------------------------------------
+# Health check
+# ------------------------------------------------------------------
+
+@mcp.custom_route("/health", methods=["GET"])
+async def _health(request: Any) -> Response:
+    """Health check endpoint for the MCP server."""
+    return Response(
+        content=json.dumps({"status": "ok", "service": "garamatic-mcp"}),
+        media_type="application/json",
+    )
+
+
+# ------------------------------------------------------------------
 # Favicon
 # ------------------------------------------------------------------
 
@@ -143,6 +188,12 @@ async def draft_email(
     tone: str = "professional",
 ) -> dict[str, Any]:
     """Draft an email using the LLM. The draft is returned for review before sending."""
+    if not to_email or "@" not in to_email:
+        return {
+            "status": "error",
+            "error": "Invalid or missing email address",
+        }
+
     prompt = f"""Draft a {tone} email to {to_email} with the subject: "{subject}".
 
 Key points to include:
@@ -508,13 +559,18 @@ def main() -> None:
 
     config = get_settings()
     transport = os.environ.get("MCP_TRANSPORT", config.mcp_transport)
+
+    valid = {"sse", "http", "streamable-http"}
+    if transport not in valid:
+        raise ValueError(f"Invalid MCP_TRANSPORT: {transport!r}. Expected one of {valid}")
+
     middleware = [
+        Middleware(ApiKeyMiddleware),
         Middleware(
             CORSMiddleware,
-            allow_origins=["*"],
+            allow_origins=config.cors_origin_list,
             allow_methods=["*"],
             allow_headers=["*"],
-            allow_credentials=True,
         ),
     ]
     if transport == "sse":
@@ -526,7 +582,7 @@ def main() -> None:
             port=3001,
             middleware=middleware,
             stateless_http=True,
-        )  # type: ignore[arg-type]
+        )
 
 
 if __name__ == "__main__":
