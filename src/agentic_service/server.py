@@ -4,12 +4,14 @@ Exposes tickets, invoices, and emails as AI-callable tools
 """
 
 import json
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
 from fastmcp import Context, FastMCP
+from starlette.responses import Response
 
 from .service import (
     GaramaticService,
@@ -93,6 +95,20 @@ def _get_service(ctx: Context) -> GaramaticService:
 
 adapter = McpAdapter(get_registry(), mcp)
 adapter.register_all(_get_service)
+
+
+# ------------------------------------------------------------------
+# Favicon
+# ------------------------------------------------------------------
+
+@mcp.custom_route("/favicon.ico", methods=["GET"])
+async def _favicon(request: Any) -> Response:
+    """Serve the Garamatic favicon."""
+    favicon_path = os.path.join(os.path.dirname(__file__), "favicon.ico")
+    if os.path.exists(favicon_path):
+        with open(favicon_path, "rb") as f:
+            return Response(content=f.read(), media_type="image/x-icon")
+    return Response(status_code=404)
 
 
 # ------------------------------------------------------------------
