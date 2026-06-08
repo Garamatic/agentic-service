@@ -1,6 +1,7 @@
 """REST API Gateway for Garamatic Agentic Service."""
 
 import functools
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, cast
@@ -9,12 +10,13 @@ import pybreaker
 import structlog
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 
 from .agent import GaramaticAgent
 from .approval import ApprovalRequiredError
 from .config import get_settings
+from .thread_store import ThreadStore
 from .service import (
     GaramaticService,
     NotFoundError,
@@ -152,6 +154,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     app.state.service = service
     app.state.agent_cache = {}
 
+    # Thread store for conversation history
+    config = get_settings()
+    db_path = config.agent_db_path or "/app/data/approvals.db"
+    app.state.thread_store = ThreadStore(db_path)
+    await app.state.thread_store._ensure_table()
+
     logger.info("api.started")
     yield {}
 
@@ -281,6 +289,14 @@ def _get_service() -> GaramaticService:
     if service is None or not isinstance(service, GaramaticService):
         raise ServiceUnavailableError("Service not initialized")
     return cast(GaramaticService, service)
+
+
+def _get_thread_store() -> ThreadStore:
+    """Get the thread store from app state."""
+    store: Any = getattr(app.state, "thread_store", None)
+    if store is None:
+        raise ServiceUnavailableError("Thread store not initialized")
+    return cast(ThreadStore, store)
 
 
 @app.get("/health")
@@ -563,11 +579,132 @@ async def api_agent_chat(request: ChatRequest) -> dict[str, Any]:
             ),
         ) from None
 
+    # Track thread metadata
+    try:
+        thread_store = _get_thread_store()
+        title = request.message[:60] if len(request.message) <= 60 else request.message[:57] + "..."
+        await thread_store.upsert(request.thread_id, title=title)
+    except Exception:
+        logger.warning("thread_store.upsert_failed", thread_id=request.thread_id)
+
     return {
         "thread_id": request.thread_id,
         "response": response,
         "request_id": rid,
     }
+
+
+@app.post("/agent/chat/stream")
+async def api_agent_chat_stream(request: ChatRequest) -> StreamingResponse:
+    """Chat with the Garamatic AI agent — streaming with tool visibility."""
+    rid = generate_request_id()
+    config = get_settings()
+
+    from .llm_adapter import validate_llm_config
+
+    try:
+        validate_llm_config(config)
+    except ValueError as e:
+        async def _error_stream():
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        return StreamingResponse(_error_stream(), media_type="text/event-stream")
+
+    service = _get_service()
+    logger.info("api.agent_chat_stream", thread_id=request.thread_id, request_id=rid)
+
+    agent_cache = getattr(app.state, "agent_cache", {})
+    agent = agent_cache.get(request.thread_id)
+    if agent is None:
+        agent = GaramaticAgent(service=service, thread_id=request.thread_id)
+        agent_cache[request.thread_id] = agent
+        while len(agent_cache) > MAX_AGENT_CACHE:
+            oldest_thread_id = next(iter(agent_cache))
+            oldest_agent = agent_cache.pop(oldest_thread_id)
+            try:
+                await oldest_agent.close()
+            except Exception:
+                logger.warning("api.agent_cache_evict_failed", thread_id=oldest_thread_id)
+        app.state.agent_cache = agent_cache
+
+    async def _event_generator():
+        full_response = ""
+        try:
+            async for event in agent.process_stream(request.message):
+                event["request_id"] = rid
+                if event["type"] == "content":
+                    full_response = event["text"]
+                yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+        except Exception as e:
+            logger.error("api.agent_chat_stream_failed", error=str(e), request_id=rid)
+            yield f"event: error\ndata: {json.dumps({'error': str(e), 'request_id': rid})}\n\n"
+            return
+
+        # Track thread metadata
+        try:
+            thread_store = _get_thread_store()
+            title = request.message[:60] if len(request.message) <= 60 else request.message[:57] + "..."
+            await thread_store.upsert(request.thread_id, title=title)
+        except Exception:
+            logger.warning("thread_store.upsert_failed", thread_id=request.thread_id)
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Request-ID": rid},
+    )
+
+
+@app.get("/agent/threads")
+@api_error_handler("list_threads")
+async def api_list_threads(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """List conversation threads with metadata."""
+    store = _get_thread_store()
+    threads = await store.list_threads(limit=limit, offset=offset)
+    return {
+        "threads": threads,
+        "count": len(threads),
+    }
+
+
+@app.get("/agent/threads/{thread_id}")
+@api_error_handler("get_thread", not_found_message="Thread not found")
+async def api_get_thread(thread_id: str) -> dict[str, Any]:
+    """Get a single thread's metadata and messages."""
+    store = _get_thread_store()
+    meta = await store.get_thread(thread_id)
+    if meta is None:
+        raise NotFoundError("Thread not found")
+    messages = await store.get_messages(thread_id)
+    return {
+        "thread_id": thread_id,
+        "metadata": meta,
+        "messages": messages,
+    }
+
+
+@app.delete("/agent/threads/{thread_id}")
+@api_error_handler("delete_thread", not_found_message="Thread not found")
+async def api_delete_thread(thread_id: str) -> dict[str, Any]:
+    """Delete a thread and its metadata."""
+    store = _get_thread_store()
+    deleted = await store.delete_thread(thread_id)
+    if not deleted:
+        raise NotFoundError("Thread not found")
+
+    # Also evict from agent cache
+    agent_cache = getattr(app.state, "agent_cache", {})
+    if thread_id in agent_cache:
+        agent = agent_cache.pop(thread_id)
+        try:
+            await agent.close()
+        except Exception:
+            pass
+        app.state.agent_cache = agent_cache
+
+    return {"thread_id": thread_id, "status": "deleted"}
 
 
 @app.post("/approvals/{approval_id}/approve")

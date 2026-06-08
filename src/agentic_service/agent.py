@@ -251,6 +251,79 @@ class GaramaticAgent:
 
         return "No response generated"
 
+    async def process_stream(self, message: str):
+        """Process a user message and yield streaming events.
+
+        Yields dicts with keys:
+            - type: "tool_call" | "tool_result" | "content" | "done"
+            - tool: str (for tool_call / tool_result)
+            - text: str (for content)
+            - response: str (for done)
+            - thread_id: str (for done)
+        """
+        agent = await self._get_agent()
+
+        state = await agent.aget_state(self.config)
+        existing = state.values.get("messages", []) if state.values else []
+        system_prompt = _build_system_prompt()
+        if existing:
+            messages: list[Any] = [
+                SystemMessage(content=system_prompt),
+                *existing,
+                HumanMessage(content=message),
+            ]
+        else:
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=message),
+            ]
+
+        full_response = ""
+        seen_tools: set[str] = set()
+
+        async for event in agent.astream(
+            {"messages": messages},
+            config=self.config,
+        ):
+            for node_name, node_data in event.items():
+                if node_name == "agent":
+                    msg = node_data["messages"][-1]
+                    if isinstance(msg, AIMessage):
+                        if msg.tool_calls:
+                            for tc in msg.tool_calls:
+                                tool_name = tc.get("name", "unknown")
+                                if tool_name not in seen_tools:
+                                    seen_tools.add(tool_name)
+                                    yield {
+                                        "type": "tool_call",
+                                        "tool": tool_name,
+                                        "args": tc.get("args", {}),
+                                    }
+                        elif msg.content:
+                            content = msg.content
+                            if isinstance(content, list):
+                                content = str(content)
+                            full_response = content
+                            yield {
+                                "type": "content",
+                                "text": content,
+                            }
+
+                elif node_name == "tools":
+                    msg = node_data["messages"][-1]
+                    if hasattr(msg, "name") and msg.name:
+                        yield {
+                            "type": "tool_result",
+                            "tool": msg.name,
+                            "result": msg.content,
+                        }
+
+        yield {
+            "type": "done",
+            "thread_id": self.thread_id,
+            "response": full_response,
+        }
+
     async def get_state(self) -> dict[str, Any]:
         """Get current conversation state."""
         agent = await self._get_agent()
