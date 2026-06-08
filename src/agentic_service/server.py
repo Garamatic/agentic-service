@@ -101,6 +101,64 @@ async def _get_resource_service() -> GaramaticService:
 
 
 # ------------------------------------------------------------------
+# MCP Prompts
+# ------------------------------------------------------------------
+
+
+@mcp.prompt()
+def create_ticket_prompt(customer_email: str = "", issue_description: str = "") -> str:
+    """Prompt template for creating a new support ticket."""
+    return f"""Create a support ticket for the customer.
+
+Customer email: {customer_email or "[to be provided]"}
+Issue description: {issue_description or "[to be provided]"}
+
+Please use the create_ticket tool to create the ticket. Make sure to gather:
+- A clear, concise title
+- A detailed description of the issue
+- The customer's full name
+- Priority level (low, medium, high, urgent)"""
+
+
+@mcp.prompt()
+def get_customer_context_prompt(customer_email: str = "") -> str:
+    """Prompt template for retrieving full customer context."""
+    return f"""Retrieve the complete customer context for {customer_email or "[email to be provided]"}.
+
+Use the get_customer_context tool to look up:
+- Total tickets and open tickets
+- Outstanding balance and lifetime value
+- Recent ticket history
+- Recent invoice history
+
+Summarize the key findings and suggest any follow-up actions."""
+
+
+@mcp.prompt()
+def resolve_ticket_prompt(ticket_id: str = "", resolution_notes: str = "") -> str:
+    """Prompt template for resolving a support ticket."""
+    return f"""Resolve ticket {ticket_id or "[ID to be provided]"}.
+
+Resolution summary: {resolution_notes or "[to be provided]"}
+
+Please use the resolve_ticket tool. If the resolution involves billable work,
+provide the billable amount. The system will handle invoice creation automatically."""
+
+
+@mcp.prompt()
+def send_email_prompt(to_email: str = "", subject: str = "", body: str = "") -> str:
+    """Prompt template for sending an email to a customer."""
+    return f"""Send an email to the customer.
+
+To: {to_email or "[email to be provided]"}
+Subject: {subject or "[subject to be provided]"}
+
+Body:
+{body or "[body to be provided]"}
+
+Use the send_email tool to queue the email. The email will be sent via the mailing service."""
+
+
 # MCP Resources
 # ------------------------------------------------------------------
 
@@ -225,13 +283,30 @@ def main() -> None:
     import os
 
     from agentic_service.config import get_settings
+    from starlette.middleware import Middleware
+    from starlette.middleware.cors import CORSMiddleware
 
     config = get_settings()
     transport = os.environ.get("MCP_TRANSPORT", config.mcp_transport)
+    middleware = [
+        Middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+            allow_credentials=True,
+        ),
+    ]
     if transport == "sse":
-        mcp.run(transport="sse", host="0.0.0.0", port=3001)
+        mcp.run(transport="sse", host="0.0.0.0", port=3001, middleware=middleware)
     else:
-        mcp.run(transport=transport)  # type: ignore[arg-type]
+        mcp.run(
+            transport=transport,
+            host="0.0.0.0",
+            port=3001,
+            middleware=middleware,
+            stateless_http=True,
+        )  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
