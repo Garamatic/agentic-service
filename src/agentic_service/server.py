@@ -64,7 +64,17 @@ mcp = FastMCP("garamatic", lifespan=app_lifespan)
 
 
 def _get_service(ctx: Context) -> GaramaticService:
-    """Extract service from MCP lifespan context."""
+    """Extract service from MCP lifespan context.
+
+    Handles the case where a small model hallucinates a ``ctx`` dict
+    instead of letting the framework inject the real Context object.
+    """
+    if isinstance(ctx, dict):
+        # Model passed ctx as a keyword argument — ignore it and use
+        # the lifespan-managed service directly.
+        if _lifespan_service is not None:
+            return _lifespan_service
+        raise ServiceUnavailableError("Service not initialized")
     rc = ctx.request_context
     if rc is None:
         raise ServiceUnavailableError("Service not initialized")

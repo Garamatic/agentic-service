@@ -19,7 +19,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated, Any, Literal
 
 import structlog
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -80,6 +80,14 @@ Guidelines:
 - Request approval for invoices over €{threshold:.2f}
 - Be helpful but cautious with customer data
 
+When calling tools:
+- ALWAYS use the exact field names specified in the tool schema
+- NEVER use generic field names like "data" or "ctx" — those are NOT valid fields
+- NEVER combine multiple fields into a single string
+- ALWAYS provide valid JSON with ALL required fields present
+- NEVER include the "ctx" parameter — it is provided by the framework automatically
+- Example: for create_ticket, pass "title", "description", "customer_email", "customer_name" and "priority" as separate fields
+
 When asked about a customer:
 1. Get their summary first
 2. Look at recent tickets
@@ -129,6 +137,35 @@ async def _get_checkpointer() -> BaseCheckpointSaver[Any]:
 # ------------------------------------------------------------------
 
 
+class SafeToolNode(ToolNode):
+    """ToolNode that catches malformed tool calls and returns structured errors.
+
+    Small models (2B) sometimes emit invalid JSON or hallucinate field names.
+    Instead of crashing the graph, we return a ``ToolMessage`` with a helpful
+    error so the model can retry.
+    """
+
+    def _run_one(self, call, config):
+        try:
+            return super()._run_one(call, config)
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(
+                "agent.tool_call_failed",
+                tool=call.get("name", "unknown"),
+                error=error_msg,
+            )
+            return ToolMessage(
+                content=(
+                    f"Tool call failed: {error_msg}. "
+                    "Please use the exact field names defined in the tool schema. "
+                    "Do NOT pass 'ctx' or 'data' as fields."
+                ),
+                name=call.get("name", "unknown"),
+                tool_call_id=call.get("id", "unknown"),
+            )
+
+
 def create_agent(
     service: GaramaticService,
     checkpointer: BaseCheckpointSaver[Any],
@@ -142,7 +179,7 @@ def create_agent(
         model_name: Optional model name override.
     """
     tools = create_tools(service)
-    tool_node = ToolNode(tools)
+    tool_node = SafeToolNode(tools)
 
     def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
         """Determine if we should continue to tools or end."""

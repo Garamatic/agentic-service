@@ -49,6 +49,10 @@ def _create_mcp_wrapper(
 
     # Build a dynamic function with the correct signature
     async def wrapper(*args: Any, ctx: Any, **kwargs: Any) -> dict[str, Any]:
+        # If the model hallucinated a dict ``ctx``, kwargs may also contain
+        # it (FastMCP sometimes passes both).  Strip it so schema validation
+        # does not fail on an extra field.
+        kwargs.pop("ctx", None)
         service = get_service(ctx)
         try:
             validated = schema(**kwargs)
@@ -132,6 +136,9 @@ def _create_langgraph_wrapper(
     """Build a wrapper coroutine for StructuredTool."""
 
     async def wrapper(**kwargs: Any) -> dict[str, Any]:
+        # Small models sometimes hallucinate a ``ctx`` or ``data`` field.
+        # Remove ctx so schema validation does not fail on an extra field.
+        kwargs.pop("ctx", None)
         try:
             validated = tool.schema(**kwargs)
             validated_dict = validated.model_dump()
