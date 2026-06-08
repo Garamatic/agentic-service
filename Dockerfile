@@ -20,9 +20,8 @@ RUN mkdir -p /app/data && apt-get update && apt-get install -y --no-install-reco
 # Expose port for SSE transport
 EXPOSE 3001
 
-# Default command runs MCP server
-# FastMCP handles transport automatically (stdio or SSE based on environment)
-CMD ["python", "-m", "agentic_service.server"]
+# Default command runs the REST API server (includes /agent/chat, CORS, /health)
+CMD ["garamatic-api"]
 
-# Alternative using entry point:
+# Alternative: run the MCP server for external AI clients
 # CMD ["garamatic-mcp"]

@@ -1,11 +1,11 @@
 # Agentic Service Stack
-# Includes the MCP server and connects to existing infrastructure
+# Includes the REST API and connects to existing infrastructure
 
 services:
   agentic-service:
     build: .
     ports:
-      - "3001:3001"  # SSE transport
+      - "3001:3001"  # REST API
     environment:
       # Connect to existing services
       TICKET_API_URL: http://ticket-masala:80
