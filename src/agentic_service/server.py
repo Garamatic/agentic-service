@@ -11,7 +11,16 @@ from typing import Any
 
 import structlog
 from fastmcp import Context, FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import (
+    Annotations,
+    Completion,
+    CompletionArgument,
+    CompletionContext,
+    Icon,
+    PromptReference,
+    ResourceTemplateReference,
+    ToolAnnotations,
+)
 from starlette.responses import Response
 
 from .service import (
@@ -179,11 +188,36 @@ async def _get_resource_service() -> GaramaticService:
 
 
 # ------------------------------------------------------------------
+# Prompt icons
+# ------------------------------------------------------------------
+TICKET_ICON = Icon(
+    src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'%3E%3Crect x='1' y='3' width='14' height='10' rx='1' fill='none' stroke='%23007bff' stroke-width='1.5'/%3E%3Cpath d='M4 8h8' stroke='%23007bff' stroke-width='1'/%3E%3C/svg%3E",
+    mimeType="image/svg+xml",
+    sizes=["16x16"],
+)
+CUSTOMER_ICON = Icon(
+    src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='5' r='3' fill='none' stroke='%2328a745' stroke-width='1.5'/%3E%3Cpath d='M2 14c0-3.3 2.7-6 6-6s6 2.7 6 6' fill='none' stroke='%2328a745' stroke-width='1.5'/%3E%3C/svg%3E",
+    mimeType="image/svg+xml",
+    sizes=["16x16"],
+)
+RESOLVE_ICON = Icon(
+    src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'%3E%3Cpath d='M3 8l4 4 6-7' fill='none' stroke='%2328a745' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E",
+    mimeType="image/svg+xml",
+    sizes=["16x16"],
+)
+EMAIL_ICON = Icon(
+    src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16'%3E%3Crect x='1' y='3' width='14' height='10' rx='1' fill='none' stroke='%23dc3545' stroke-width='1.5'/%3E%3Cpath d='M1 4l7 5 7-5' fill='none' stroke='%23dc3545' stroke-width='1.5'/%3E%3C/svg%3E",
+    mimeType="image/svg+xml",
+    sizes=["16x16"],
+)
+
+
+# ------------------------------------------------------------------
 # MCP Prompts
 # ------------------------------------------------------------------
 
 
-@mcp.prompt()
+@mcp.prompt(description="Guided prompt for creating a new support ticket.", icons=[TICKET_ICON])
 def create_ticket_prompt(customer_email: str = "", issue_description: str = "") -> str:
     """Prompt template for creating a new support ticket."""
     return f"""Create a support ticket for the customer.
@@ -198,7 +232,7 @@ Please use the create_ticket tool to create the ticket. Make sure to gather:
 - Priority level (low, medium, high, urgent)"""
 
 
-@mcp.prompt()
+@mcp.prompt(description="Retrieve full customer context — tickets, invoices, balance.", icons=[CUSTOMER_ICON])
 def get_customer_context_prompt(customer_email: str = "") -> str:
     """Prompt template for retrieving full customer context."""
     return f"""Retrieve the complete customer context for {customer_email or "[email to be provided]"}.
@@ -212,7 +246,7 @@ Use the get_customer_context tool to look up:
 Summarize the key findings and suggest any follow-up actions."""
 
 
-@mcp.prompt()
+@mcp.prompt(description="Resolve a support ticket with optional billing.", icons=[RESOLVE_ICON])
 def resolve_ticket_prompt(ticket_id: str = "", resolution_notes: str = "") -> str:
     """Prompt template for resolving a support ticket."""
     return f"""Resolve ticket {ticket_id or "[ID to be provided]"}.
@@ -223,7 +257,7 @@ Please use the resolve_ticket tool. If the resolution involves billable work,
 provide the billable amount. The system will handle invoice creation automatically."""
 
 
-@mcp.prompt()
+@mcp.prompt(description="Send an email to a customer.", icons=[EMAIL_ICON])
 def send_email_prompt(to_email: str = "", subject: str = "", body: str = "") -> str:
     """Prompt template for sending an email to a customer."""
     return f"""Send an email to the customer.
@@ -241,7 +275,11 @@ Use the send_email tool to queue the email. The email will be sent via the maili
 # ------------------------------------------------------------------
 
 
-@mcp.resource("ticket://{ticket_id}")
+@mcp.resource(
+    "ticket://{ticket_id}",
+    description="Single ticket details including status, description, and linked invoice.",
+    annotations=Annotations(audience=["user", "assistant"], priority=0.8),
+)
 async def get_ticket_resource(ticket_id: str) -> str:
     """MCP Resource: Single ticket details as formatted text."""
     if not ticket_id or not ticket_id.strip():
@@ -290,7 +328,11 @@ async def get_ticket_resource(ticket_id: str) -> str:
 """
 
 
-@mcp.resource("system://health")
+@mcp.resource(
+    "system://health",
+    description="System health status of all integrated services.",
+    annotations=Annotations(audience=["assistant"], priority=0.9),
+)
 async def get_health() -> str:
     """MCP Resource: System health status."""
     try:
@@ -306,7 +348,11 @@ async def get_health() -> str:
     return json.dumps(health_json, indent=2)
 
 
-@mcp.resource("customer://{email}")
+@mcp.resource(
+    "customer://{email}",
+    description="Full customer profile with tickets, invoices, and balance.",
+    annotations=Annotations(audience=["user", "assistant"], priority=0.7),
+)
 async def get_customer_resource(email: str) -> str:
     """MCP Resource: Full customer profile as formatted text."""
     try:
@@ -354,6 +400,79 @@ async def get_customer_resource(email: str) -> str:
 {invoices_section}
 """
 
+
+# ------------------------------------------------------------------
+# Completion & Subscription support
+# ------------------------------------------------------------------
+
+# Known demo values for autocompletion
+DEMO_TICKET_IDS = ["TKT-001", "TKT-002", "TKT-003", "TKT-004", "TKT-005"]
+DEMO_CUSTOMER_EMAILS = ["john@example.com", "jane@example.com", "support@example.com", "admin@example.com"]
+DEMO_PRIORITIES = ["low", "medium", "high", "urgent"]
+
+
+@mcp._mcp_server.completion()
+async def handle_completion(
+    ref: PromptReference | ResourceTemplateReference,
+    argument: CompletionArgument,
+    context: CompletionContext | None,
+) -> Completion | None:
+    """Provide completions for prompt arguments and resource templates."""
+    value = (argument.value or "").lower()
+    name = argument.name
+
+    # Resource templates
+    if isinstance(ref, ResourceTemplateReference):
+        if "ticket" in ref.uri and name == "ticket_id":
+            matches = [t for t in DEMO_TICKET_IDS if t.lower().startswith(value)]
+            if matches:
+                return Completion(values=matches, total=len(matches), hasMore=False)
+        if "customer" in ref.uri and name == "email":
+            matches = [e for e in DEMO_CUSTOMER_EMAILS if e.lower().startswith(value)]
+            if matches:
+                return Completion(values=matches, total=len(matches), hasMore=False)
+        return None
+
+    # Prompts
+    if isinstance(ref, PromptReference):
+        if name in ("customer_email", "to_email"):
+            matches = [e for e in DEMO_CUSTOMER_EMAILS if e.lower().startswith(value)]
+            if matches:
+                return Completion(values=matches, total=len(matches), hasMore=False)
+        if name == "ticket_id":
+            matches = [t for t in DEMO_TICKET_IDS if t.lower().startswith(value)]
+            if matches:
+                return Completion(values=matches, total=len(matches), hasMore=False)
+        if name == "priority":
+            matches = [p for p in DEMO_PRIORITIES if p.startswith(value)]
+            if matches:
+                return Completion(values=matches, total=len(matches), hasMore=False)
+        return None
+
+    return None
+
+
+# Track active subscriptions for resource-change notifications
+_subscribed_resources: set[str] = set()
+
+
+@mcp._mcp_server.subscribe_resource()
+async def handle_subscribe(uri: str) -> None:
+    """Subscribe to resource change notifications."""
+    _subscribed_resources.add(uri)
+    logger.info("resource.subscribed", uri=uri, total_subscriptions=len(_subscribed_resources))
+
+
+@mcp._mcp_server.unsubscribe_resource()
+async def handle_unsubscribe(uri: str) -> None:
+    """Unsubscribe from resource change notifications."""
+    _subscribed_resources.discard(uri)
+    logger.info("resource.unsubscribed", uri=uri, total_subscriptions=len(_subscribed_resources))
+
+
+# ------------------------------------------------------------------
+# Main entrypoint
+# ------------------------------------------------------------------
 
 def main() -> None:
     """Run the MCP server."""
