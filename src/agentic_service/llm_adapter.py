@@ -28,11 +28,12 @@ def _resolve_base_url(config: Settings) -> str:
     return config.llm_base_url or config.ollama_base_url
 
 
-def build_llm(config: Settings) -> Any:
+def build_llm(config: Settings, model_override: str = "") -> Any:
     """Build a LangChain chat model based on provider configuration.
 
     Args:
         config: Service settings carrying provider, model, and credentials.
+        model_override: Optional model name to override the configured default.
 
     Returns:
         A LangChain chat model instance (ChatOpenAI, ChatOllama, …).
@@ -41,7 +42,7 @@ def build_llm(config: Settings) -> Any:
         ValueError: If the provider is unsupported or mis-configured.
     """
     provider = config.llm_provider
-    model = config.llm_model or config.openai_model
+    model = model_override or config.llm_model or config.openai_model
     base_url = _resolve_base_url(config)
 
     if provider == LLMProvider.OLLAMA:
@@ -68,6 +69,9 @@ def build_llm(config: Settings) -> Any:
         api_key = config.openai_api_key.get_secret_value()
         if api_key:
             kwargs["api_key"] = api_key
+        elif provider == LLMProvider.LLAMACPP:
+            # llama.cpp server does not require a real API key
+            kwargs["api_key"] = "sk-no-key-required"
 
         if base_url:
             kwargs["base_url"] = base_url

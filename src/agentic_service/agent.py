@@ -132,12 +132,14 @@ async def _get_checkpointer() -> BaseCheckpointSaver[Any]:
 def create_agent(
     service: GaramaticService,
     checkpointer: BaseCheckpointSaver[Any],
+    model_name: str = "",
 ) -> Any:
     """Create and configure the LangGraph agent.
 
     Args:
         service: The business-logic service that tools call.
         checkpointer: Checkpoint saver for persisting conversation state.
+        model_name: Optional model name override.
     """
     tools = create_tools(service)
     tool_node = ToolNode(tools)
@@ -152,7 +154,7 @@ def create_agent(
         return "__end__"
 
     config = get_settings()
-    model = build_llm(config)
+    model = build_llm(config, model_override=model_name)
     model_with_tools = model.bind_tools(tools)
 
     def call_model(state: AgentState) -> dict[str, Any]:
@@ -192,6 +194,7 @@ class GaramaticAgent:
         service: GaramaticService,
         thread_id: str | None = None,
         checkpointer: BaseCheckpointSaver[Any] | None = None,
+        model: str | None = None,
     ) -> None:
         """Initialize agent with a service and optional thread_id.
 
@@ -200,6 +203,7 @@ class GaramaticAgent:
             thread_id: Unique identifier for conversation thread.
             checkpointer: Optional custom checkpoint saver. Uses environment
                          config if not provided. Caller is responsible for cleanup.
+            model: Optional model name override for this agent instance.
         """
         self._service = service
         self.thread_id = thread_id or "garamatic-session"
@@ -207,6 +211,7 @@ class GaramaticAgent:
         self._checkpointer = checkpointer
         self._owns_checkpointer = checkpointer is None
         self._agent: Any | None = None
+        self._model = model
 
     async def _get_agent(self) -> Any:
         """Lazy initialization of the agent (async)."""
@@ -216,6 +221,7 @@ class GaramaticAgent:
             self._agent = create_agent(
                 service=self._service,
                 checkpointer=self._checkpointer,
+                model_name=self._model or "",
             )
         return self._agent
 

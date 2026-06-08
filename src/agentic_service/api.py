@@ -520,6 +520,7 @@ class ChatRequest(BaseModel):
 
     message: str = Field(..., min_length=1, max_length=2000)
     thread_id: str = Field(default="web-session", max_length=128)
+    model: str = Field(default="", max_length=128, description="Optional model override. Uses default if empty.")
 
 
 class ApprovalRequest(BaseModel):
@@ -549,8 +550,15 @@ async def api_agent_chat(request: ChatRequest) -> dict[str, Any]:
 
     agent_cache = getattr(app.state, "agent_cache", {})
     agent = agent_cache.get(request.thread_id)
-    if agent is None:
-        agent = GaramaticAgent(service=service, thread_id=request.thread_id)
+    if agent is None or (request.model and agent._model != request.model):
+        # Evict old agent if model changed
+        if request.thread_id in agent_cache:
+            old_agent = agent_cache.pop(request.thread_id)
+            try:
+                await old_agent.close()
+            except Exception:
+                pass
+        agent = GaramaticAgent(service=service, thread_id=request.thread_id, model=request.model)
         agent_cache[request.thread_id] = agent
         while len(agent_cache) > MAX_AGENT_CACHE:
             oldest_thread_id = next(iter(agent_cache))
@@ -615,8 +623,15 @@ async def api_agent_chat_stream(request: ChatRequest) -> StreamingResponse:
 
     agent_cache = getattr(app.state, "agent_cache", {})
     agent = agent_cache.get(request.thread_id)
-    if agent is None:
-        agent = GaramaticAgent(service=service, thread_id=request.thread_id)
+    if agent is None or (request.model and agent._model != request.model):
+        # Evict old agent if model changed
+        if request.thread_id in agent_cache:
+            old_agent = agent_cache.pop(request.thread_id)
+            try:
+                await old_agent.close()
+            except Exception:
+                pass
+        agent = GaramaticAgent(service=service, thread_id=request.thread_id, model=request.model)
         agent_cache[request.thread_id] = agent
         while len(agent_cache) > MAX_AGENT_CACHE:
             oldest_thread_id = next(iter(agent_cache))
