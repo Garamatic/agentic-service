@@ -56,7 +56,9 @@ class ThreadStore:
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 """
-                INSERT INTO thread_metadata (thread_id, title, created_at, updated_at, message_count)
+                INSERT INTO thread_metadata (
+                    thread_id, title, created_at, updated_at, message_count
+                )
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(thread_id) DO UPDATE SET
                     title = COALESCE(excluded.title, thread_metadata.title),

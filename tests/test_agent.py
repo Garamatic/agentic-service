@@ -123,58 +123,62 @@ def fake_service():
 
 
 class TestCreateTools:
-    def test_returns_six_tools(self, fake_service):
+    def test_returns_ten_tools(self, fake_service):
         tools = create_tools(fake_service)
-        assert len(tools) == 6
+        assert len(tools) == 10
         names = {t.name for t in tools}
         assert names == {
-            "search_tickets_by_customer",
-            "get_ticket_details",
-            "get_customer_summary",
-            "resolve_ticket_with_invoice",
+            "get_ticket_status",
+            "list_customer_tickets",
+            "create_ticket",
+            "resolve_ticket",
+            "create_invoice",
+            "get_invoice_status",
+            "send_email",
+            "get_customer_context",
             "request_human_approval",
             "approve_request",
         }
         assert all(isinstance(t, StructuredTool) for t in tools)
 
     @pytest.mark.asyncio
-    async def test_search_tickets_by_customer(self, fake_service):
+    async def test_list_customer_tickets(self, fake_service):
         tools = create_tools(fake_service)
-        tool = next(t for t in tools if t.name == "search_tickets_by_customer")
+        tool = next(t for t in tools if t.name == "list_customer_tickets")
         result = await tool.ainvoke({"customer_email": "john@example.com", "limit": 10})
         assert result["status"] == "success"
         assert len(result["tickets"]) == 1
-        assert result["tickets"][0]["id"] == "T-123"
+        assert result["tickets"][0]["ticket_id"] == "T-123"
         assert result["tickets"][0]["title"] == "Network Issue"
 
     @pytest.mark.asyncio
-    async def test_get_ticket_details(self, fake_service):
+    async def test_get_ticket_status(self, fake_service):
         tools = create_tools(fake_service)
-        tool = next(t for t in tools if t.name == "get_ticket_details")
+        tool = next(t for t in tools if t.name == "get_ticket_status")
         result = await tool.ainvoke({"ticket_id": "T-123"})
         assert result["status"] == "success"
-        assert result["ticket"]["title"] == "Network Issue"
-        assert result["ticket"]["status"] == "open"
+        assert result["status_detail"] == "open"
+        assert result["title"] == "Network Issue"
 
     @pytest.mark.asyncio
-    async def test_get_ticket_details_not_found(self, fake_service):
+    async def test_get_ticket_status_not_found(self, fake_service):
         tools = create_tools(fake_service)
-        tool = next(t for t in tools if t.name == "get_ticket_details")
+        tool = next(t for t in tools if t.name == "get_ticket_status")
         result = await tool.ainvoke({"ticket_id": "T-999"})
-        assert result["status"] == "error"
+        assert result["status"] == "not_found"
 
     @pytest.mark.asyncio
-    async def test_get_customer_summary(self, fake_service):
+    async def test_get_customer_context(self, fake_service):
         tools = create_tools(fake_service)
-        tool = next(t for t in tools if t.name == "get_customer_summary")
+        tool = next(t for t in tools if t.name == "get_customer_context")
         result = await tool.ainvoke({"customer_email": "john@example.com"})
         assert result["status"] == "success"
         assert result["customer_email"] == "john@example.com"
 
     @pytest.mark.asyncio
-    async def test_resolve_ticket_with_invoice(self, fake_service):
+    async def test_resolve_ticket(self, fake_service):
         tools = create_tools(fake_service)
-        tool = next(t for t in tools if t.name == "resolve_ticket_with_invoice")
+        tool = next(t for t in tools if t.name == "resolve_ticket")
         result = await tool.ainvoke(
             {
                 "ticket_id": "T-123",
@@ -210,7 +214,7 @@ class TestCreateTools:
                 "estimated_amount": 100.0,
             }
         )
-        assert result["status"] == "approved"
+        assert result["status"] == "success"
 
 
 # ------------------------------------------------------------------
@@ -219,16 +223,20 @@ class TestCreateTools:
 
 
 class TestAgentToolkit:
-    def test_returns_six_tools(self, fake_service):
+    def test_returns_ten_tools(self, fake_service):
         toolkit = AgentToolkit(fake_service)
         tools = toolkit.get_tools()
-        assert len(tools) == 6
+        assert len(tools) == 10
         names = {t.name for t in tools}
         assert names == {
-            "search_tickets_by_customer",
-            "get_ticket_details",
-            "get_customer_summary",
-            "resolve_ticket_with_invoice",
+            "get_ticket_status",
+            "list_customer_tickets",
+            "create_ticket",
+            "resolve_ticket",
+            "create_invoice",
+            "get_invoice_status",
+            "send_email",
+            "get_customer_context",
             "request_human_approval",
             "approve_request",
         }
@@ -269,7 +277,7 @@ class TestGaramaticAgent:
                         tool_calls=[
                             {
                                 "id": "call_1",
-                                "name": "search_tickets_by_customer",
+                                "name": "list_customer_tickets",
                                 "args": {"customer_email": "john@example.com", "limit": 10},
                             }
                         ],

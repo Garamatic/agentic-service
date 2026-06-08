@@ -2,7 +2,8 @@
 
 import pytest
 
-from agentic_service.server import create_ticket, get_customer_context
+from agentic_service.tools.customer_tools import _get_customer_context as get_customer_context
+from agentic_service.tools.ticket_tools import _create_ticket as create_ticket
 
 
 @pytest.mark.asyncio
@@ -139,10 +140,12 @@ class TestMcpEdgeCases:
 
     async def test_empty_customer_list(self, mcp_client):
         """E2E: List tickets for customer with no tickets."""
-        from agentic_service.server import list_customer_tickets
+        from agentic_service.tools.ticket_tools import (
+            _list_customer_tickets as list_customer_tickets,
+        )
         result = await list_customer_tickets(
             customer_email="nobody@example.com",
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
         assert "tickets" in result
         assert result["tickets"] == []
@@ -155,34 +158,40 @@ class TestMcpEdgeCases:
             customer_email="unicode-mcp@example.com",
             customer_name="Ünicode Müller",
             priority="medium",
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
-        assert result["status"] == "created"
+        assert result["status"] == "success"
         assert result["customer_email"] == "unicode-mcp@example.com"
 
     async def test_zero_amount_invoice_mcp(self, mcp_client, fake_ticket_client):
         """E2E: Zero amount invoice should fail validation."""
-        from agentic_service.server import create_invoice, create_ticket, list_customer_tickets
+        from agentic_service.tools.invoice_tools import _create_invoice as create_invoice
+        from agentic_service.tools.ticket_tools import _create_ticket as create_ticket
+        from agentic_service.tools.ticket_tools import (
+            _list_customer_tickets as list_customer_tickets,
+        )
         # Create ticket via MCP first so fake_ticket_client is set up correctly
         await create_ticket(
+            service=mcp_client.request_context.lifespan_context["service"],
             title="Zero Invoice Test",
             description="For zero amount invoice",
             customer_email="zero-invoice@example.com",
             customer_name="Zero Invoice",
             priority="medium",
-            ctx=mcp_client,
         )
         # Get the ticket ID
         list_result = await list_customer_tickets(
+            service=mcp_client.request_context.lifespan_context["service"],
             customer_email="zero-invoice@example.com",
-            ctx=mcp_client,
         )
         ticket_id = list_result["tickets"][0]["ticket_id"]
         result = await create_invoice(
-            ticket_id=ticket_id, amount=0.00,
-            description="Zero amount", ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
+            ticket_id=ticket_id,
+            amount=0.00,
+            description="Zero amount",
         )
-        assert result["status"] == "failed"
+        assert result["status"] == "validation_error"
         assert "error" in result
 
 
@@ -192,7 +201,9 @@ class TestStateConsistency:
 
     async def test_api_and_mcp_see_same_tickets(self, api_client, mcp_client):
         """E2E: Tickets created via API are visible via MCP."""
-        from agentic_service.server import list_customer_tickets
+        from agentic_service.tools.ticket_tools import (
+            _list_customer_tickets as list_customer_tickets,
+        )
         await api_client.post("/tickets", json={
             "title": "Cross-entry",
             "description": "Visible everywhere",
@@ -202,7 +213,7 @@ class TestStateConsistency:
         })
         result = await list_customer_tickets(
             customer_email="cross@example.com",
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
         assert "tickets" in result
         assert len(result["tickets"]) == 1
@@ -216,7 +227,7 @@ class TestStateConsistency:
             customer_email="mcp-cross@example.com",
             customer_name="MCP Cross",
             priority="medium",
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
         response = await api_client.get("/tickets?customer_email=mcp-cross@example.com")
         assert response.status_code == 200
@@ -248,8 +259,8 @@ class TestStateConsistency:
             "paid_at": None,
         }
         result = await get_customer_context(
-            "invoice-context@example.com",
-            ctx=mcp_client,
+            customer_email="invoice-context@example.com",
+            service=mcp_client.request_context.lifespan_context["service"],
         )
         assert result["status"] == "success"
         assert result["summary"]["total_tickets"] == 1

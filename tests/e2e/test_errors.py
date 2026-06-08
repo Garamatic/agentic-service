@@ -4,13 +4,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agentic_service.server import (
-    create_ticket,
-    get_customer_context,
-    get_invoice_status,
-    get_ticket_status,
-    resolve_ticket,
-    send_email,
+from agentic_service.tools.customer_tools import _get_customer_context as get_customer_context
+from agentic_service.tools.email_tools import _send_email as send_email
+from agentic_service.tools.invoice_tools import _get_invoice_status as get_invoice_status
+from agentic_service.tools.ticket_tools import (
+    _create_ticket as create_ticket,
+)
+from agentic_service.tools.ticket_tools import (
+    _get_ticket_status as get_ticket_status,
+)
+from agentic_service.tools.ticket_tools import (
+    _resolve_ticket as resolve_ticket,
 )
 
 
@@ -121,19 +125,22 @@ class TestMcpErrors:
 
     async def test_ticket_not_found_mcp(self, mcp_client):
         """E2E: Handle ticket not found via MCP."""
-        result = await get_ticket_status("T-NONEXISTENT", ctx=mcp_client)
+        service = mcp_client.request_context.lifespan_context["service"]
+        result = await get_ticket_status(ticket_id="T-NONEXISTENT", service=service)
         assert result["status"] == "not_found"
-        assert "message" in result
+        assert "error" in result
 
     async def test_invoice_not_found_mcp(self, mcp_client):
         """E2E: Handle invoice not found via MCP."""
-        result = await get_invoice_status("T-NOINVOICE", ctx=mcp_client)
+        service = mcp_client.request_context.lifespan_context["service"]
+        result = await get_invoice_status(ticket_id="T-NOINVOICE", service=service)
         assert result["status"] == "not_found"
-        assert "message" in result
+        assert "error" in result
 
     async def test_invalid_email_mcp(self, mcp_client):
         """E2E: Handle invalid email via MCP."""
-        result = await get_customer_context("invalid-email", ctx=mcp_client)
+        service = mcp_client.request_context.lifespan_context["service"]
+        result = await get_customer_context(customer_email="invalid-email", service=service)
         assert "error" in result
 
     async def test_create_ticket_validation_error(self, mcp_client):
@@ -141,7 +148,7 @@ class TestMcpErrors:
         result = await create_ticket(
             title="", description="Desc",
             customer_email="test@example.com", customer_name="Test",
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
         assert "error" in result
 
@@ -149,15 +156,15 @@ class TestMcpErrors:
         """E2E: Handle negative billable amount via MCP."""
         result = await resolve_ticket(
             ticket_id="T-123", resolution_notes="Fixed",
-            billable_amount=-100.0, ctx=mcp_client,
+            billable_amount=-100.0, service=mcp_client.request_context.lifespan_context["service"],
         )
-        assert "message" in result
+        assert "error" in result
 
     async def test_send_email_invalid_email(self, mcp_client):
         """E2E: Handle invalid email in send_email via MCP."""
         result = await send_email(
             to_email="invalid-email", subject="Test", body="Body",
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
         assert "error" in result
 

@@ -8,21 +8,26 @@ in test_service.py.
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastmcp import Context
 
-from agentic_service.server import (
-    create_invoice,
-    create_ticket,
-    get_customer_context,
-    get_ticket_status,
-    list_customer_tickets,
-    resolve_ticket,
-    send_email,
-)
 from agentic_service.service import (
     ValidationError,
     generate_request_id,
     validate_email,
+)
+from agentic_service.tools.customer_tools import _get_customer_context as get_customer_context
+from agentic_service.tools.email_tools import _send_email as send_email
+from agentic_service.tools.invoice_tools import _create_invoice as create_invoice
+from agentic_service.tools.ticket_tools import (
+    _create_ticket as create_ticket,
+)
+from agentic_service.tools.ticket_tools import (
+    _get_ticket_status as get_ticket_status,
+)
+from agentic_service.tools.ticket_tools import (
+    _list_customer_tickets as list_customer_tickets,
+)
+from agentic_service.tools.ticket_tools import (
+    _resolve_ticket as resolve_ticket,
 )
 
 
@@ -67,17 +72,10 @@ class TestRequestIdGeneration:
         assert len(id2) == 32
 
 
-def _make_mock_ctx(**service_methods):
-    """Create a mock MCP Context with a mock service in lifespan_context."""
-    ctx = MagicMock(spec=Context)
-    ctx.request_context.lifespan_context = {"service": _make_mock_service(**service_methods)}
-    ctx.info = AsyncMock()
-    return ctx
-
-
 def _make_mock_service(**methods):
     """Create a mock GaramaticService with specified async methods."""
     service = MagicMock()
+    service.approval_store = None
     for name, return_value in methods.items():
         setattr(service, name, AsyncMock(return_value=return_value))
     return service
@@ -106,25 +104,24 @@ class TestGetTicketStatus:
             resolution_notes=None,
             billable_amount=None,
         )
-        mock_ctx = _make_mock_ctx(get_ticket=ticket)
+        service = _make_mock_service(get_ticket=ticket)
 
-        result = await get_ticket_status("T-123", ctx=mock_ctx)
+        result = await get_ticket_status(service, ticket_id="T-123")
 
         assert result["ticket_id"] == "T-123"
-        assert result["status"] == "open"
+        assert result["status"] == "success"
+        assert result["status_detail"] == "open"
         assert result["customer_id"] == "john@example.com"
         assert result["title"] == "Network Issue"
-        mock_ctx.request_context.lifespan_context["service"].get_ticket.assert_awaited_once_with("T-123")
+        service.get_ticket.assert_awaited_once_with("T-123")
 
     async def test_handles_not_found(self):
         """Should return not_found for missing ticket."""
         from agentic_service.service import NotFoundError
         svc = _make_mock_service()
         svc.get_ticket = AsyncMock(side_effect=NotFoundError("Not found"))
-        ctx = MagicMock(spec=Context)
-        ctx.request_context.lifespan_context = {"service": svc}
 
-        result = await get_ticket_status("NONEXISTENT", ctx=ctx)
+        result = await get_ticket_status(svc, ticket_id="NONEXISTENT")
 
         assert result["status"] == "not_found"
         assert result["ticket_id"] == "NONEXISTENT"
@@ -144,11 +141,10 @@ class TestGetTicketStatus:
             resolution_notes=None,
             billable_amount=None,
         )
-        mock_ctx = _make_mock_ctx(get_ticket=ticket)
+        service = _make_mock_service(get_ticket=ticket)
 
-        await get_ticket_status("T-123", ctx=mock_ctx)
-
-        mock_ctx.info.assert_awaited_once()
+        result = await get_ticket_status(service, ticket_id="T-123")
+        assert result["ticket_id"] == "T-123"
 
 
 @pytest.mark.asyncio
@@ -165,13 +161,13 @@ class TestListCustomerTickets:
             created_at="2024-01-15T10:30:00Z",
             resolved_at=None,
         )
-        mock_ctx = _make_mock_ctx(list_tickets=[summary])
+        service = _make_mock_service(list_tickets=[summary])
 
         result = await list_customer_tickets(
-            "john@example.com",
+            service,
+            customer_email="john@example.com",
             status="open",
             limit=5,
-            ctx=mock_ctx
         )
 
         assert len(result["tickets"]) == 1
@@ -197,19 +193,19 @@ class TestCreateTicket:
             resolution_notes=None,
             billable_amount=None,
         )
-        mock_ctx = _make_mock_ctx(create_ticket=ticket)
+        service = _make_mock_service(create_ticket=ticket)
 
         result = await create_ticket(
+            service,
             title="New Issue",
             description="Something broke",
             customer_email="test@example.com",
             customer_name="Test User",
             priority="high",
-            ctx=mock_ctx
         )
 
         assert result["ticket_id"] == "T-999"
-        assert result["status"] == "created"
+        assert result["status"] == "success"
         assert "message" in result
 
 
@@ -226,16 +222,16 @@ class TestResolveTicket:
             resolution_notes="Fixed the issue",
             invoice=None,
         )
-        mock_ctx = _make_mock_ctx(resolve_ticket=result_obj)
+        service = _make_mock_service(resolve_ticket=result_obj)
 
         result = await resolve_ticket(
+            service,
             ticket_id="T-123",
             resolution_notes="Fixed the issue",
             billable_amount=None,
-            ctx=mock_ctx
         )
 
-        assert result["status"] == "resolved"
+        assert result["status"] == "success"
         assert result["ticket_id"] == "T-123"
         assert "invoice" not in result
 
@@ -253,16 +249,16 @@ class TestResolveTicket:
             resolution_notes="Fixed the issue",
             invoice=invoice,
         )
-        mock_ctx = _make_mock_ctx(resolve_ticket=result_obj)
+        service = _make_mock_service(resolve_ticket=result_obj)
 
         result = await resolve_ticket(
+            service,
             ticket_id="T-123",
             resolution_notes="Fixed the issue",
             billable_amount=200.00,
-            ctx=mock_ctx
         )
 
-        assert result["status"] == "resolved"
+        assert result["status"] == "success"
         assert "invoice" in result
         assert result["invoice"]["estimated_amount"] == 200.00
 
@@ -283,19 +279,19 @@ class TestCreateInvoice:
             estimated_amount=250.00,
             message="Invoice queued",
         )
-        mock_ctx = _make_mock_ctx(queue_invoice=result_obj)
+        service = _make_mock_service(queue_invoice=result_obj)
 
         result = await create_invoice(
+            service,
             ticket_id="T-123",
             amount=250.00,
             description="Network troubleshooting",
-            ctx=mock_ctx
         )
 
-        assert result["status"] == "queued"
+        assert result["status"] == "success"
         assert result["amount"] == 250.00
         assert "message" in result
-        mock_ctx.request_context.lifespan_context["service"].queue_invoice.assert_awaited_once()
+        service.queue_invoice.assert_awaited_once()
 
     async def test_handles_unavailable_mq(self):
         """Should handle when MQ is unavailable."""
@@ -305,15 +301,16 @@ class TestCreateInvoice:
             estimated_amount=100.00,
             message="Invoice service unavailable",
         )
-        mock_ctx = _make_mock_ctx(queue_invoice=result_obj)
+        service = _make_mock_service(queue_invoice=result_obj)
 
         result = await create_invoice(
+            service,
             ticket_id="T-123",
             amount=100.00,
-            ctx=mock_ctx
         )
 
-        assert result["status"] == "unavailable"
+        assert result["status"] == "success"
+        assert result["message"] == "Invoice service unavailable"
 
 
 # ------------------------------------------------------------------
@@ -333,19 +330,19 @@ class TestSendEmail:
             subject="Test Subject",
             message="Email queued",
         )
-        mock_ctx = _make_mock_ctx(send_email=result_obj)
+        service = _make_mock_service(send_email=result_obj)
 
         result = await send_email(
+            service,
             to_email="customer@example.com",
             subject="Test Subject",
             body="<p>Hello World</p>",
             from_name="Support Team",
-            ctx=mock_ctx
         )
 
-        assert result["status"] == "queued"
+        assert result["status"] == "success"
         assert result["to_email"] == "customer@example.com"
-        mock_ctx.request_context.lifespan_context["service"].send_email.assert_awaited_once()
+        service.send_email.assert_awaited_once()
 
 
 # ------------------------------------------------------------------
@@ -387,10 +384,11 @@ class TestGetCustomerContext:
                 created_at="2024-01-10T14:35:00Z",
             )],
         )
-        mock_ctx = _make_mock_ctx(get_customer_context=context)
+        service = _make_mock_service(get_customer_context=context)
 
-        result = await get_customer_context("john@example.com", ctx=mock_ctx)
+        result = await get_customer_context(service, customer_email="john@example.com")
 
+        assert result["status"] == "success"
         assert result["customer_email"] == "john@example.com"
         assert "summary" in result
         assert result["summary"]["total_tickets"] == 1
@@ -404,10 +402,8 @@ class TestGetCustomerContext:
         svc.get_customer_context = AsyncMock(
             side_effect=ServiceUnavailableError("Service not initialized")
         )
-        ctx = MagicMock(spec=Context)
-        ctx.request_context.lifespan_context = {"service": svc}
 
-        result = await get_customer_context("test@example.com", ctx=ctx)
+        result = await get_customer_context(svc, customer_email="test@example.com")
 
         assert result["status"] == "error"
         assert result["customer_email"] == "test@example.com"

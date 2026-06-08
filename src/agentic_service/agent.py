@@ -15,6 +15,7 @@ Usage:
 import asyncio
 import contextlib
 import os
+from collections.abc import AsyncIterator
 from typing import Annotated, Any, Literal
 
 import structlog
@@ -251,7 +252,7 @@ class GaramaticAgent:
 
         return "No response generated"
 
-    async def process_stream(self, message: str):
+    async def process_stream(self, message: str) -> AsyncIterator[dict[str, Any]]:
         """Process a user message and yield streaming events.
 
         Yields dicts with keys:

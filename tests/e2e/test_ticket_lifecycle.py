@@ -2,12 +2,18 @@
 
 import pytest
 
-from agentic_service.server import (
-    create_invoice,
-    create_ticket,
-    get_ticket_status,
-    list_customer_tickets,
-    resolve_ticket,
+from agentic_service.tools.invoice_tools import _create_invoice as create_invoice
+from agentic_service.tools.ticket_tools import (
+    _create_ticket as create_ticket,
+)
+from agentic_service.tools.ticket_tools import (
+    _get_ticket_status as get_ticket_status,
+)
+from agentic_service.tools.ticket_tools import (
+    _list_customer_tickets as list_customer_tickets,
+)
+from agentic_service.tools.ticket_tools import (
+    _resolve_ticket as resolve_ticket,
 )
 
 
@@ -118,9 +124,9 @@ class TestTicketLifecycleMcp:
         result = await create_ticket(
             title="MCP Ticket", description="Created via MCP",
             customer_email="mcp@example.com", customer_name="MCP User",
-            priority="medium", ctx=mcp_client,
+            priority="medium", service=mcp_client.request_context.lifespan_context["service"],
         )
-        assert result["status"] == "created"
+        assert result["status"] == "success"
         assert result["ticket_id"].startswith("T-")
 
     async def test_get_ticket_status_mcp(self, mcp_client, fake_ticket_client):
@@ -128,11 +134,12 @@ class TestTicketLifecycleMcp:
         create_result = await create_ticket(
             title="MCP Status Test", description="Testing get_ticket_status",
             customer_email="status@example.com", customer_name="Status User",
-            priority="high", ctx=mcp_client,
+            priority="high", service=mcp_client.request_context.lifespan_context["service"],
         )
         ticket_id = create_result["ticket_id"]
-        status_result = await get_ticket_status(ticket_id, ctx=mcp_client)
-        assert status_result["status"] == "open"
+        service = mcp_client.request_context.lifespan_context["service"]
+        status_result = await get_ticket_status(ticket_id=ticket_id, service=service)
+        assert status_result["status"] == "success"
         assert status_result["ticket_id"] == ticket_id
 
     async def test_resolve_ticket_mcp(self, mcp_client, fake_ticket_client, fake_mq):
@@ -140,38 +147,43 @@ class TestTicketLifecycleMcp:
         create_result = await create_ticket(
             title="MCP Resolve", description="To be resolved",
             customer_email="resolve@example.com", customer_name="Resolve User",
-            priority="high", ctx=mcp_client,
+            priority="high", service=mcp_client.request_context.lifespan_context["service"],
         )
         ticket_id = create_result["ticket_id"]
         resolve_result = await resolve_ticket(
             ticket_id=ticket_id, resolution_notes="Resolved via MCP",
-            billable_amount=150.00, ctx=mcp_client,
+            billable_amount=150.00, service=mcp_client.request_context.lifespan_context["service"],
         )
-        assert resolve_result["status"] == "resolved"
+        assert resolve_result["status"] == "success"
         assert "invoice" in resolve_result
         assert len(fake_mq.published) == 1
 
     async def test_list_and_create_invoice_mcp(self, mcp_client, fake_ticket_client, fake_mq):
         """E2E: Create ticket, list tickets, create invoice via MCP."""
+        service = mcp_client.request_context.lifespan_context["service"]
         await create_ticket(
             title="Invoice Test", description="For invoice",
             customer_email="invoice@example.com", customer_name="Invoice User",
-            priority="medium", ctx=mcp_client,
+            priority="medium", service=service,
         )
         list_result = await list_customer_tickets(
-            customer_email="invoice@example.com", ctx=mcp_client,
+            customer_email="invoice@example.com",
+            service=service,
         )
         assert "tickets" in list_result
         assert len(list_result["tickets"]) == 1
         ticket_id = list_result["tickets"][0]["ticket_id"]
         invoice_result = await create_invoice(
-            ticket_id=ticket_id, amount=300.00,
-            description="MCP invoice", ctx=mcp_client,
+            ticket_id=ticket_id,
+            amount=300.00,
+            description="MCP invoice",
+            service=service,
         )
-        assert invoice_result["status"] == "queued"
+        assert invoice_result["status"] == "success"
         assert invoice_result["ticket_id"] == ticket_id
 
     async def test_ticket_not_found_mcp(self, mcp_client):
         """E2E: Get non-existent ticket via MCP."""
-        result = await get_ticket_status("T-NONEXISTENT", ctx=mcp_client)
+        service = mcp_client.request_context.lifespan_context["service"]
+        result = await get_ticket_status(ticket_id="T-NONEXISTENT", service=service)
         assert result["status"] == "not_found"

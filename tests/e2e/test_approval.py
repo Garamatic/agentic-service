@@ -5,7 +5,9 @@ Tests the human-in-the-loop approval for high-value invoices.
 
 import pytest
 
-from agentic_service.server import create_ticket, list_customer_tickets, resolve_ticket
+from agentic_service.tools.ticket_tools import _create_ticket as create_ticket
+from agentic_service.tools.ticket_tools import _list_customer_tickets as list_customer_tickets
+from agentic_service.tools.ticket_tools import _resolve_ticket as resolve_ticket
 
 
 @pytest.mark.asyncio
@@ -61,12 +63,12 @@ class TestApprovalWorkflow:
             customer_email="mcp-expensive@example.com",
             customer_name="MCP Expensive",
             priority="high",
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
 
         list_result = await list_customer_tickets(
             customer_email="mcp-expensive@example.com",
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
         ticket_id = list_result["tickets"][0]["ticket_id"]
 
@@ -74,7 +76,7 @@ class TestApprovalWorkflow:
             ticket_id=ticket_id,
             resolution_notes="Fixed",
             billable_amount=600.00,
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
         assert result["status"] == "approval_required"
         assert "approval_id" in result

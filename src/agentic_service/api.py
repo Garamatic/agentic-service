@@ -3,7 +3,7 @@
 import functools
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, cast
 
 import pybreaker
@@ -16,7 +16,6 @@ from pydantic import BaseModel, EmailStr, Field
 from .agent import GaramaticAgent
 from .approval import ApprovalRequiredError
 from .config import get_settings
-from .thread_store import ThreadStore
 from .service import (
     GaramaticService,
     NotFoundError,
@@ -26,6 +25,7 @@ from .service import (
     create_service,
     generate_request_id,
 )
+from .thread_store import ThreadStore
 
 # Agent cache bound to prevent unbounded memory growth
 MAX_AGENT_CACHE = 100
@@ -604,9 +604,10 @@ async def api_agent_chat_stream(request: ChatRequest) -> StreamingResponse:
 
     try:
         validate_llm_config(config)
-    except ValueError as e:
-        async def _error_stream():
-            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+    except ValueError as exc:
+        error_msg = str(exc)
+        async def _error_stream() -> AsyncIterator[str]:
+            yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
         return StreamingResponse(_error_stream(), media_type="text/event-stream")
 
     service = _get_service()
@@ -626,13 +627,12 @@ async def api_agent_chat_stream(request: ChatRequest) -> StreamingResponse:
                 logger.warning("api.agent_cache_evict_failed", thread_id=oldest_thread_id)
         app.state.agent_cache = agent_cache
 
-    async def _event_generator():
-        full_response = ""
+    async def _event_generator() -> AsyncIterator[str]:
         try:
             async for event in agent.process_stream(request.message):
                 event["request_id"] = rid
                 if event["type"] == "content":
-                    full_response = event["text"]
+                    _ = event["text"]
                 yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
         except Exception as e:
             logger.error("api.agent_chat_stream_failed", error=str(e), request_id=rid)
@@ -642,7 +642,11 @@ async def api_agent_chat_stream(request: ChatRequest) -> StreamingResponse:
         # Track thread metadata
         try:
             thread_store = _get_thread_store()
-            title = request.message[:60] if len(request.message) <= 60 else request.message[:57] + "..."
+            title = (
+                request.message[:60]
+                if len(request.message) <= 60
+                else request.message[:57] + "..."
+            )
             await thread_store.upsert(request.thread_id, title=title)
         except Exception:
             logger.warning("thread_store.upsert_failed", thread_id=request.thread_id)
@@ -698,10 +702,8 @@ async def api_delete_thread(thread_id: str) -> dict[str, Any]:
     agent_cache = getattr(app.state, "agent_cache", {})
     if thread_id in agent_cache:
         agent = agent_cache.pop(thread_id)
-        try:
+        with suppress(Exception):
             await agent.close()
-        except Exception:
-            pass
         app.state.agent_cache = agent_cache
 
     return {"thread_id": thread_id, "status": "deleted"}

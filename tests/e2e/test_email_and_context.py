@@ -2,7 +2,8 @@
 
 import pytest
 
-from agentic_service.server import get_customer_context, send_email
+from agentic_service.tools.customer_tools import _get_customer_context as get_customer_context
+from agentic_service.tools.email_tools import _send_email as send_email
 
 
 @pytest.mark.asyncio
@@ -32,9 +33,9 @@ class TestEmailWorkflow:
             subject="MCP Email",
             body="<p>Sent via MCP</p>",
             from_name="MCP Support",
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
-        assert result["status"] == "queued"
+        assert result["status"] == "success"
         assert result["to_email"] == "mcp-customer@example.com"
         assert len(fake_mq.published) == 1
 
@@ -90,7 +91,7 @@ class TestCustomerContext:
 
     async def test_customer_context_mcp(self, mcp_client, fake_ticket_client):
         """E2E: Get customer context via MCP tool."""
-        from agentic_service.server import create_ticket
+        from agentic_service.tools.ticket_tools import _create_ticket as create_ticket
         customer_email = "mcp-context@example.com"
         await create_ticket(
             title="MCP Context",
@@ -98,9 +99,10 @@ class TestCustomerContext:
             customer_email=customer_email,
             customer_name="MCP Context",
             priority="medium",
-            ctx=mcp_client,
+            service=mcp_client.request_context.lifespan_context["service"],
         )
-        result = await get_customer_context(customer_email, ctx=mcp_client)
+        service = mcp_client.request_context.lifespan_context["service"]
+        result = await get_customer_context(customer_email=customer_email, service=service)
         assert result["status"] == "success"
         assert result["customer_email"] == customer_email
         assert result["summary"]["total_tickets"] == 1
