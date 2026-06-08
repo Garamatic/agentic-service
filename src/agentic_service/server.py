@@ -211,6 +211,29 @@ EMAIL_ICON = Icon(
     sizes=["16x16"],
 )
 
+# Advertise server identity (favicon + website) so MCP clients can display branding
+mcp._mcp_server.icons = [TICKET_ICON]
+mcp._mcp_server.website_url = "https://garamatic.tech"
+
+# Enable resource subscription capability in the init handshake
+mcp._mcp_server._resources_subscribed = True
+
+# Patch get_capabilities because the SDK hardcodes resources.subscribe=False
+# even though the attribute exists. We override it post-hoc.
+_original_get_capabilities = mcp._mcp_server.get_capabilities
+
+def _patched_get_capabilities(notification_options, experimental_capabilities):
+    capabilities = _original_get_capabilities(notification_options, experimental_capabilities)
+    if capabilities.resources is not None and mcp._mcp_server._resources_subscribed:
+        capabilities = capabilities.model_copy(
+            update={
+                "resources": capabilities.resources.model_copy(update={"subscribe": True})
+            }
+        )
+    return capabilities
+
+mcp._mcp_server.get_capabilities = _patched_get_capabilities
+
 
 # ------------------------------------------------------------------
 # MCP Prompts
