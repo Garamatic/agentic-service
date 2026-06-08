@@ -258,8 +258,8 @@ class TestEventConsumer:
 
         await consumer.close()
 
-        assert fake_service._ticket.closed
-        assert fake_service._odoo.closed
+        assert fake_service._ticket._ticket.closed
+        assert fake_service._invoice._odoo.closed
         assert fake_service._mq.closed
 
     async def test_does_not_close_service_when_not_owned(self, fake_service):
@@ -273,7 +273,7 @@ class TestEventConsumer:
 
         await consumer.close()
 
-        assert not fake_service._ticket.closed
+        assert not fake_service._ticket._ticket.closed
 
 
 # ------------------------------------------------------------------

@@ -24,12 +24,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt import ToolNode
 from typing_extensions import TypedDict
 
 from .agent_toolkit import AgentToolkit
 from .config import get_settings
+from .llm_adapter import build_llm
 from .service import GaramaticService, create_service
 
 logger = structlog.get_logger()
@@ -43,7 +43,7 @@ logger = structlog.get_logger()
 class AgentState(TypedDict):
     """State maintained across agent invocations."""
 
-    messages: Annotated[list, add_messages]
+    messages: Annotated[list[Any], add_messages]
 
 
 # ------------------------------------------------------------------
@@ -51,7 +51,7 @@ class AgentState(TypedDict):
 # ------------------------------------------------------------------
 
 
-def create_tools(service: GaramaticService) -> list:
+def create_tools(service: GaramaticService) -> list[Any]:
     """Create LangGraph tools bound to a service instance."""
     return AgentToolkit(service).get_tools()
 
@@ -60,19 +60,23 @@ def create_tools(service: GaramaticService) -> list:
 # System prompt
 # ------------------------------------------------------------------
 
-_system_prompt = """You are Garamatic AI, an intelligent assistant for customer support and billing.
+
+def _build_system_prompt() -> str:
+    """Build the system prompt with the current approval threshold."""
+    threshold = get_settings().approval_threshold
+    return f"""You are Garamatic AI, an intelligent assistant for customer support and billing.
 
 Your capabilities:
 1. Look up tickets and customer information
 2. Resolve tickets and create invoices when appropriate
 3. Get customer context across all services
-4. Request human approval for sensitive actions (amounts > €500)
+4. Request human approval for sensitive actions (amounts > €{threshold:.2f})
 
 Guidelines:
 - Always verify customer identity before making changes
 - Explain your reasoning when taking actions
 - Use resolve_ticket_with_invoice only when explicitly requested or when work is clearly billable
-- Request approval for invoices over €500
+- Request approval for invoices over €{threshold:.2f}
 - Be helpful but cautious with customer data
 
 When asked about a customer:
@@ -89,12 +93,15 @@ When resolving tickets:
 """
 
 
+_system_prompt = _build_system_prompt()
+
+
 # ------------------------------------------------------------------
 # Checkpointer
 # ------------------------------------------------------------------
 
 
-async def _get_checkpointer() -> BaseCheckpointSaver:
+async def _get_checkpointer() -> BaseCheckpointSaver[Any]:
     """Get appropriate checkpoint saver based on configuration.
 
     Uses SQLite persistence if AGENT_DB_PATH is set (production),
@@ -123,8 +130,8 @@ async def _get_checkpointer() -> BaseCheckpointSaver:
 
 def create_agent(
     service: GaramaticService,
-    checkpointer: BaseCheckpointSaver,
-) -> CompiledStateGraph:
+    checkpointer: BaseCheckpointSaver[Any],
+) -> Any:
     """Create and configure the LangGraph agent.
 
     Args:
@@ -142,8 +149,6 @@ def create_agent(
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
             return "tools"
         return "__end__"
-
-    from .llm_adapter import build_llm
 
     config = get_settings()
     model = build_llm(config)
@@ -185,8 +190,8 @@ class GaramaticAgent:
         self,
         service: GaramaticService,
         thread_id: str | None = None,
-        checkpointer: BaseCheckpointSaver | None = None,
-    ):
+        checkpointer: BaseCheckpointSaver[Any] | None = None,
+    ) -> None:
         """Initialize agent with a service and optional thread_id.
 
         Args:
@@ -200,9 +205,9 @@ class GaramaticAgent:
         self.config = {"configurable": {"thread_id": self.thread_id}}
         self._checkpointer = checkpointer
         self._owns_checkpointer = checkpointer is None
-        self._agent: CompiledStateGraph | None = None
+        self._agent: Any | None = None
 
-    async def _get_agent(self):
+    async def _get_agent(self) -> Any:
         """Lazy initialization of the agent (async)."""
         if self._agent is None:
             if self._checkpointer is None:
@@ -219,15 +224,16 @@ class GaramaticAgent:
 
         state = await agent.aget_state(self.config)
         existing = state.values.get("messages", []) if state.values else []
+        system_prompt = _build_system_prompt()
         if existing:
-            messages = [
-                SystemMessage(content=_system_prompt),
+            messages: list[Any] = [
+                SystemMessage(content=system_prompt),
                 *existing,
                 HumanMessage(content=message),
             ]
         else:
             messages = [
-                SystemMessage(content=_system_prompt),
+                SystemMessage(content=system_prompt),
                 HumanMessage(content=message),
             ]
 
@@ -245,7 +251,7 @@ class GaramaticAgent:
 
         return "No response generated"
 
-    async def get_state(self) -> dict:
+    async def get_state(self) -> dict[str, Any]:
         """Get current conversation state."""
         agent = await self._get_agent()
         state = await agent.aget_state(self.config)
@@ -256,7 +262,7 @@ class GaramaticAgent:
             "last_message": messages[-1].content if messages else None,
         }
 
-    async def close(self):
+    async def close(self) -> None:
         """Cleanup resources including checkpointer connections."""
         if self._agent is not None:
             self._agent = None
@@ -266,17 +272,20 @@ class GaramaticAgent:
                 if hasattr(self._checkpointer, "close"):
                     await self._checkpointer.close()
                 elif getattr(self._checkpointer, "conn", None):
-                    await self._checkpointer.conn.close()
+                    await self._checkpointer.conn.close()  # type: ignore[attr-defined]
             self._checkpointer = None
 
-    async def run_conversation(self):
+    async def run_conversation(self) -> None:
         """Run interactive conversation loop."""
+        import asyncio
+
         print("🤖 Garamatic AI Agent")
         print("Type 'quit' to exit\n")
 
         while True:
             try:
-                user_input = input("You: ").strip()
+                user_input = await asyncio.to_thread(input, "You: ")
+                user_input = user_input.strip()
 
                 if user_input.lower() in ("quit", "exit", "bye"):
                     print("Goodbye! 👋")
@@ -304,7 +313,7 @@ class GaramaticAgent:
 # ------------------------------------------------------------------
 
 
-async def main_async():
+async def main_async() -> None:
     """Async main entry point."""
     service = await create_service()
     agent = None
@@ -317,7 +326,7 @@ async def main_async():
         await service.close()
 
 
-def main():
+def main() -> None:
     """Run the AI Agent."""
     from .llm_adapter import validate_llm_config
 

@@ -2,7 +2,7 @@
 
 from functools import cache
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,8 +22,11 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 3001
 
-    # CORS
-    cors_origins: str = "*"  # comma-separated or "*"
+    # HTTP client timeout (seconds)
+    client_timeout: float = Field(default=30.0, ge=1.0)
+
+    # CORS — comma-separated origins or "*"
+    cors_origins: str = "*"
 
     # RabbitMQ
     rabbitmq_host: str = "localhost"
@@ -44,19 +47,21 @@ class Settings(BaseSettings):
     llm_model: str = ""
     llm_base_url: str = ""
     llm_temperature: float = 0.1
+    # Ollama-specific alias for llm_base_url
+    ollama_base_url: str = ""
 
     # Backward compatibility — used when llm_model / llm_base_url are empty
     openai_api_key: SecretStr = SecretStr("")
     openai_model: str = "gpt-4o-mini"
 
     # Approval threshold for invoices requiring human approval
-    approval_threshold: float = 500.0
+    approval_threshold: float = Field(default=500.0, ge=0)
 
     # MCP server transport
     mcp_transport: str = "sse"
 
-    # Agent persistence
-    agent_db_path: str = ""
+    # Agent persistence — default to a shared file path for production
+    agent_db_path: str = "/data/approvals.db"
 
     # Mail defaults
     mail_from_email: str = "support@garamatic.com"
@@ -73,6 +78,19 @@ class Settings(BaseSettings):
         if origins == "*" or not origins:
             return ["*"]
         return [o.strip() for o in origins.split(",") if o.strip()]
+
+    @field_validator("approval_threshold", mode="after")
+    @classmethod
+    def _warn_zero_threshold(cls, v: float) -> float:
+        if v == 0:
+            import warnings
+
+            warnings.warn(
+                "APPROVAL_THRESHOLD is 0 — all invoices will require approval. "
+                "Set a positive value to enable auto-approval.",
+                stacklevel=2,
+            )
+        return v
 
     model_config = SettingsConfigDict(
         env_file=".env",

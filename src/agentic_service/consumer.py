@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import signal
+from typing import Any
 
 import aio_pika
 import structlog
@@ -55,10 +56,6 @@ class _TicketLookup:
                 error=str(exc),
             )
             return None
-
-
-# Global flag for graceful shutdown
-running = True
 
 
 class EventConsumer:
@@ -178,11 +175,11 @@ class EventConsumer:
 
         logger.info("consumer.connected", queue=self.queue.name)
         assert self.queue is not None
-        return self.queue  # type: ignore[return-value]
+        return self.queue
 
     MAX_RETRIES = 3
 
-    async def handle_message(self, message: aio_pika.IncomingMessage):
+    async def handle_message(self, message: aio_pika.abc.AbstractIncomingMessage) -> None:
         """Process a single message with explicit ack/reject control.
 
         Bad JSON is acked (won't get better with retries).
@@ -209,7 +206,11 @@ class EventConsumer:
             await self._handle_retry(message, retry_count)
 
     async def _process_message(
-        self, body: dict, routing_key: str, message: aio_pika.IncomingMessage, retry_count: int
+        self,
+        body: dict[str, Any],
+        routing_key: str,
+        message: aio_pika.abc.AbstractIncomingMessage,
+        retry_count: int,
     ) -> None:
         """Process a single event with idempotency check."""
         event_data = body["data"] if "data" in body and isinstance(body["data"], dict) else body
@@ -249,7 +250,7 @@ class EventConsumer:
         else:
             raise RuntimeError(f"Notification failed: {result.reason}")
 
-    def _get_retry_count(self, message: aio_pika.IncomingMessage) -> int:
+    def _get_retry_count(self, message: aio_pika.abc.AbstractIncomingMessage) -> int:
         if message.headers and "x-retry-count" in message.headers:
             raw = message.headers["x-retry-count"]
             try:
@@ -258,7 +259,11 @@ class EventConsumer:
                 return 0
         return 0
 
-    async def _handle_retry(self, message: aio_pika.IncomingMessage, retry_count: int):
+    async def _handle_retry(
+        self,
+        message: aio_pika.abc.AbstractIncomingMessage,
+        retry_count: int,
+    ) -> None:
         """Route a failed message through TTL-based retry queues.
 
         Each retry level has a dedicated queue with increasing TTL delays:
@@ -346,22 +351,19 @@ class EventConsumer:
             )
             await message.reject(requeue=False)
 
-    async def run(self):
+    async def run(self) -> None:
         """Main consumer loop."""
-        global running
-
         queue = await self.connect()
         logger.info("consumer.started", queue=queue.name)
 
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
-                if not running:
-                    break
                 await self.handle_message(message)
 
-    async def close(self):
+    async def close(self) -> None:
         with contextlib.suppress(Exception):
-            await self.connection.close()
+            if self.connection is not None:
+                await self.connection.close()
         if self._owns_service and self._service:
             with contextlib.suppress(Exception):
                 await self._service.close()
@@ -369,14 +371,7 @@ class EventConsumer:
             await self._idempotency_store.close()
 
 
-def signal_handler(signum, frame):
-    """Handle shutdown signals."""
-    global running
-    logger.info("consumer.shutdown_signal", signal=signum)
-    running = False
-
-
-async def main_async():
+async def main_async() -> None:
     """Async main entry point."""
     from .config import get_settings
 
@@ -391,8 +386,15 @@ async def main_async():
 
     # Set up signal handlers for graceful shutdown
     loop = asyncio.get_running_loop()
+
+    def _signal_handler(signum: int, _frame: Any) -> None:
+        """Handle shutdown signals by closing the consumer connection."""
+        logger.info("consumer.shutdown_signal", signal=signum)
+        # Closing the connection forces the message iterator to exit
+        loop.create_task(consumer.close())
+
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, signal_handler, sig, None)
+        loop.add_signal_handler(sig, _signal_handler, sig, None)
 
     try:
         await consumer.run()
@@ -403,7 +405,7 @@ async def main_async():
         logger.info("consumer.stopped")
 
 
-def main():
+def main() -> None:
     """Run the event consumer."""
     asyncio.run(main_async())
 

@@ -51,6 +51,8 @@ class ApprovalStore:
         """Open database connection and create table."""
         import aiosqlite
 
+        if self._conn is not None:
+            return
         self._conn = await aiosqlite.connect(self._db_path)
         await self._conn.execute(
             """
@@ -125,7 +127,7 @@ class ApprovalStore:
             (datetime.now(UTC).isoformat(), approval_id),
         )
         await self._conn.commit()
-        approved = cursor.rowcount > 0
+        approved = bool(cursor.rowcount > 0)
         if approved:
             logger.info("approval.approved", approval_id=approval_id)
         return approved
@@ -139,7 +141,7 @@ class ApprovalStore:
             (approval_id,),
         )
         await self._conn.commit()
-        rejected = cursor.rowcount > 0
+        rejected = bool(cursor.rowcount > 0)
         if rejected:
             logger.info("approval.rejected", approval_id=approval_id)
         return rejected

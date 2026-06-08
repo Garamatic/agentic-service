@@ -4,6 +4,8 @@ Uses real service with fake in-memory clients to test full workflows
 end-to-end through the API and MCP layers.
 """
 
+import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -12,8 +14,6 @@ from httpx import ASGITransport, AsyncClient
 
 from agentic_service.api import app as fastapi_app
 from agentic_service.service import GaramaticService
-import sys
-from pathlib import Path
 
 # Add project root to path so tests.fakes can be imported
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -39,11 +39,12 @@ def fake_mq():
     return FakeMQ()
 
 
-@pytest.fixture
-def e2e_service(fake_ticket_client, fake_odoo_client, fake_mq):
+@pytest_asyncio.fixture
+async def e2e_service(fake_ticket_client, fake_odoo_client, fake_mq):
     """Create a GaramaticService backed by fake clients."""
     from agentic_service.approval import ApprovalStore
     store = ApprovalStore(db_path=":memory:")
+    await store.initialize()
     return GaramaticService(fake_ticket_client, fake_odoo_client, fake_mq, approval_store=store)
 
 
@@ -54,7 +55,6 @@ async def api_client(e2e_service):
     transport = ASGITransport(app=fastapi_app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
-    fastapi_app.state.service = None
 
 
 @pytest_asyncio.fixture

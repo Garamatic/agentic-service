@@ -4,12 +4,14 @@ Exposes tickets, invoices, and emails as AI-callable tools
 """
 
 import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 import structlog
 from fastmcp import Context, FastMCP
 
+from .approval import ApprovalRequiredError
 from .service import (
     GaramaticService,
     NotFoundError,
@@ -19,8 +21,6 @@ from .service import (
     format_date,
     validate_email,
 )
-
-from .approval import ApprovalRequiredError
 
 logger = structlog.get_logger()
 
@@ -34,7 +34,7 @@ _lifespan_service: GaramaticService | None = None
 
 
 @asynccontextmanager
-async def app_lifespan(server: "FastMCP"):
+async def app_lifespan(server: "FastMCP") -> AsyncIterator[dict[str, Any]]:
     """Initialize and cleanup service on server startup/shutdown.
 
     Uses create_service() as the single composition root.
@@ -67,7 +67,7 @@ def _get_service(ctx: Context) -> GaramaticService:
     service = lc.get("service")
     if service is None:
         raise ServiceUnavailableError("Service not initialized")
-    return service
+    return service  # type: ignore[no-any-return]
 
 
 # ------------------------------------------------------------------
@@ -239,6 +239,7 @@ async def resolve_ticket(
             ticket_id=ticket_id,
             resolution_notes=resolution_notes,
             billable_amount=billable_amount,
+            approval_store=service.approval_store,
         )
     except (ValidationError, ValueError) as e:
         return {"ticket_id": ticket_id, "status": "error", "message": str(e)}
@@ -589,7 +590,7 @@ async def get_customer_resource(email: str) -> str:
 """
 
 
-def main():
+def main() -> None:
     """Run the MCP server."""
     # Use SSE transport for Docker; stdio for local CLI usage
     import os
@@ -601,7 +602,7 @@ def main():
     if transport == "sse":
         mcp.run(transport="sse", host="0.0.0.0", port=3001)
     else:
-        mcp.run(transport=transport)
+        mcp.run(transport=transport)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

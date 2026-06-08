@@ -67,6 +67,8 @@ def mock_mq_publisher():
     publisher.publish = AsyncMock()
     publisher.close = AsyncMock()
     publisher.channel = MagicMock()  # Non-None to pass channel checks
+    publisher.connection = MagicMock()
+    publisher.connection.is_closed = False
     return publisher
 
 

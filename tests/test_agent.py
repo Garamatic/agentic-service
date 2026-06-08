@@ -123,9 +123,9 @@ def fake_service():
 
 
 class TestCreateTools:
-    def test_returns_five_tools(self, fake_service):
+    def test_returns_six_tools(self, fake_service):
         tools = create_tools(fake_service)
-        assert len(tools) == 5
+        assert len(tools) == 6
         names = {t.name for t in tools}
         assert names == {
             "search_tickets_by_customer",
@@ -133,6 +133,7 @@ class TestCreateTools:
             "get_customer_summary",
             "resolve_ticket_with_invoice",
             "request_human_approval",
+            "approve_request",
         }
         assert all(isinstance(t, StructuredTool) for t in tools)
 
@@ -218,10 +219,10 @@ class TestCreateTools:
 
 
 class TestAgentToolkit:
-    def test_returns_five_tools(self, fake_service):
+    def test_returns_six_tools(self, fake_service):
         toolkit = AgentToolkit(fake_service)
         tools = toolkit.get_tools()
-        assert len(tools) == 5
+        assert len(tools) == 6
         names = {t.name for t in tools}
         assert names == {
             "search_tickets_by_customer",
@@ -229,6 +230,7 @@ class TestAgentToolkit:
             "get_customer_summary",
             "resolve_ticket_with_invoice",
             "request_human_approval",
+            "approve_request",
         }
 
     @pytest.mark.asyncio

@@ -5,8 +5,12 @@ from unittest.mock import AsyncMock
 import pytest
 
 from agentic_service.server import (
-    create_ticket, get_customer_context, get_invoice_status,
-    get_ticket_status, resolve_ticket, send_email,
+    create_ticket,
+    get_customer_context,
+    get_invoice_status,
+    get_ticket_status,
+    resolve_ticket,
+    send_email,
 )
 
 
@@ -77,6 +81,7 @@ class TestApiErrors:
     async def test_circuit_breaker_error(self, api_client):
         """E2E: Return 503 when circuit breaker is open."""
         import pybreaker
+
         from agentic_service.api import app
         from agentic_service.service import GaramaticService
         from tests.fakes import FakeMQ, FakeOdooClient, FakeTicketClient

@@ -3,11 +3,8 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install uv for fast package management
-RUN apt-get update && apt-get install -y curl && \
-    curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    mv /root/.local/bin/uv /usr/local/bin/uv && \
-    rm -rf /var/lib/apt/lists/*
+# Install uv via official copy (avoids curl|sh security risk)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Copy dependency file and source
 COPY pyproject.toml .

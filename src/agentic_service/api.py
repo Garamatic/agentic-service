@@ -1,9 +1,9 @@
 """REST API Gateway for Garamatic Agentic Service."""
 
 import functools
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
 import pybreaker
 import structlog
@@ -36,7 +36,7 @@ def create_error_response(
     message: str,
     internal_error: str | None = None,
     is_development: bool = False,
-) -> dict:
+) -> dict[str, Any]:
     """Create sanitized error response.
 
     In production: Only show generic message + request_id for tracing
@@ -143,7 +143,7 @@ class SendEmailRequest(BaseModel):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[dict[str, Any]]:
     """Initialize and cleanup service.
 
     Uses create_service() as the single composition root.
@@ -153,7 +153,7 @@ async def lifespan(app: FastAPI):
     app.state.agent_cache = {}
 
     logger.info("api.started")
-    yield
+    yield {}
 
     # Close all cached agent instances
     agent_cache = getattr(app.state, "agent_cache", {})
@@ -229,7 +229,9 @@ async def auth_middleware(
 
 
 @app.exception_handler(pybreaker.CircuitBreakerError)
-async def circuit_breaker_handler(request: Request, exc: pybreaker.CircuitBreakerError):
+async def circuit_breaker_handler(
+    request: Request, exc: pybreaker.CircuitBreakerError
+) -> JSONResponse:
     """Handle circuit breaker open state."""
     rid = generate_request_id()
     logger.warning("api.circuit_breaker_open", request_id=rid, path=request.url.path)
@@ -243,7 +245,9 @@ async def circuit_breaker_handler(request: Request, exc: pybreaker.CircuitBreake
 
 
 @app.exception_handler(ServiceUnavailableError)
-async def service_unavailable_handler(request: Request, exc: ServiceUnavailableError):
+async def service_unavailable_handler(
+    request: Request, exc: ServiceUnavailableError
+) -> JSONResponse:
     """Handle service not initialized."""
     rid = exc.request_id
     logger.warning("api.service_unavailable", request_id=rid, path=request.url.path)
@@ -257,7 +261,7 @@ async def service_unavailable_handler(request: Request, exc: ServiceUnavailableE
 
 
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Handle all unhandled exceptions with sanitized responses."""
     rid = generate_request_id()
     logger.error("api.unhandled_exception", request_id=rid, error=str(exc), path=request.url.path)
@@ -273,15 +277,15 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 def _get_service() -> GaramaticService:
     """Get the business-layer service from app state."""
-    service = getattr(app.state, "service", None)
-    if service is None:
+    service: Any = getattr(app.state, "service", None)
+    if service is None or not isinstance(service, GaramaticService):
         raise ServiceUnavailableError("Service not initialized")
-    return service
+    return cast(GaramaticService, service)
 
 
 @app.get("/health")
 @api_error_handler("health_check")
-async def health_check():
+async def health_check() -> dict[str, Any]:
     """Health check endpoint."""
     service = _get_service()
     health = await service.health_check()
@@ -293,7 +297,7 @@ async def health_check():
 
 @app.get("/tickets/{ticket_id}")
 @api_error_handler("get_ticket", not_found_message="Ticket not found")
-async def api_get_ticket(ticket_id: str):
+async def api_get_ticket(ticket_id: str) -> dict[str, Any]:
     """Get ticket details."""
     service = _get_service()
     ticket = await service.get_ticket(ticket_id)
@@ -317,7 +321,7 @@ async def api_list_tickets(
     customer_email: EmailStr | None = None,
     status: str | None = Query(None, pattern="^(open|resolved|closed)$"),
     limit: int = Query(10, ge=1, le=100),
-):
+) -> list[dict[str, Any]]:
     """List tickets with optional filters."""
     service = _get_service()
     tickets = await service.list_tickets(
@@ -339,7 +343,7 @@ async def api_list_tickets(
 
 @app.post("/tickets")
 @api_error_handler("create_ticket")
-async def api_create_ticket(request: CreateTicketRequest):
+async def api_create_ticket(request: CreateTicketRequest) -> dict[str, Any]:
     """Create a new ticket."""
     service = _get_service()
     ticket = await service.create_ticket(
@@ -370,7 +374,7 @@ async def api_create_ticket(request: CreateTicketRequest):
 
 @app.post("/tickets/{ticket_id}/resolve")
 @api_error_handler("resolve_ticket", not_found_message="Ticket not found")
-async def api_resolve_ticket(ticket_id: str, request: ResolveTicketRequest):
+async def api_resolve_ticket(ticket_id: str, request: ResolveTicketRequest) -> dict[str, Any]:
     """Resolve a ticket."""
     service = _get_service()
     result = await service.resolve_ticket(
@@ -378,6 +382,7 @@ async def api_resolve_ticket(ticket_id: str, request: ResolveTicketRequest):
         resolution_notes=request.resolution_notes,
         billable_amount=request.billable_amount,
         approval_id=request.approval_id,
+        approval_store=service.approval_store,
     )
 
     response: dict[str, Any] = {
@@ -395,7 +400,7 @@ async def api_resolve_ticket(ticket_id: str, request: ResolveTicketRequest):
 
 @app.get("/invoices/by-ticket/{ticket_id}")
 @api_error_handler("get_invoice", not_found_message="Invoice not found for this ticket")
-async def api_get_invoice(ticket_id: str):
+async def api_get_invoice(ticket_id: str) -> dict[str, Any]:
     """Get invoice for a ticket."""
     service = _get_service()
     invoice = await service.get_invoice_status(ticket_id)
@@ -420,7 +425,7 @@ async def api_get_invoice(ticket_id: str):
 
 @app.post("/invoices/{ticket_id}")
 @api_error_handler("create_invoice", not_found_message="Ticket not found")
-async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
+async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest) -> dict[str, Any]:
     """Create an invoice for a ticket."""
     service = _get_service()
     result = await service.queue_invoice(
@@ -439,7 +444,7 @@ async def api_create_invoice(ticket_id: str, request: CreateInvoiceRequest):
 
 @app.post("/emails")
 @api_error_handler("send_email")
-async def api_send_email(request: SendEmailRequest):
+async def api_send_email(request: SendEmailRequest) -> dict[str, Any]:
     """Send an email."""
     service = _get_service()
     result = await service.send_email(
@@ -459,7 +464,7 @@ async def api_send_email(request: SendEmailRequest):
 
 @app.get("/customers/{email}/context")
 @api_error_handler("get_customer_context", validation_message="Invalid email format")
-async def api_get_customer_context(email: str):
+async def api_get_customer_context(email: str) -> dict[str, Any]:
     """Get full customer context."""
     service = _get_service()
     context = await service.get_customer_context(email)
@@ -498,11 +503,17 @@ class ChatRequest(BaseModel):
     """Request to chat with the AI agent."""
 
     message: str = Field(..., min_length=1, max_length=2000)
-    thread_id: str = Field(default="web-session")
+    thread_id: str = Field(default="web-session", max_length=128)
+
+
+class ApprovalRequest(BaseModel):
+    """Request to approve or reject an approval ID."""
+
+    approval_id: str = Field(..., min_length=1, max_length=64)
 
 
 @app.post("/agent/chat")
-async def api_agent_chat(request: ChatRequest):
+async def api_agent_chat(request: ChatRequest) -> dict[str, Any]:
     """Chat with the Garamatic AI agent."""
     rid = generate_request_id()
     config = get_settings()
@@ -515,7 +526,7 @@ async def api_agent_chat(request: ChatRequest):
         raise HTTPException(
             status_code=503,
             detail=create_error_response(rid, "Agent unavailable", str(e)),
-        )
+        ) from e
 
     service = _get_service()
     logger.info("api.agent_chat", thread_id=request.thread_id, request_id=rid)
@@ -559,7 +570,51 @@ async def api_agent_chat(request: ChatRequest):
     }
 
 
-def main():
+@app.post("/approvals/{approval_id}/approve")
+@api_error_handler("approve")
+async def api_approve(approval_id: str) -> dict[str, Any]:
+    """Approve a pending approval request."""
+    service = _get_service()
+    store = service.approval_store
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail=create_error_response(generate_request_id(), "Approval store not available"),
+        )
+    success = await store.approve(approval_id)
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail=create_error_response(
+                generate_request_id(), "Approval request not found or already processed"
+            ),
+        )
+    return {"approval_id": approval_id, "status": "approved"}
+
+
+@app.post("/approvals/{approval_id}/reject")
+@api_error_handler("reject")
+async def api_reject(approval_id: str) -> dict[str, Any]:
+    """Reject a pending approval request."""
+    service = _get_service()
+    store = service.approval_store
+    if store is None:
+        raise HTTPException(
+            status_code=503,
+            detail=create_error_response(generate_request_id(), "Approval store not available"),
+        )
+    success = await store.reject(approval_id)
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail=create_error_response(
+                generate_request_id(), "Approval request not found or already processed"
+            ),
+        )
+    return {"approval_id": approval_id, "status": "rejected"}
+
+
+def main() -> None:
     """Run the REST API server."""
     import uvicorn
 

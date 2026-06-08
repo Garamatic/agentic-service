@@ -99,9 +99,10 @@ class TestApprovalWorkflow:
         detail = data.get("detail", data)
         approval_id = detail["approval_id"]
 
-        if e2e_service.approval_store:
-            await e2e_service.approval_store.initialize()
-            await e2e_service.approval_store.approve(approval_id)
+        # Approve via the API endpoint
+        approve_resp = await api_client.post(f"/approvals/{approval_id}/approve")
+        assert approve_resp.status_code == 200
+        assert approve_resp.json()["status"] == "approved"
 
         resolve_resp = await api_client.post(f"/tickets/{ticket_id}/resolve", json={
             "resolution_notes": "Fixed",
@@ -111,6 +112,41 @@ class TestApprovalWorkflow:
         assert resolve_resp.status_code == 200
         data = resolve_resp.json()
         assert data["status"] == "resolved"
+
+    async def test_approval_rejected_api(self, api_client, fake_ticket_client):
+        """E2E: Rejected approval cannot be used."""
+        create_resp = await api_client.post("/tickets", json={
+            "title": "Rejected Approval",
+            "description": "For rejection",
+            "customer_email": "rejected-api@example.com",
+            "customer_name": "Rejected API",
+            "priority": "medium",
+        })
+        ticket_id = create_resp.json()["ticket_id"]
+
+        resolve_resp = await api_client.post(f"/tickets/{ticket_id}/resolve", json={
+            "resolution_notes": "Fixed",
+            "billable_amount": 600.00,
+        })
+        assert resolve_resp.status_code == 402
+        approval_id = resolve_resp.json()["detail"]["approval_id"]
+
+        # Reject via the API endpoint
+        reject_resp = await api_client.post(f"/approvals/{approval_id}/reject")
+        assert reject_resp.status_code == 200
+        assert reject_resp.json()["status"] == "rejected"
+
+        # Rejecting again should 404
+        reject_again = await api_client.post(f"/approvals/{approval_id}/reject")
+        assert reject_again.status_code == 404
+
+        # Resolving with rejected approval_id should 402 again
+        resolve_resp = await api_client.post(f"/tickets/{ticket_id}/resolve", json={
+            "resolution_notes": "Fixed",
+            "billable_amount": 600.00,
+            "approval_id": approval_id,
+        })
+        assert resolve_resp.status_code == 402
 
     async def test_approval_store_operations(self, e2e_service):
         """E2E: Approval store lifecycle."""

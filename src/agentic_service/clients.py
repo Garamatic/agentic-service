@@ -50,15 +50,18 @@ class TicketClient:
         self,
         base_url: str,
         api_key: str | None = None,
-        timeout: float = 30.0,
+        timeout: float | None = None,
     ):
         """Initialize the ticket client.
 
         Args:
             base_url: The base URL of the ticket-masala service
             api_key: Optional API key for authentication
-            timeout: Request timeout in seconds
+            timeout: Request timeout in seconds (defaults to config.client_timeout)
         """
+        if timeout is None:
+            from .config import get_settings
+            timeout = get_settings().client_timeout
         if not base_url or not isinstance(base_url, str):
             raise ValueError("TicketClient requires a valid base_url string")
         self.client = httpx.AsyncClient(
@@ -85,7 +88,7 @@ class TicketClient:
         """
         response = await self.client.get(f"/work-items/{ticket_id}")
         response.raise_for_status()
-        return response.json()
+        return response.json()  # type: ignore[no-any-return]
 
     @ticket_api_breaker
     @retry(
@@ -123,7 +126,7 @@ class TicketClient:
 
         response = await self.client.get("/work-items", params=params)
         response.raise_for_status()
-        return response.json()
+        return response.json()  # type: ignore[no-any-return]
 
     @ticket_api_breaker
     @retry(
@@ -151,8 +154,12 @@ class TicketClient:
             The created ticket data
         """
         # Use the anonymous /api/tickets endpoint which is [AllowAnonymous]
-        # and creates customers on-the-fly with snake_case fields
-        tickets_url = str(self.client.base_url).replace("/api/v1", "/api/tickets")
+        # and creates customers on-the-fly with snake_case fields.
+        # Build the URL by replacing the path on the base_url, not via string replace.
+        from urllib.parse import urljoin
+
+        base = str(self.client.base_url).rsplit("/api/v1", 1)[0]
+        tickets_url = urljoin(base + "/", "api/tickets")
         payload = {
             "customer_email": customer_id,
             "customer_name": kwargs.get("customer_name", "External User"),
@@ -211,7 +218,7 @@ class TicketClient:
             json=payload,
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()  # type: ignore[no-any-return]
 
     async def close(self) -> None:
         """Close the HTTP client."""
@@ -221,7 +228,10 @@ class TicketClient:
 class OdooBridgeClient:
     """HTTP client for odoo-bridge API."""
 
-    def __init__(self, base_url: str, timeout: float = 30.0):
+    def __init__(self, base_url: str, timeout: float | None = None):
+        if timeout is None:
+            from .config import get_settings
+            timeout = get_settings().client_timeout
         if not base_url or not isinstance(base_url, str):
             raise ValueError("OdooBridgeClient requires a valid base_url string")
         self.client = httpx.AsyncClient(
@@ -242,7 +252,7 @@ class OdooBridgeClient:
         if response.status_code == 404:
             return None
         response.raise_for_status()
-        return response.json()
+        return response.json()  # type: ignore[no-any-return]
 
     @odoo_bridge_breaker
     @retry(
@@ -257,7 +267,7 @@ class OdooBridgeClient:
             params={"customerEmail": customer_email},
         )
         response.raise_for_status()
-        return response.json()
+        return response.json()  # type: ignore[no-any-return]
 
     async def close(self) -> None:
         await self.client.aclose()

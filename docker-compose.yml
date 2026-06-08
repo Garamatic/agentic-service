@@ -1,8 +1,6 @@
 # Agentic Service Stack
 # Includes the MCP server and connects to existing infrastructure
 
-version: '3.8'
-
 services:
   agentic-service:
     build: .
@@ -12,22 +10,40 @@ services:
       # Connect to existing services
       TICKET_API_URL: http://ticket-masala:80
       ODOO_BRIDGE_URL: http://odoo-bridge:80
-      
+
+      # Authentication — set a strong secret in production
+      API_KEY: ${API_KEY:-change-me-in-production}
+      CORS_ORIGINS: "*"
+
       # RabbitMQ (same as your existing)
       RABBITMQ_HOST: rabbitmq
       RABBITMQ_PORT: 5672
       RABBITMQ_USER: guest
       RABBITMQ_PASS: guest
       RABBITMQ_VHOST: /
-      
+
+      # Agent persistence — shared file so all processes see the same approvals
+      AGENT_DB_PATH: /data/approvals.db
+
       # Logging
       LOG_LEVEL: INFO
+    volumes:
+      - agentic-data:/data
     networks:
       - garamatic-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
 
   # Optional: Add to your existing docker-compose
   # This shows how to integrate with your stack
+
+volumes:
+  agentic-data:
 
 networks:
   garamatic-network:

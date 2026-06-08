@@ -63,6 +63,11 @@ class AgentToolkit:
                 name="request_human_approval",
                 description="Request human approval for sensitive actions.",
             ),
+            StructuredTool.from_function(
+                coroutine=self.approve_request,
+                name="approve_request",
+                description="Approve a pending approval request by ID.",
+            ),
         ]
 
     @staticmethod
@@ -267,3 +272,25 @@ class AgentToolkit:
             "estimated_amount": estimated_amount,
             "message": f"Action '{action}' approved automatically (below threshold).",
         }
+
+    async def approve_request(self, approval_id: str) -> dict[str, Any]:
+        """Approve a pending approval request by ID.
+
+        Returns success or error if the request does not exist or was already processed.
+        """
+        approval_store = self._service.approval_store
+        if approval_store is None:
+            return self._error("Approval store is not available")
+        try:
+            success = await approval_store.approve(approval_id)
+        except Exception as e:
+            return self._error(str(e))
+        if not success:
+            return self._error(
+                f"Approval request '{approval_id}' not found or already processed."
+            )
+        return self._ok(
+            approval_id=approval_id,
+            status="approved",
+            message=f"Approval request '{approval_id}' has been approved.",
+        )

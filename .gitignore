@@ -49,6 +49,9 @@ htmlcov/
 # Logs
 *.log
 
+# SQLite databases
+*.db
+
 # macOS
 .DS_Store
 .ralph/

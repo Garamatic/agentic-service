@@ -88,8 +88,8 @@ class TestTicketClient:
 
     async def test_create_ticket(self, respx_mock):
         """Should create ticket successfully."""
-        created_data = {"id": "T-999", "status": "created"}
-        route = respx_mock.post("http://ticket-api.example.com/api/v1/work-items").mock(
+        created_data = {"ticketId": "T-999", "success": True}
+        route = respx_mock.post("http://ticket-api.example.com/api/tickets").mock(
             return_value=httpx.Response(201, json=created_data)
         )
 

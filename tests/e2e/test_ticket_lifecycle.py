@@ -3,8 +3,11 @@
 import pytest
 
 from agentic_service.server import (
-    create_invoice, create_ticket, get_ticket_status,
-    list_customer_tickets, resolve_ticket,
+    create_invoice,
+    create_ticket,
+    get_ticket_status,
+    list_customer_tickets,
+    resolve_ticket,
 )
 
 

@@ -38,7 +38,7 @@ def idempotency_key_for_event(event_type: str, payload: dict[str, Any]) -> str |
     # Prefer explicit key from the publisher
     explicit = payload.get("idempotency_key")
     if explicit:
-        return explicit
+        return explicit  # type: ignore[no-any-return]
 
     # Fall back to deterministic key based on event type
     if event_type == "invoice.create_requested":
@@ -74,6 +74,8 @@ class IdempotencyStore:
         """Open database connection and create table."""
         import aiosqlite
 
+        if self._conn is not None:
+            return
         self._conn = await aiosqlite.connect(self._db_path)
         await self._conn.execute(
             """

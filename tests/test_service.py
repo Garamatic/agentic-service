@@ -3,7 +3,7 @@
 Tests the service layer with fake ports — no HTTP mocking, no RabbitMQ.
 """
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -93,6 +93,8 @@ class FakeMQ:
     def __init__(self):
         self.published: list[tuple[str, dict]] = []
         self.closed = False
+        self.connection = MagicMock()
+        self.connection.is_closed = False
 
     async def publish(self, routing_key: str, message: dict):
         self.published.append((routing_key, message))
@@ -447,8 +449,8 @@ class TestCustomerSession:
 class TestLifecycle:
     async def test_closes_all_clients(self, service):
         await service.close()
-        assert service._ticket.closed
-        assert service._odoo.closed
+        assert service._ticket._ticket.closed
+        assert service._invoice._odoo.closed
         assert service._mq.closed
 
     async def test_context_manager(self, sample_ticket, sample_invoice):

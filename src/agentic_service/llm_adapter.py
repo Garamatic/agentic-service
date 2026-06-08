@@ -5,19 +5,27 @@ All providers are resolved through a single factory so the rest of the
 codebase never imports provider-specific libraries directly.
 """
 
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from .config import Settings
 
 
-class LLMProvider(str, Enum):
+class LLMProvider(StrEnum):
     """Supported LLM providers."""
 
     OPENAI = "openai"
     OPENROUTER = "openrouter"
     OLLAMA = "ollama"
     LLAMACPP = "llamacpp"
+
+
+def _resolve_base_url(config: Settings) -> str:
+    """Resolve the effective base URL for LLM providers.
+
+    Falls back from LLM_BASE_URL to OLLAMA_BASE_URL for ollama.
+    """
+    return config.llm_base_url or config.ollama_base_url
 
 
 def build_llm(config: Settings) -> Any:
@@ -34,17 +42,18 @@ def build_llm(config: Settings) -> Any:
     """
     provider = config.llm_provider
     model = config.llm_model or config.openai_model
+    base_url = _resolve_base_url(config)
 
     if provider == LLMProvider.OLLAMA:
         from langchain_ollama import ChatOllama
 
-        if not config.llm_base_url:
+        if not base_url:
             raise ValueError(
-                "LLM_BASE_URL (or OLLAMA_BASE_URL) is required for ollama provider"
+                "LLM_BASE_URL or OLLAMA_BASE_URL is required for ollama provider"
             )
         return ChatOllama(
             model=model,
-            base_url=config.llm_base_url,
+            base_url=base_url,
             temperature=config.llm_temperature,
         )
 
@@ -60,8 +69,8 @@ def build_llm(config: Settings) -> Any:
         if api_key:
             kwargs["api_key"] = api_key
 
-        if config.llm_base_url:
-            kwargs["base_url"] = config.llm_base_url
+        if base_url:
+            kwargs["base_url"] = base_url
 
         return ChatOpenAI(**kwargs)
 
@@ -79,19 +88,20 @@ def validate_llm_config(config: Settings) -> None:
     """
     provider = config.llm_provider
     model = config.llm_model or config.openai_model
+    base_url = _resolve_base_url(config)
 
     if not model:
         raise ValueError("LLM_MODEL (or OPENAI_MODEL) is required")
 
     if provider == LLMProvider.OLLAMA:
-        if not config.llm_base_url:
+        if not base_url:
             raise ValueError(
-                "LLM_BASE_URL (or OLLAMA_BASE_URL) is required for ollama provider"
+                "LLM_BASE_URL or OLLAMA_BASE_URL is required for ollama provider"
             )
         return
 
     if provider == LLMProvider.LLAMACPP:
-        if not config.llm_base_url:
+        if not base_url:
             raise ValueError("LLM_BASE_URL is required for llamacpp provider")
         return
 

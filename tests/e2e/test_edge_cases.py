@@ -161,8 +161,8 @@ class TestMcpEdgeCases:
         assert result["customer_email"] == "unicode-mcp@example.com"
 
     async def test_zero_amount_invoice_mcp(self, mcp_client, fake_ticket_client):
-        """E2E: Zero amount invoice should still queue."""
-        from agentic_service.server import create_invoice, create_ticket
+        """E2E: Zero amount invoice should fail validation."""
+        from agentic_service.server import create_invoice, create_ticket, list_customer_tickets
         # Create ticket via MCP first so fake_ticket_client is set up correctly
         await create_ticket(
             title="Zero Invoice Test",
@@ -173,7 +173,6 @@ class TestMcpEdgeCases:
             ctx=mcp_client,
         )
         # Get the ticket ID
-        from agentic_service.server import list_customer_tickets
         list_result = await list_customer_tickets(
             customer_email="zero-invoice@example.com",
             ctx=mcp_client,
@@ -183,8 +182,8 @@ class TestMcpEdgeCases:
             ticket_id=ticket_id, amount=0.00,
             description="Zero amount", ctx=mcp_client,
         )
-        assert result["status"] == "queued"
-        assert result["amount"] == 0.00
+        assert result["status"] == "failed"
+        assert "error" in result
 
 
 @pytest.mark.asyncio
