@@ -2,6 +2,7 @@
 
 import functools
 import json
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from typing import Any, cast
@@ -9,6 +10,14 @@ from typing import Any, cast
 import pybreaker
 import structlog
 from fastapi import FastAPI, HTTPException, Query, Request
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.sdk.resources import Resource, SERVICE_NAME
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
@@ -180,6 +189,24 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# OpenTelemetry tracing
+_otel_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://tempo:4318")
+if _otel_endpoint:
+    _resource = Resource(attributes={SERVICE_NAME: "agentic-service"})
+    _provider = TracerProvider(resource=_resource)
+    _processor = BatchSpanProcessor(
+        OTLPSpanExporter(endpoint=f"{_otel_endpoint}/v1/traces")
+    )
+    _provider.add_span_processor(_processor)
+    trace.set_tracer_provider(_provider)
+    FastAPIInstrumentor.instrument_app(app)
+    HTTPXClientInstrumentor().instrument()
+
+# Prometheus metrics endpoint
+@app.get("/metrics")
+def metrics() -> Response:
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 # Allow cross-origin requests based on configuration
 settings = get_settings()
 app.add_middleware(
@@ -213,7 +240,7 @@ async def auth_middleware(
 ) -> Response:
     """Check API key on protected endpoints."""
     # Public paths — no auth needed
-    public_paths = {"/docs", "/openapi.json", "/redoc", "/health"}
+    public_paths = {"/docs", "/openapi.json", "/redoc", "/health", "/metrics"}
     if request.url.path in public_paths or request.url.path.startswith("/openapi.json"):
         return await call_next(request)
 

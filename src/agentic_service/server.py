@@ -11,6 +11,7 @@ from typing import Any
 
 import structlog
 from fastmcp import Context, FastMCP
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from mcp.types import (
     Annotations,
     Completion,
@@ -120,7 +121,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         path = request.url.path
-        if path in ("/health", "/favicon.ico", "/") or request.method == "OPTIONS":
+        if path in ("/health", "/favicon.ico", "/", "/metrics") or request.method == "OPTIONS":
             return await call_next(request)
 
         settings = get_settings()
@@ -149,6 +150,19 @@ async def _health(request: Any) -> Response:
     return Response(
         content=json.dumps({"status": "ok", "service": "garamatic-mcp"}),
         media_type="application/json",
+    )
+
+
+# ------------------------------------------------------------------
+# Prometheus metrics
+# ------------------------------------------------------------------
+
+@mcp.custom_route("/metrics", methods=["GET"])
+async def _metrics(request: Any) -> Response:
+    """Prometheus metrics endpoint for the MCP server."""
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
     )
 
 

@@ -26,6 +26,12 @@ dependencies = [
     "pybreaker>=1.2.0",  # Circuit breakers
     "aiosqlite>=0.20.0",  # SQLite for persistent agent state
     "langgraph-checkpoint-sqlite>=2.0.0",
+    "opentelemetry-api>=1.25.0",
+    "opentelemetry-sdk>=1.25.0",
+    "opentelemetry-instrumentation-fastapi>=0.46b0",
+    "opentelemetry-instrumentation-httpx>=0.46b0",
+    "opentelemetry-exporter-otlp>=1.25.0",
+    "prometheus-client>=0.20.0",
 ]
 
 [project.optional-dependencies]
