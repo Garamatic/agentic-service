@@ -120,7 +120,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         path = request.url.path
-        if path in ("/health", "/favicon.ico", "/"):
+        if path in ("/health", "/favicon.ico", "/") or request.method == "OPTIONS":
             return await call_next(request)
 
         settings = get_settings()
@@ -514,13 +514,14 @@ def main() -> None:
         raise ValueError(f"Invalid MCP_TRANSPORT: {transport!r}. Expected one of {valid}")
 
     middleware = [
-        Middleware(ApiKeyMiddleware),
         Middleware(
             CORSMiddleware,
             allow_origins=config.cors_origin_list,
+            allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
         ),
+        Middleware(ApiKeyMiddleware),
     ]
     if transport == "sse":
         mcp.run(transport="sse", host="0.0.0.0", port=3001, middleware=middleware)

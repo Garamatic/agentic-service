@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 import pydantic
+from fastmcp import Context
 from langchain_core.tools import StructuredTool
 
 from ..approval import ApprovalRequiredError
@@ -44,7 +45,7 @@ def _create_mcp_wrapper(
     import inspect
 
     schema = tool.schema
-    sig = inspect.signature(schema.__init__)
+    sig = inspect.signature(schema)
     params = list(sig.parameters.keys())[1:]  # skip 'self'
 
     # Build a dynamic function with the correct signature
@@ -109,7 +110,7 @@ def _create_mcp_wrapper(
                 name="ctx",
                 kind=inspect.Parameter.KEYWORD_ONLY,
                 default=inspect.Parameter.empty,
-                annotation=Any,
+                annotation=Context,
             )
         ]
     )
@@ -120,7 +121,7 @@ def _create_mcp_wrapper(
         for p in params
         if sig.parameters[p].annotation is not inspect.Parameter.empty
     }
-    wrapper.__annotations__["ctx"] = Any
+    wrapper.__annotations__["ctx"] = Context
     wrapper.__annotations__["return"] = dict[str, Any]
     wrapper.__name__ = tool.name
     wrapper.__doc__ = tool.description

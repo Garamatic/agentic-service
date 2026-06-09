@@ -167,6 +167,9 @@ class TicketClient:
             "subject": title,
             "source": "agentic-service",
         }
+        priority = kwargs.get("priority")
+        if priority:
+            payload["priority"] = priority
 
         response = await self.client.post(
             tickets_url,
