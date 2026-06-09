@@ -169,58 +169,7 @@ async def _favicon(request: Any) -> Response:
 # ------------------------------------------------------------------
 # Sampling-enabled tools
 # ------------------------------------------------------------------
-
-@mcp.tool(
-    name="draft_email",
-    description="Draft an email using the LLM. Returns a draft for review before sending.",
-    annotations=ToolAnnotations(
-        title="Draft email",
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-    ),
-)
-async def draft_email(
-    ctx: Context,
-    to_email: str = "",
-    subject: str = "",
-    key_points: str = "",
-    tone: str = "professional",
-) -> dict[str, Any]:
-    """Draft an email using the LLM. The draft is returned for review before sending."""
-    if not to_email or "@" not in to_email:
-        return {
-            "status": "error",
-            "error": "Invalid or missing email address",
-        }
-
-    prompt = f"""Draft a {tone} email to {to_email} with the subject: "{subject}".
-
-Key points to include:
-{key_points}
-
-Write the full email body. Be concise but complete. Include appropriate greeting and closing."""
-
-    try:
-        result = await ctx.sample(
-            messages=prompt,
-            max_tokens=800,
-        )
-        draft = result.content if result.content else ""
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": f"Failed to draft email: {e}",
-        }
-
-    return {
-        "status": "success",
-        "draft": draft,
-        "subject": subject,
-        "to_email": to_email,
-        "tone": tone,
-        "message": "Email drafted. Review the draft before sending with send_email.",
-    }
+# Note: draft_email is auto-registered from email_tools via ToolRegistry
 
 
 # ------------------------------------------------------------------

@@ -61,6 +61,41 @@ class InvoiceService(BaseService):
         )
         return _invoice_status_from_dict(data)
 
+    async def post_invoice(self, invoice_id: str) -> dict[str, Any]:
+        if not invoice_id or not invoice_id.strip():
+            raise ValidationError("Invoice ID is required")
+        if self._odoo is None:
+            raise ServiceUnavailableError("Odoo bridge not configured")
+        return await self._call_port(
+            "post_invoice",
+            {"invoice_id": invoice_id},
+            self._odoo.post_invoice(invoice_id),
+        )
+
+    async def get_invoice_pdf(self, invoice_id: str) -> bytes | None:
+        if not invoice_id or not invoice_id.strip():
+            raise ValidationError("Invoice ID is required")
+        if self._odoo is None:
+            raise ServiceUnavailableError("Odoo bridge not configured")
+        return await self._call_port(
+            "get_invoice_pdf",
+            {"invoice_id": invoice_id},
+            self._odoo.get_invoice_pdf(invoice_id),
+        )
+
+    async def register_payment(self, invoice_id: str, amount: float) -> dict[str, Any]:
+        if not invoice_id or not invoice_id.strip():
+            raise ValidationError("Invoice ID is required")
+        if amount <= 0:
+            raise ValidationError("Payment amount must be positive")
+        if self._odoo is None:
+            raise ServiceUnavailableError("Odoo bridge not configured")
+        return await self._call_port(
+            "register_payment",
+            {"invoice_id": invoice_id, "amount": amount},
+            self._odoo.register_payment(invoice_id, amount),
+        )
+
     async def queue_invoice(
         self,
         *,

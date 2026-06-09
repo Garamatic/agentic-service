@@ -269,6 +269,47 @@ class OdooBridgeClient:
         response.raise_for_status()
         return response.json()  # type: ignore[no-any-return]
 
+    @odoo_bridge_breaker
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True,
+    )
+    async def post_invoice(self, invoice_id: str) -> dict[str, Any]:
+        response = await self.client.post(f"/api/invoices/{invoice_id}/post")
+        response.raise_for_status()
+        return response.json()  # type: ignore[no-any-return]
+
+    @odoo_bridge_breaker
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True,
+    )
+    async def get_invoice_pdf(self, invoice_id: str) -> bytes | None:
+        response = await self.client.get(f"/api/invoices/{invoice_id}/pdf")
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        return response.content  # type: ignore[no-any-return]
+
+    @odoo_bridge_breaker
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception(_is_retryable_error),
+        reraise=True,
+    )
+    async def register_payment(self, invoice_id: str, amount: float) -> dict[str, Any]:
+        response = await self.client.post(
+            f"/api/invoices/{invoice_id}/payment",
+            json={"amount": amount},
+        )
+        response.raise_for_status()
+        return response.json()  # type: ignore[no-any-return]
+
     async def close(self) -> None:
         await self.client.aclose()
 

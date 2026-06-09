@@ -32,6 +32,25 @@ class GetInvoiceStatusSchema(BaseModel):
     ticket_id: str = Field(..., description="The ticket to check")
 
 
+class PostInvoiceSchema(BaseModel):
+    """Schema for post_invoice tool."""
+
+    invoice_id: str = Field(..., description="The Odoo invoice ID to post")
+
+
+class GetInvoicePdfSchema(BaseModel):
+    """Schema for get_invoice_pdf tool."""
+
+    invoice_id: str = Field(..., description="The Odoo invoice ID")
+
+
+class RegisterPaymentSchema(BaseModel):
+    """Schema for register_payment tool."""
+
+    invoice_id: str = Field(..., description="The Odoo invoice ID")
+    amount: float = Field(..., description="Payment amount in EUR")
+
+
 # ------------------------------------------------------------------
 # Handlers
 # ------------------------------------------------------------------
@@ -96,6 +115,79 @@ async def _get_invoice_status(service: GaramaticService, **kwargs: Any) -> dict[
     }
 
 
+async def _post_invoice(service: GaramaticService, **kwargs: Any) -> dict[str, Any]:
+    invoice_id = kwargs["invoice_id"]
+    try:
+        result = await service.post_invoice(invoice_id)
+    except (ValidationError, ValueError) as e:
+        return {"status": "validation_error", "error": str(e), "invoice_id": invoice_id}
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": f"Failed to post invoice: {e}",
+            "invoice_id": invoice_id,
+        }
+
+    return {
+        "status": "success",
+        "invoice_id": invoice_id,
+        "message": result.get("status", "posted"),
+    }
+
+
+async def _get_invoice_pdf(service: GaramaticService, **kwargs: Any) -> dict[str, Any]:
+    invoice_id = kwargs["invoice_id"]
+    try:
+        pdf = await service.get_invoice_pdf(invoice_id)
+    except (ValidationError, ValueError) as e:
+        return {"status": "validation_error", "error": str(e), "invoice_id": invoice_id}
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": f"Failed to get invoice PDF: {e}",
+            "invoice_id": invoice_id,
+        }
+
+    if pdf is None:
+        return {
+            "status": "not_found",
+            "error": "PDF not found for this invoice",
+            "invoice_id": invoice_id,
+        }
+
+    # Return base64-encoded PDF for MCP transport
+    import base64
+
+    return {
+        "status": "success",
+        "invoice_id": invoice_id,
+        "pdf_base64": base64.b64encode(pdf).decode("ascii"),
+        "mime_type": "application/pdf",
+    }
+
+
+async def _register_payment(service: GaramaticService, **kwargs: Any) -> dict[str, Any]:
+    invoice_id = kwargs["invoice_id"]
+    amount = kwargs["amount"]
+    try:
+        result = await service.register_payment(invoice_id, amount)
+    except (ValidationError, ValueError) as e:
+        return {"status": "validation_error", "error": str(e), "invoice_id": invoice_id}
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": f"Failed to register payment: {e}",
+            "invoice_id": invoice_id,
+        }
+
+    return {
+        "status": "success",
+        "invoice_id": invoice_id,
+        "amount": amount,
+        "message": result.get("status", "payment_registered"),
+    }
+
+
 # ------------------------------------------------------------------
 # Registration
 # ------------------------------------------------------------------
@@ -130,6 +222,50 @@ def register_tools() -> None:
                 title="Get invoice status",
                 readOnlyHint=True,
                 idempotentHint=True,
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="post_invoice",
+            schema=PostInvoiceSchema,
+            handler=_post_invoice,
+            description="Post (confirm) an invoice in Odoo.",
+            group="invoice",
+            annotations=ToolAnnotations(
+                title="Post invoice",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="get_invoice_pdf",
+            schema=GetInvoicePdfSchema,
+            handler=_get_invoice_pdf,
+            description="Get the PDF of an invoice.",
+            group="invoice",
+            annotations=ToolAnnotations(
+                title="Get invoice PDF",
+                readOnlyHint=True,
+                idempotentHint=True,
+            ),
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="register_payment",
+            schema=RegisterPaymentSchema,
+            handler=_register_payment,
+            description="Register a payment for an invoice in Odoo.",
+            group="invoice",
+            annotations=ToolAnnotations(
+                title="Register payment",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
             ),
         )
     )

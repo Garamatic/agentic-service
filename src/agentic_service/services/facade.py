@@ -7,7 +7,7 @@ delegates to focused services while keeping the same public API.
 from __future__ import annotations
 
 import contextlib
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 
@@ -183,6 +183,15 @@ class GaramaticService:
 
     async def get_invoice_status(self, ticket_id: str) -> InvoiceStatus:
         return await self._invoice.get_invoice_status(ticket_id)
+
+    async def post_invoice(self, invoice_id: str) -> dict[str, Any]:
+        return await self._invoice.post_invoice(invoice_id)
+
+    async def get_invoice_pdf(self, invoice_id: str) -> bytes | None:
+        return await self._invoice.get_invoice_pdf(invoice_id)
+
+    async def register_payment(self, invoice_id: str, amount: float) -> dict[str, Any]:
+        return await self._invoice.register_payment(invoice_id, amount)
 
     async def queue_invoice(
         self,
