@@ -74,6 +74,9 @@ def build_llm(config: Settings, model_override: str = "") -> Any:
             kwargs["api_key"] = "sk-no-key-required"
 
         if base_url:
+            # Ensure OpenAI-compatible path prefix
+            if base_url and not base_url.rstrip("/").endswith("/v1"):
+                base_url = base_url.rstrip("/") + "/v1"
             kwargs["base_url"] = base_url
 
         return ChatOpenAI(**kwargs)

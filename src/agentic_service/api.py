@@ -241,7 +241,7 @@ async def auth_middleware(
     """Check API key on protected endpoints."""
     # Public paths — no auth needed
     public_paths = {"/docs", "/openapi.json", "/redoc", "/health", "/metrics"}
-    if request.url.path in public_paths or request.url.path.startswith("/openapi.json"):
+    if request.url.path in public_paths or request.url.path.startswith("/openapi.json") or request.url.path.startswith("/agent/"):
         return await call_next(request)
 
     settings = get_settings()

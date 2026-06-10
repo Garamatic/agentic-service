@@ -166,7 +166,7 @@ Every entry point creates its own `GaramaticService` + client instances. Circuit
 
 ### Dockerfile
 
-- ✅ Non-root user
+- ⚠️ Non-root user — **known gap**: container currently runs as root (no `USER` instruction in Dockerfile); add a non-root user for production hardening
 - ✅ Uses `uv` via official `COPY --from=ghcr.io/astral-sh/uv:latest`
 - ✅ Multi-stage not needed for a small Python service
 - ✅ `uv.lock` is tracked in git for reproducible builds
@@ -176,7 +176,7 @@ Every entry point creates its own `GaramaticService` + client instances. Circuit
 
 - ✅ `version:` key removed
 - ✅ `API_KEY` placeholder added
-- ✅ `AGENT_DB_PATH` set to shared volume
+- ⚠️ `AGENT_DB_PATH` set to `/app/data/approvals.db` (tmpfs, resets on restart; add a persistent volume for production)
 - ✅ `healthcheck` block added
 - ⚠️ Default `guest:guest` RabbitMQ credentials — should be overridden in production
 
