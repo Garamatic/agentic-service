@@ -523,9 +523,13 @@ def main() -> None:
     config = get_settings()
     transport = os.environ.get("MCP_TRANSPORT", config.mcp_transport)
 
-    valid = {"sse", "http", "streamable-http"}
+    valid = {"sse", "http", "streamable-http", "stdio"}
     if transport not in valid:
         raise ValueError(f"Invalid MCP_TRANSPORT: {transport!r}. Expected one of {valid}")
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+        return
 
     middleware = [
         Middleware(

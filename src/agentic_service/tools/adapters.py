@@ -45,8 +45,18 @@ def _create_mcp_wrapper(
     import inspect
 
     schema = tool.schema
-    sig = inspect.signature(schema)
-    params = list(sig.parameters.keys())[1:]  # skip 'self'
+    # Pydantic v2 models use __init__(self, /, **data) — inspect.signature
+    # won't reveal individual fields.  Build the param list from model_fields.
+    if hasattr(schema, "model_fields"):
+        # Pydantic v2
+        params = list(schema.model_fields.keys())
+    elif hasattr(schema, "__fields__"):
+        # Pydantic v1
+        params = list(schema.__fields__.keys())
+    else:
+        # Fallback to inspect.signature (non-Pydantic classes)
+        sig = inspect.signature(schema)
+        params = list(sig.parameters.keys())[1:]  # skip 'self'
 
     # Build a dynamic function with the correct signature
     async def wrapper(*args: Any, ctx: Any, **kwargs: Any) -> dict[str, Any]:
@@ -94,17 +104,38 @@ def _create_mcp_wrapper(
         except Exception as e:
             return {"status": "error", "error": f"Failed: {e}"}
 
-    # Preserve the schema signature for introspection
-    wrapper.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
-        parameters=[
+    # Build annotations from the Pydantic model fields so FastMCP's
+    # function parser can introspect the correct schema.
+    _annotations: dict[str, Any] = {}
+    _parameters: list[inspect.Parameter] = []
+    for p in params:
+        if hasattr(schema, "model_fields"):
+            # Pydantic v2 — type annotation is in the field metadata
+            field_info = schema.model_fields[p]
+            annotation = field_info.annotation if hasattr(field_info, "annotation") else str
+            default = field_info.default if hasattr(field_info, "default") else inspect.Parameter.empty
+        elif hasattr(schema, "__fields__"):
+            # Pydantic v1
+            field_info = schema.__fields__[p]
+            annotation = field_info.type_ if hasattr(field_info, "type_") else str
+            default = field_info.default if hasattr(field_info, "default") else inspect.Parameter.empty
+        else:
+            # Fallback — inspect.signature path
+            annotation = sig.parameters[p].annotation if sig.parameters[p].annotation is not inspect.Parameter.empty else str
+            default = sig.parameters[p].default
+        _annotations[p] = annotation
+        _parameters.append(
             inspect.Parameter(
                 name=p,
                 kind=inspect.Parameter.KEYWORD_ONLY,
-                default=sig.parameters[p].default,
-                annotation=sig.parameters[p].annotation,
+                default=default,
+                annotation=annotation,
             )
-            for p in params
-        ]
+        )
+
+    # Preserve the schema signature for introspection
+    wrapper.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        parameters=_parameters
         + [
             inspect.Parameter(
                 name="ctx",
@@ -116,11 +147,7 @@ def _create_mcp_wrapper(
     )
     # Set __annotations__ to match the signature so that
     # typing.get_type_hints() and FastMCP's function parser stay consistent.
-    wrapper.__annotations__ = {
-        p: sig.parameters[p].annotation
-        for p in params
-        if sig.parameters[p].annotation is not inspect.Parameter.empty
-    }
+    wrapper.__annotations__ = _annotations
     wrapper.__annotations__["ctx"] = Context
     wrapper.__annotations__["return"] = dict[str, Any]
     wrapper.__name__ = tool.name
