@@ -673,8 +673,6 @@ async def api_agent_chat_stream(request: ChatRequest) -> StreamingResponse:
         try:
             async for event in agent.process_stream(request.message):
                 event["request_id"] = rid
-                if event["type"] == "content":
-                    _ = event["text"]
                 yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
         except Exception as e:
             logger.error("api.agent_chat_stream_failed", error=str(e), request_id=rid)

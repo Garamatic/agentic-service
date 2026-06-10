@@ -394,8 +394,6 @@ class GaramaticAgent:
 
     async def run_conversation(self) -> None:
         """Run interactive conversation loop."""
-        import asyncio
-
         print("🤖 Garamatic AI Agent")
         print("Type 'quit' to exit\n")
 
