@@ -4,6 +4,20 @@ AI-agenten integratieservice die uw Garamatic platform beschikbaar maakt via Mod
 
 Inclusief: MCP Server, REST API, Event Consumer en LangGraph Agent voor volledige automatisering.
 
+## English overview
+
+Garamatic's platform (ticketing, invoicing, mailing) was reachable only through separate REST endpoints, so an AI agent had no single typed way to read customer context and act on it.
+
+This service is that integration layer. It exposes the platform's operations as MCP tools and REST endpoints, and adds a LangGraph agent that can plan across them.
+
+**One end-to-end workflow.** A support request comes in for a customer with an open ticket. The agent calls `list_customer_tickets`, reads `customer://{email}` for context, then calls `resolve_ticket` with resolution notes and, if the work is billable, a `billable_amount`. Every step is a typed tool call with validated input, so the agent cannot invent a payload shape.
+
+**Where human approval happens.** `resolve_ticket` is wrapped in an approval gate. When `billable_amount` exceeds `APPROVAL_THRESHOLD` (default EUR 500), the tool does not resolve or invoice anything: it returns `status: approval_required` with an approval ID. A person approves or rejects that ID through `POST /approvals/{approval_id}/approve` (30-minute TTL), and only then can the agent retry `resolve_ticket` with `approval_id`. The gate lives in the tool interceptor, not in the prompt, so it holds for every client: MCP, REST, CLI or the LangGraph agent.
+
+**Components.** MCP server, REST API on port 3001 with OpenAPI at `/docs`, a RabbitMQ event consumer for workflow triggers, and the LangGraph agent. Integrations: `ticket-masala` (REST), `odoo-bridge` (RabbitMQ), `mailing-service`.
+
+The rest of this README is in Dutch.
+
 ## Inleiding
 
 Deze service biedt een [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server die uw bestaande Garamatic services beschikbaar maakt als AI-aanroepbare tools:
